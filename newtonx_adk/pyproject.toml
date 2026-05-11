@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "newtonx-adk"
+version = "0.10.5"
+description = "NewtonX エージェント開発キット (NewtonX ADK): NewtonX API を簡単に扱うPythonライブラリ"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "NewtonX Team", email = "newtonx_helpdesk@seraku.co.jp"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.25.0",
+    "msal>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "flake8>=3.8",
+    "mypy>=0.800",
+]
+docs = [
+    "sphinx>=3.0",
+    "sphinx-rtd-theme>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/innovationserakucojporganization/newtonx_adk"
+Repository = "https://github.com/innovationserakucojporganization/newtonx_adk"
+Issues = "https://github.com/innovationserakucojporganization/newtonx_adk/issues" 
+
+[project.scripts]
+newtonx-adk-config = "newtonx_adk.config_cli:main"
+newtonx-config = "newtonx_adk.config_cli:main"  # 後方互換のためのエイリアス
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["newtonx_adk*"]

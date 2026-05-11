@@ -1,0 +1,4 @@
+newtonx-adk>=0.10.0
+rich>=10.0.0
+requests>=2.25.0
+pyreadline3; platform_system == "Windows" 

@@ -1,0 +1,5 @@
+include README.md
+include requirements.txt
+recursive-include src/newtonx_adk *.py
+recursive-include src/newtonx_adk *.md
+recursive-include tools *.py 

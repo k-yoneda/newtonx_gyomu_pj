@@ -1,0 +1,62 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Run current file with venv Python",
+            "type": "shell",
+            "command": "${workspaceFolder}/myvenv/Scripts/python.exe",
+            "args": ["${file}"],
+            "options": {
+                "cwd": "${fileDirname}",
+                "env": {
+                    "PYTHONPATH": "${workspaceFolder}/myvenv/Lib/site-packages"
+                }
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run auto_runner with config",
+            "type": "shell",
+            "command": "${workspaceFolder}/myvenv/Scripts/python.exe",
+            "args": ["${file}", "-c", "${fileDirname}/config.yml"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run expence_processor with sample_data and output.csv",
+            "type": "shell",
+            "command": "${workspaceFolder}/myvenv/Scripts/python.exe",
+            "args": ["${file}", "${fileDirname}/sample_data", "${fileDirname}/output.csv"],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

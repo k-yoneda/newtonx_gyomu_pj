@@ -1,0 +1,44 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python デバッガー: 現在のファイル",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${fileDirname}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}\\myvenv\\Lib\\site-packages"
+            }
+        },
+        {
+            "name": "Python デバッガー: for auto_runner",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}\\myvenv\\Lib\\site-packages"
+            },
+            "cwd": "${fileDirname}",
+            "args": ["-c","config.yml"]
+        },
+        {
+            "name": "Python デバッガー: for expence_processor",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}\\myvenv\\Lib\\site-packages"
+            },
+            "cwd": "${fileDirname}",
+            "args": ["sample_data", "output.csv"]
+        }
+    ]
+}

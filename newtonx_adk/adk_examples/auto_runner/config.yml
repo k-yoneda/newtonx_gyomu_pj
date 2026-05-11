@@ -1,0 +1,78 @@
+# NewtonX Auto Runner Configuration
+# YAML設定ファイルに従って自動実行するサンプル
+
+project:
+  name: "NewtonX Auto Runner Example"
+  description: "設定ファイルベースの自動実行サンプル"
+  version: "1.0.0"
+
+# 認証設定
+auth:
+  auto_login: true
+  session_timeout: 3600
+
+# チャット設定
+chat:
+  default_assistant: "高速アシスタント（GPT-4o mini）"
+  # ファイル登録後にメッセージ送信するまでの待機秒数（インデックス反映の猶予）
+  wait_after_upload_seconds: 5
+  search_types:
+    - "WEB検索（最新情報）"
+    - "ナレッジ検索（登録ファイル）"
+    - "両方（制限あり）"
+    - "検索なし（基本対話）"
+
+# ファイルアップロード設定
+upload:
+  max_file_size: 10485760  # 10MB
+  allowed_extensions:
+    images: [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
+    documents: [".pdf", ".docx", ".txt", ".pptx", ".xls", ".xlsx", ".md"]
+
+# 自動実行タスク
+tasks:
+  - name: "初期化"
+    type: "init"
+    description: "プロジェクトの初期化"
+    enabled: true
+    
+  - name: "チャット作成"
+    type: "create_chat"
+    description: "新しいチャットの作成"
+    title: "Auto Runner Test Chat"
+    assistant: "高速アシスタント（GPT-4o mini）"
+    enabled: true
+    
+  - name: "メッセージ送信"
+    type: "send_message"
+    description: "テストメッセージの送信"
+    message: "こんにちは！Auto Runnerのテストです。"
+    web_search: false
+    knowledge_search: false
+    enabled: true
+
+  - name: "ファイルアップロード"
+    type: "upload"
+    description: "サンプルファイルのアップロード"
+    files:
+      - "sample_document.txt"
+    enabled: true
+    
+  - name: "ファイル分析"
+    type: "analyze_file"
+    description: "アップロードしたファイルの分析"
+    message: "このファイルの中身について教えてください。"
+    enabled: true
+        
+# ログ設定
+logging:
+  level: "INFO"
+  file: "auto_runner.log"
+  max_size: 10485760  # 10MB
+  backup_count: 5
+
+# 出力設定
+output:
+  format: "rich"  # rich, json, plain
+  save_results: true
+  output_dir: "results" 

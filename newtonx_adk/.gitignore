@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.code-workspace
+
+# OS
+.DS_Store
+
+# Test
+.pytest_cache/
+coverage.xml
+.coverage*
+htmlcov/
+
+# Local config
+*.local.json
+*.env
+*.log
+
+# temp
+temp/
+tmp/
+ 
+# Local-only tools and outputs (not for distribution)
+tools/local/
+local_outputs/
+tests/local/
+tests/integration/
+
+# example folder
+adk_examples/auto_runner/results/
+results/
+adk_examples/expense_processor/result.csv
+
+# work log
+docs/WORK_LOG.md
+
+uv.lock
