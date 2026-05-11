@@ -24,19 +24,21 @@ from kintai_core import (
 )
 
 
-class KintaiApp(tk.Tk):
+class KintaiApp(tk.Frame):
     USER_JUDGMENT_COL = "ユーザ判断"
     EMPLOYEE_NO_COL = "社員番号"
 
     def __init__(
         self,
+        master: tk.Tk,
         *,
         client,
         assistant_uid: str,
     ) -> None:
-        super().__init__()
-        self.title("勤務表解析")
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        super().__init__(master)
+        self._root = master
+        self._root.title("勤務表解析")
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._client = client
         self._assistant_uid = assistant_uid
         self._data_dir: Path | None = None
@@ -141,8 +143,8 @@ class KintaiApp(tk.Tk):
         self._tree.bind("<Button-3>", self._on_tree_right_click)
         self._tree.bind("<Double-1>", self._on_row_double_click)
 
-        self.minsize(total_min, 520)
-        self.geometry(f"{total_min}x680")
+        self._root.minsize(total_min, 520)
+        self._root.geometry(f"{total_min}x680")
 
     def _browse_folder(self) -> None:
         d = filedialog.askdirectory(title="データを読み込むフォルダを選択")
@@ -400,9 +402,9 @@ class KintaiApp(tk.Tk):
     def _update_title(self) -> None:
         base = "勤務表解析"
         if self._loaded_json_path is None:
-            self.title(base)
+            self._root.title(base)
         else:
-            self.title(f"{base} - {self._loaded_json_path.name}")
+            self._root.title(f"{base} - {self._loaded_json_path.name}")
 
     def _has_unsaved_changes(self) -> bool:
         rows = self._current_grid_rows()
@@ -441,7 +443,7 @@ class KintaiApp(tk.Tk):
                 except Exception as e:
                     messagebox.showerror("保存失敗", str(e))
                     return
-        self.destroy()
+        self._root.destroy()
 
     def _start_new_analysis(self) -> None:
         # 新規解析: グリッドをクリアして最初から
@@ -691,9 +693,25 @@ class KintaiApp(tk.Tk):
             )
 
 
+def _center_window_on_screen(win: tk.Misc) -> None:
+    """現在のサイズのまま、プライマリディスプレイのおおよそ中央へ移動する。"""
+    win.update_idletasks()
+    w = max(win.winfo_width(), win.winfo_reqwidth())
+    h = max(win.winfo_height(), win.winfo_reqheight())
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = max(0, (sw - w) // 2)
+    y = max(0, (sh - h) // 2)
+    win.geometry(f"+{x}+{y}")
+
+
 def main() -> None:
     root = tk.Tk()
-    root.withdraw()
+    # withdraw() のルートは環境により messagebox / Toplevel が出ず、メインにも進めないことがある。
+    # 画面外の 1x1 として「表示済み」の親にする。
+    root.geometry("1x1+-10000+-10000")
+    root.deiconify()
+    root.update_idletasks()
 
     client = create_client()
     if not client.authenticate():
@@ -756,6 +774,11 @@ def main() -> None:
     dlg.bind("<Escape>", lambda _e: on_cancel())
     cb.focus_set()
 
+    dlg.update_idletasks()
+    _center_window_on_screen(dlg)
+    dlg.lift()
+    dlg.focus_force()
+
     root.wait_window(dlg)
 
     if not chosen["name"]:
@@ -763,8 +786,16 @@ def main() -> None:
         sys.exit(0)
 
     selected_name = str(chosen["name"])
-    selected = next((a for a in assistants if (a.get("name") == selected_name)), None)
-    assistant_uid = str(selected["uid"]) if selected and selected.get("uid") is not None else ""
+    selected = next(
+        (a for a in assistants if str(a.get("name") or "").strip() == selected_name),
+        None,
+    )
+    assistant_uid = ""
+    if selected:
+        raw = selected.get("uid")
+        if raw is None or str(raw).strip() == "":
+            raw = selected.get("uuid")
+        assistant_uid = str(raw).strip() if raw is not None else ""
 
     if not assistant_uid:
         messagebox.showerror(
@@ -775,10 +806,19 @@ def main() -> None:
         root.destroy()
         sys.exit(1)
 
-    root.destroy()
-
-    app = KintaiApp(client=client, assistant_uid=assistant_uid)
-    app.mainloop()
+    # Windows では「最初の Tk を destroy したあとに 2 つ目の Tk を作る」と
+    # メインウィンドウが表示されないことがあるため、起動〜本画面まで同一の root を使う。
+    app = KintaiApp(
+        root,
+        client=client,
+        assistant_uid=assistant_uid,
+    )
+    app.pack(fill=tk.BOTH, expand=True)
+    root.update_idletasks()
+    _center_window_on_screen(root)
+    root.lift()
+    root.focus_force()
+    root.mainloop()
 
 
 if __name__ == "__main__":
