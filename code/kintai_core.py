@@ -21,7 +21,7 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".ti
 PDF_SUFFIX = ".pdf"
 
 TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
-TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
+#TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
 
 def _process_sse_response_no_print(self, response) -> str:
     full_response = ""
@@ -113,6 +113,7 @@ def _build_check_message(display_file_name: str) -> str:
     """解析結果に出すファイル名をローカルの実名に固定する。"""
     return f"""
 勤務表の画像を解析し、１画像１行で以下の内容にあたるものをmd形式で表で出力してください。
+画像ファイル名の会社名は勤務先会社名として抽出しないこと。
 画像ファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
 {display_file_name}
 
@@ -128,7 +129,7 @@ def _build_pdf_check_message(display_file_name: str) -> str:
     """PDF用。アップロード直後は send_message にドキュメントIDを渡さなくても参照できる想定。"""
     return f"""
 同じPDFに勤怠（出退勤・打刻・勤務時間等）の情報と経費精算（領収書・立替等）の情報の両方が含まれている場合は、経費精算は無視し、必ず勤怠（勤務表）の情報だけを根拠に回答してください。経費側の社名・氏名・金額は採用しないでください。
-
+PDFファイル名の会社名は勤務先会社名として抽出しないこと。
 勤務表（勤怠）のPDFを解析し、１ファイルあたり適切な行数で以下の内容にあたるものをmd形式で表で出力してください。出力する勤務先・氏名・合計勤務時間・押印はすべて勤怠部分の記載に基づきます。
 
 PDFファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
