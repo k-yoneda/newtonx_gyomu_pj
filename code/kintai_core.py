@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from newtonx_adk import NewtonXClient, ConfigManager
+from newtonx_adk import NewtonXClient, ConfigManager, FileUploadError
 import json
 import threading
 import math
@@ -125,11 +125,11 @@ def _build_check_message(display_file_name: str) -> str:
     """解析結果に出すファイル名をローカルの実名に固定する。"""
     return f"""
 勤務表の画像を解析し、１画像１行で以下の内容にあたるものをmd形式で表で出力してください。
-画像ファイル名の会社名は勤務先会社名として抽出しないこと。
+画像ファイル名の会社名は会社名として抽出しないこと。
 画像ファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
 {display_file_name}
 
-勤務先会社名：
+会社名：
 氏名：
 合計勤務時間：（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
 押印有無：〇/✖
@@ -141,13 +141,13 @@ def _build_pdf_check_message(display_file_name: str) -> str:
     """PDF用。アップロード直後は send_message にドキュメントIDを渡さなくても参照できる想定。"""
     return f"""
 同じPDFに勤怠（出退勤・打刻・勤務時間等）の情報と経費精算（領収書・立替等）の情報の両方が含まれている場合は、経費精算は無視し、必ず勤怠（勤務表）の情報だけを根拠に回答してください。経費側の社名・氏名・金額は採用しないでください。
-PDFファイル名の会社名は勤務先会社名として抽出しないこと。
+PDFファイル名の会社名は会社名として抽出しないこと。
 勤務表（勤怠）のPDFを解析し、１ファイルあたり適切な行数で以下の内容にあたるものをmd形式で表で出力してください。出力する勤務先・氏名・合計勤務時間・押印はすべて勤怠部分の記載に基づきます。
 
 PDFファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
 {display_file_name}
 
-勤務先会社名：
+会社名：
 氏名：
 合計勤務時間：（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
 押印有無：〇/✖
@@ -262,7 +262,7 @@ def _is_md_table_separator_row(cells: list[str]) -> bool:
 # 区切り行の隣接セルに誤ってマッチしないよう、列名そのものを弾く
 _KINTAI_HEADER_CELLS: frozenset[str] = frozenset(
     {
-        "勤務先会社名",
+        "会社名",
         "勤務先",
         "氏名",
         "合計勤務時間",
@@ -296,7 +296,7 @@ def _kintai_header_col_roles(cells: list[str]) -> dict[str, int] | None:
         if not t:
             continue
         if "co" not in roles and (
-            t in ("勤務先会社名", "勤務先", "勤務先会社", "就業先")
+            t in ("会社名", "勤務先", "勤務先会社", "就業先")
             or ("勤務" in t and "会社" in t)
         ):
             roles["co"] = j
@@ -586,7 +586,7 @@ def _prefer_kintai_text_for_extraction(text: str) -> str:
             "合計勤務",
             "合計勤務時間",
             "打刻",
-            "勤務先会社名",
+            "会社名",
             "押印",
         )
     )
@@ -624,7 +624,7 @@ def _prefer_kintai_text_for_extraction(text: str) -> str:
         return head.rstrip()
     # 文書上で経費が先・勤怠が後の可能性
     tail = t[keihi_pos + 1 :]
-    for kw in ("勤怠", "勤務表", "出退勤", "出退", "合計勤務", "合計勤務時間", "勤務先会社名"):
+    for kw in ("勤怠", "勤務表", "出退勤", "出退", "合計勤務", "合計勤務時間", "会社名"):
         i = tail.find(kw)
         if i >= 0:
             return tail[i:].strip()
@@ -645,110 +645,49 @@ def _katakana_latin_mismatch_both_look_like_transcription(a: str, b: str) -> boo
     return (mostly_kat(a) and mostly_lat(b)) or (mostly_kat(b) and mostly_lat(a))
 
 
-_SERAKU_MARK_RE = re.compile(r"セラク|seraku", re.IGNORECASE)
-
-
-def _split_company_segments(text: str) -> list[str]:
-    """1セル内の複数会社名を分割（区切りで分割）。"""
-    t = (text or "").strip()
-    if not t:
-        return []
-    parts = re.split(r"[/／、,，｜\|\n]+", t)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _contains_seraku_company_mark(s: str) -> bool:
-    """セラク／英字 seraku（Seraku 等）を含む社名は当社関連として照合・一覧から除外する。
-    誤表記の SELAC は当社名として扱わない。
-    """
-    t = unicodedata.normalize("NFKC", (s or "").strip())
-    if not t:
+def _company_text_contains_seraku(s: str) -> bool:
+    """社名文字列にセラクまたは英字 seraku（大小無視）が含まれるか。"""
+    if not (s or "").strip():
         return False
-    nospace = re.sub(r"\s+", "", t)
-    return bool(_SERAKU_MARK_RE.search(nospace))
+    t = re.sub(r"\s+", "", unicodedata.normalize("NFKC", s))
+    return bool(re.search(r"セラク|seraku", t, re.IGNORECASE))
 
 
-def _collect_company_candidates_from_document(text: str) -> list[tuple[int, str]]:
-    """文面から 勤務先会社名 の候補を出現順に収集（重複は位置が別ならそのまま）。"""
-    if not (text and str(text).strip()):
-        return []
-    raw = str(text)
-    cands: list[tuple[int, str]] = []
-    for m in re.finditer(
-        r"勤務先会社名\s*[：:｜\|]?\s*([^\n\r\|]+?)(?=(\s*\||$|\n))",
-        raw,
-    ):
-        v = m.group(1).strip()
-        if v and v not in ("", "-", "—", "―", "N/A", "n/a", "要確認", "未記載", "null"):
-            if not _is_table_headerish_cell(v):
-                cands.append((m.start(1), v))
-    for m in re.finditer(
-        r"\|[^\n]*?勤務先会社名(?:\s*\|)?\s*([^\n\|]+)", raw, re.IGNORECASE
-    ):
-        v = m.group(1).strip()
-        if v and v not in ("", "-", "—") and not _is_table_headerish_cell(v):
-            cands.append((m.start(1), v))
-    cands.sort(key=lambda x: (x[0], x[1]))
-    return cands
-
-
-def _merge_company_names_for_display(
-    ktab_company: str,
-    doc_text: str,
-) -> tuple[str, list[str]]:
-    """
-    セラクまたは英字 **seraku** を**含む**社名は一覧・照合から除外する（SELAC 表記は対象外）。
-    戻り値: (表示用文字列 "A / B", 照合に使う当社以外の会社名リスト)
-    """
-    ordered_raw: list[str] = []
-    if (ktab_company or "").strip():
-        ordered_raw.append(ktab_company.strip())
-    for _pos, c in _collect_company_candidates_from_document(doc_text):
-        ordered_raw.append(c.strip())
-
-    flat: list[str] = []
-    seen_key: set[str] = set()
-    for block in ordered_raw:
-        for seg in _split_company_segments(block):
-            if _contains_seraku_company_mark(seg):
-                continue
-            key = _normalize_mixed(seg)
-            if key not in seen_key:
-                seen_key.add(key)
-                flat.append(seg)
-    if not flat:
-        return "不明", []
-    display = " / ".join(flat)
-    return display, flat
-
-
-def _file_company_for_match(company_from_file: str) -> str:
-    """ファイル名由来の会社。セラク／seraku を含むときは照合対象外（空）。"""
+def _file_co_for_match(company_from_file: str) -> str:
+    """ファイル名由来の会社。セラク/seraku を含むときは照合対象外（空文字）。"""
     s = (company_from_file or "").strip()
-    if not s or _contains_seraku_company_mark(s):
+    if not s or _company_text_contains_seraku(s):
         return ""
     return s
 
 
-def _best_match_company_symbol(file_co: str, doc_companies: list[str]) -> str:
-    """ファイル名会社と、文書の（当社・seraku 以外の）会社名リストの最良照合（〇>△>✖）。"""
-    fp = _file_company_for_match(file_co)
-    if not doc_companies:
+def _document_company_for_display(ktab_company: str) -> str:
+    """会社名1列用。セラクを含む勤怠表の会社は表示しない（不明扱い）。"""
+    k = (ktab_company or "").strip()
+    if not k:
+        return "不明"
+    if _company_text_contains_seraku(k):
+        return "不明"
+    return k
+
+
+def _document_company_for_match(ktab_company: str) -> str:
+    """照合用の文書側会社。セラクを含む場合は空（ファイル名との比較から外す）。"""
+    k = (ktab_company or "").strip()
+    if not k or _company_text_contains_seraku(k):
+        return ""
+    return k
+
+
+def _match_company_symbol_single(file_co: str, doc_company: str) -> str:
+    """勤怠表から取れた会社名1件とファイル名会社を照合（以前の複数社名マージ版の単一化）。"""
+    fp = _file_co_for_match(file_co)
+    d = (doc_company or "").strip()
+    if not d:
         return "〇" if not fp else "✖"
-    rank = {"〇": 3, "△": 2, "✖": 1}
-    best = "✖"
-    for d in doc_companies:
-        ds = (d or "").strip()
-        if not ds:
-            continue
-        sym = _compare_company(fp, ds) if fp else "✖"
-        if rank[sym] > rank[best]:
-            best = sym
-        if best == "〇":
-            break
-    if not fp and doc_companies:
+    if not fp:
         return "△"
-    return best
+    return _compare_company(fp, d)
 
 
 def _series_company_hint(f_raw: str, d_raw: str) -> bool:
@@ -762,13 +701,6 @@ def _series_company_hint(f_raw: str, d_raw: str) -> bool:
             return True
     return False
 
-
-def _extract_company_name_from_document(text: str) -> str:
-    """後方互換: 単一代表名（当社・seraku 以外を優先、複数は先頭のみ）。"""
-    disp, lst = _merge_company_names_for_display("", text)
-    if lst:
-        return lst[0]
-    return ""
 
 
 def _extract_person_name_from_document(text: str) -> str:
@@ -927,22 +859,8 @@ def _enrich_with_match_scores(
     row["employee_no"] = _employee_no_from_file_name(fn)
     ktab = _extract_kintai_from_markdown_table(text_for_extraction, fn) or {}
     k_co = (ktab.get("company") or "").strip()
-    disp_co, doc_co_list = _merge_company_names_for_display(
-        k_co, text_for_extraction
-    )
-
-    # 複数社名が取れた場合は「会社名1」「会社名2」に分けて保持
-    name_company_1 = ""
-    name_company_2 = ""
-    if doc_co_list:
-        name_company_1 = (doc_co_list[0] or "").strip()
-        name_company_2 = (doc_co_list[1] or "").strip() if len(doc_co_list) >= 2 else ""
-    if not name_company_1 and disp_co.strip() and disp_co != "不明":
-        # 念のため display からも補完
-        parts = [p.strip() for p in disp_co.split("/") if p.strip()]
-        if parts:
-            name_company_1 = parts[0]
-            name_company_2 = parts[1] if len(parts) >= 2 else ""
+    name_company_1 = _document_company_for_display(k_co)
+    doc_co_match = _document_company_for_match(k_co)
     d_pe = (ktab.get("person") or "").strip() or _extract_person_name_from_document(
         text_for_extraction
     )
@@ -953,12 +871,11 @@ def _enrich_with_match_scores(
     _seal_norm = _normalize_seal_phrase(s_seal) if s_seal else ""
     row["name_company_from_file"] = fp_co
     row["name_person_from_file"] = fp_pe
-    row["name_company_1"] = name_company_1 or "不明"
-    row["name_company_2"] = name_company_2
-    # 互換: 従来キーも残す
-    row["name_company_from_doc"] = (disp_co or "").strip() if disp_co else ""
+    row["name_company_1"] = name_company_1
+    # 互換: 従来キーも残す（勤怠表の会社セルのみ）
+    row["name_company_from_doc"] = k_co
     row["name_person_from_doc"] = d_pe
-    row["match_company"] = _best_match_company_symbol(fp_co, doc_co_list)
+    row["match_company"] = _match_company_symbol_single(fp_co, doc_co_match)
     row["user_judgment_company"] = row["match_company"]
     row["match_person"] = _compare_person(fp_pe, d_pe)
     th_dec = _work_hours_string_to_decimal(th_raw)
@@ -978,8 +895,31 @@ def _escape_md_table_cell(text: str) -> str:
     return text.replace("\n", "<br>")
 
 
+# アップロードが 422 等で失敗した際、ワーカーのチャットを作り直す判断に使う
+_UPLOAD_RECREATE_CHAT_STATUSES = frozenset(
+    {400, 404, 407, 408, 409, 410, 422, 423, 424, 425, 426, 500}
+)
+
+
+def _extract_http_status_from_adk_exc(exc: BaseException) -> int | None:
+    """NewtonX ADK が付ける FileUploadError 等から HTTP ステータスを推定。"""
+    sc = getattr(exc, "status_code", None)
+    if isinstance(sc, int):
+        return sc
+    msg = str(exc)
+    m = re.search(r"に失敗:\s*(\d{3})\s*-", msg)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _upload_http_error_should_recreate_chat(exc: BaseException) -> bool:
+    code = _extract_http_status_from_adk_exc(exc)
+    return code is not None and code in _UPLOAD_RECREATE_CHAT_STATUSES
+
+
 SUMMARY_MD_HEADER = (
-    f"| {SUMMARY_UPLOAD_COL} | 画像ファイル名 | 会社名1 | 会社名2 | 氏名 | 社員番号 | "
+    f"| {SUMMARY_UPLOAD_COL} | 画像ファイル名 | 会社名1 | 氏名 | 社員番号 | "
     "合計勤務時間（10進） | 合計勤務時間（読取） | 押印有無 | "
     "会社名比較（ファイル名✖文書） | ユーザ判断 |"
 )
@@ -988,44 +928,98 @@ SUMMARY_MD_HEADER = (
 def _upload_image_with_retries(
     wc: NewtonXClient,
     *,
-    chat_uid: str,
+    chat_uid_holder: dict[str, str],
     upload_src: str | Path,
     file_name: str,
+    recreate_chat_fn: Callable[[BaseException], bool] | None = None,
+    log_emit: Callable[[str], None] | None = None,
 ) -> tuple[str | None, bool]:
-    """upload_image を初回＋ UPLOAD_MAX_RETRIES 回まで試す。（image_id, 上限内で成功したか）。"""
+    """upload_image を試行する。422 などの場合は recreate_chat_fn でチャット刷新後・同一試行で再アップロード。"""
     last: str | None = None
+    lg = log_emit if log_emit is not None else print
+
+    def _recover_if_applicable(exc: BaseException, *, recovered_already: bool) -> bool:
+        if not recreate_chat_fn or recovered_already:
+            return False
+        if not _upload_http_error_should_recreate_chat(exc):
+            return False
+        code = _extract_http_status_from_adk_exc(exc)
+        code_s = str(code) if code is not None else "?"
+        lg(f"画像アップロード失敗 HTTP {code_s} のためチャットを再作成して再試行します。")
+        return bool(recreate_chat_fn(exc))
+
     for attempt in range(UPLOAD_MAX_RETRIES + 1):
         if attempt > 0 and UPLOAD_RETRY_DELAY_SEC > 0:
             time.sleep(UPLOAD_RETRY_DELAY_SEC)
-        last = wc.upload_image(
-            chat_uid=chat_uid,
-            file_path=upload_src,
-            file_name=file_name,
-        )
-        if last:
-            return last, True
+        recovered_round = False
+        while True:
+            try:
+                last = wc.upload_image(
+                    chat_uid=chat_uid_holder["chat_uid"],
+                    file_path=upload_src,
+                    file_name=file_name,
+                )
+                if last:
+                    return last, True
+                break
+            except FileUploadError as e:
+                if _extract_http_status_from_adk_exc(e) is None:
+                    lg(f"画像アップロード: リトライ不能な検証／IOエラーです — {e}")
+                    return None, False
+                if _recover_if_applicable(e, recovered_already=recovered_round):
+                    recovered_round = True
+                    continue
+                last = None
+                break
     return last, False
 
 
 def _upload_document_with_retries(
     wc: NewtonXClient,
     *,
-    chat_uid: str,
+    chat_uid_holder: dict[str, str],
     file_path: str,
     file_name: str,
+    recreate_chat_fn: Callable[[BaseException], bool] | None = None,
+    log_emit: Callable[[str], None] | None = None,
 ) -> tuple[bool, bool]:
-    """upload_document を初回＋ UPLOAD_MAX_RETRIES 回まで試す。（成功, 上限内で成功したか）。"""
+    """upload_document を試行する。チャット刷新ロジックは画像と同一。"""
     last_ok = False
+    lg = log_emit if log_emit is not None else print
+
+    def _recover_if_applicable(exc: BaseException, *, recovered_already: bool) -> bool:
+        if not recreate_chat_fn or recovered_already:
+            return False
+        if not _upload_http_error_should_recreate_chat(exc):
+            return False
+        code = _extract_http_status_from_adk_exc(exc)
+        code_s = str(code) if code is not None else "?"
+        lg(f"PDFアップロード失敗 HTTP {code_s} のためチャットを再作成して再試行します。")
+        return bool(recreate_chat_fn(exc))
+
     for attempt in range(UPLOAD_MAX_RETRIES + 1):
         if attempt > 0 and UPLOAD_RETRY_DELAY_SEC > 0:
             time.sleep(UPLOAD_RETRY_DELAY_SEC)
-        last_ok = wc.upload_document(
-            chat_uid=chat_uid,
-            file_path=file_path,
-            file_name=file_name,
-        )
-        if last_ok:
-            return True, True
+        recovered_round = False
+        while True:
+            try:
+                last_ok = wc.upload_document(
+                    chat_uid=chat_uid_holder["chat_uid"],
+                    file_path=file_path,
+                    file_name=file_name,
+                )
+                if last_ok:
+                    return True, True
+                break
+            except FileUploadError as e:
+                if _extract_http_status_from_adk_exc(e) is None:
+                    lg(f"PDFアップロード: リトライ不能な検証／IOエラーです — {e}")
+                    return False, False
+                if _recover_if_applicable(e, recovered_already=recovered_round):
+                    recovered_round = True
+                    continue
+                last_ok = False
+                break
     return last_ok, False
 
 
@@ -1038,11 +1032,10 @@ def _upload_ok_symbol(row: dict[str, str]) -> str:
 
 
 def _one_summary_data_line(r: dict[str, str]) -> str:
-    """11列1行分（集計用）。先頭はアップロード成否（〇/✖）、ユーザ判断は初期値は match_company と同じ。"""
+    """10列1行分（集計用）。先頭はアップロード成否（〇/✖）、ユーザ判断は初期値は match_company と同じ。"""
     u_sym = _escape_md_table_cell(_upload_ok_symbol(r))
     fn = _escape_md_table_cell(r.get("file_name", ""))
     co1 = _escape_md_table_cell((r.get("name_company_1") or "").strip() or "不明")
-    co2 = _escape_md_table_cell((r.get("name_company_2") or "").strip() or "")
     pe = _escape_md_table_cell(
         (r.get("name_person_from_doc") or "").strip() or "不明"
     )
@@ -1060,7 +1053,7 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     uj = (r.get("user_judgment_company") or "").strip() or (r.get("match_company") or "✖")
     uj = _escape_md_table_cell(uj)
     return (
-        f"| {u_sym} | {fn} | {co1} | {co2} | {pe} | {emp} | {th} | {lr} | {se} | {mc} | {uj} |"
+        f"| {u_sym} | {fn} | {co1} | {pe} | {emp} | {th} | {lr} | {se} | {mc} | {uj} |"
     )
 
 
@@ -1086,7 +1079,6 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
     up_sym = _upload_ok_symbol(r)
     fn = r.get("file_name", "") or ""
     co1 = (r.get("name_company_1") or "").strip() or "不明"
-    co2 = (r.get("name_company_2") or "").strip() or ""
     pe = (r.get("name_person_from_doc") or "").strip() or "不明"
     emp = (r.get("employee_no") or "").strip() or ""
     th = _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
@@ -1094,7 +1086,7 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
     se = (r.get("seal_in_doc") or "").strip() or "不明"
     mc = r.get("match_company", "✖") or "✖"
     uj = (r.get("user_judgment_company") or "").strip() or mc
-    return (up_sym, fn, co1, co2, pe, emp, th, lr, se, mc, uj)
+    return (up_sym, fn, co1, pe, emp, th, lr, se, mc, uj)
 
 
 def run_analysis(
@@ -1266,6 +1258,35 @@ def run_analysis(
 
     def worker_loop(worker_idx: int, chat_uid: str, tasks: list[tuple[str, Path]]) -> None:
         wc = create_client()
+        chat_holder: dict[str, str] = {"chat_uid": chat_uid}
+
+        def recreate_worker_chat(_exc: BaseException) -> bool:
+            """アップロード系 HTTP エラー時に、本ワーカーの作業チャットを作り直す。"""
+            try:
+                nc = wc.create_chat_in_folder(
+                    assistant_uid=assistant_uid,
+                    folder_uid=folder_uid,
+                    title=f"業務課集計 #{worker_idx + 1}",
+                )
+                if not nc:
+                    log(f"ワーカー {worker_idx + 1}: チャットの再作成に失敗しました（API）。")
+                    return False
+                try:
+                    wc.move_chat_to_folder(chat_uid=nc, folder_uid=folder_uid)
+                except Exception as me:
+                    log(
+                        f"ワーカー {worker_idx + 1}: "
+                        f"再作成チャットのフォルダ移動に警告 — {me}"
+                    )
+                chat_holder["chat_uid"] = str(nc).strip()
+                log(
+                    f"ワーカー {worker_idx + 1}: "
+                    f"チャットを再作成しました: {chat_holder['chat_uid']}"
+                )
+                return True
+            except Exception as e:
+                log(f"ワーカー {worker_idx + 1}: チャット再作成処理で異常 — {e}")
+                return False
 
         def signal_fatal(exc: BaseException) -> None:
             worker_exc[worker_idx] = exc
@@ -1309,9 +1330,11 @@ def run_analysis(
                         try:
                             image_id, upload_succeeded = _upload_image_with_retries(
                                 wc,
-                                chat_uid=chat_uid,
+                                chat_uid_holder=chat_holder,
                                 upload_src=upload_src,
                                 file_name=file_path.name,
+                                recreate_chat_fn=recreate_worker_chat,
+                                log_emit=log,
                             )
                             if not image_id:
                                 log(
@@ -1334,7 +1357,7 @@ def run_analysis(
                                     )
                                     break
                                 response = wc.send_message(
-                                    chat_uid=chat_uid,
+                                    chat_uid=chat_holder["chat_uid"],
                                     message=_build_check_message(file_path.name),
                                     image_ids=[image_id],
                                 )
@@ -1366,9 +1389,11 @@ def run_analysis(
                             break
                         success, upload_succeeded = _upload_document_with_retries(
                             wc,
-                            chat_uid=chat_uid,
+                            chat_uid_holder=chat_holder,
                             file_path=str(file_path),
                             file_name=file_path.name,
+                            recreate_chat_fn=recreate_worker_chat,
+                            log_emit=log,
                         )
                         if not success:
                             log(
@@ -1392,7 +1417,7 @@ def run_analysis(
                                 )
                                 break
                             response = wc.send_message(
-                                chat_uid=chat_uid,
+                                chat_uid=chat_holder["chat_uid"],
                                 message=_build_pdf_check_message(file_path.name),
                             )
                             if is_cancelled():

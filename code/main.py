@@ -24,6 +24,7 @@ from kintai_core import (
     run_analysis,
     summary_header_cells,
 )
+from newtonx_adk.exceptions import APIError
 
 
 class KintaiApp(tk.Frame):
@@ -730,7 +731,25 @@ def main() -> None:
         sys.exit(1)
 
     # --- アシスタント選択ダイアログ（コンボボックス） ---
-    assistants = client.get_assistants() or []
+    try:
+        assistants = client.get_assistants() or []
+    except APIError as e:
+        err_text = str(e).strip()
+        if "403" in err_text:
+            user_msg = (
+                "アシスタント一覧の取得がサーバーに拒否されました（HTTP 403）。\n"
+                "利用アカウントの権限・ロール、またはトークン／セッションの状態を確認してください。\n\n"
+                f"{err_text}"
+            )
+        else:
+            user_msg = (
+                "アシスタント一覧を取得できませんでした（NewtonX API）。\n\n"
+                f"{err_text}"
+            )
+        messagebox.showerror("NewtonX API エラー", user_msg, parent=root)
+        root.destroy()
+        sys.exit(1)
+
     assistant_names = [str(a.get("name") or "").strip() for a in assistants]
     assistant_names = [n for n in assistant_names if n]
 
