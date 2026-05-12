@@ -1091,10 +1091,31 @@ def run_analysis(
         log("中断: 解析を開始する前にキャンセルされました")
         return []
 
-    folder_uid = client.create_folder("業務課集計")
-    if not folder_uid:
-        raise RuntimeError("NewtonX 上でフォルダの作成に失敗しました。")
-    log(f"フォルダが作成されました: {folder_uid}")
+    target_folder_name = "業務課集計"
+    folders = client.get_folders()
+    matched = next(
+        (
+            f
+            for f in folders
+            if (f.get("name") or "").strip() == target_folder_name
+        ),
+        None,
+    )
+    if matched is not None:
+        raw_id = matched.get("uid") if matched.get("uid") is not None else matched.get(
+            "id"
+        )
+        folder_uid = str(raw_id) if raw_id is not None else None
+        if not folder_uid:
+            raise RuntimeError(
+                "NewtonX のフォルダ一覧に該当がありますが、フォルダ ID を取得できませんでした。"
+            )
+        log(f"既存フォルダを使用します: {target_folder_name} ({folder_uid})")
+    else:
+        folder_uid = client.create_folder(target_folder_name)
+        if not folder_uid:
+            raise RuntimeError("NewtonX 上でフォルダの作成に失敗しました。")
+        log(f"フォルダが作成されました: {folder_uid}")
 
     chat_id: str | None = None
     if image_files:
