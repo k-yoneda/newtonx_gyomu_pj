@@ -5,9 +5,11 @@ from collections.abc import Callable
 
 from newtonx_adk import NewtonXClient, ConfigManager
 import json
+import threading
 import math
 import re
 import tempfile
+import time
 import types
 import unicodedata
 from pathlib import Path
@@ -19,6 +21,16 @@ MIB = 1024 * 1024
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 PDF_SUFFIX = ".pdf"
+
+# アップロード: 初回試行後、最大 UPLOAD_MAX_RETRIES 回まで再試行（合計で最大 1 + UPLOAD_MAX_RETRIES 回）
+UPLOAD_MAX_RETRIES = 3
+UPLOAD_RETRY_DELAY_SEC = 0.35
+
+DEFAULT_PARALLEL_ANALYSIS_CHATS = 2
+PARALLEL_WORKERS_MAX = 32
+
+# グリッド・集計表の先頭列（〇: リトライ上限内でアップロード成功 / ✖: それ以外）
+SUMMARY_UPLOAD_COL = "アップロード"
 
 TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
 #TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
@@ -967,13 +979,67 @@ def _escape_md_table_cell(text: str) -> str:
 
 
 SUMMARY_MD_HEADER = (
-    "| 画像ファイル名 | 会社名1 | 会社名2 | 氏名 | 社員番号 | 合計勤務時間（10進） | "
-    "合計勤務時間（読取） | 押印有無 | 会社名比較（ファイル名✖文書） | ユーザ判断 |"
+    f"| {SUMMARY_UPLOAD_COL} | 画像ファイル名 | 会社名1 | 会社名2 | 氏名 | 社員番号 | "
+    "合計勤務時間（10進） | 合計勤務時間（読取） | 押印有無 | "
+    "会社名比較（ファイル名✖文書） | ユーザ判断 |"
 )
 
 
+def _upload_image_with_retries(
+    wc: NewtonXClient,
+    *,
+    chat_uid: str,
+    upload_src: str | Path,
+    file_name: str,
+) -> tuple[str | None, bool]:
+    """upload_image を初回＋ UPLOAD_MAX_RETRIES 回まで試す。（image_id, 上限内で成功したか）。"""
+    last: str | None = None
+    for attempt in range(UPLOAD_MAX_RETRIES + 1):
+        if attempt > 0 and UPLOAD_RETRY_DELAY_SEC > 0:
+            time.sleep(UPLOAD_RETRY_DELAY_SEC)
+        last = wc.upload_image(
+            chat_uid=chat_uid,
+            file_path=upload_src,
+            file_name=file_name,
+        )
+        if last:
+            return last, True
+    return last, False
+
+
+def _upload_document_with_retries(
+    wc: NewtonXClient,
+    *,
+    chat_uid: str,
+    file_path: str,
+    file_name: str,
+) -> tuple[bool, bool]:
+    """upload_document を初回＋ UPLOAD_MAX_RETRIES 回まで試す。（成功, 上限内で成功したか）。"""
+    last_ok = False
+    for attempt in range(UPLOAD_MAX_RETRIES + 1):
+        if attempt > 0 and UPLOAD_RETRY_DELAY_SEC > 0:
+            time.sleep(UPLOAD_RETRY_DELAY_SEC)
+        last_ok = wc.upload_document(
+            chat_uid=chat_uid,
+            file_path=file_path,
+            file_name=file_name,
+        )
+        if last_ok:
+            return True, True
+    return last_ok, False
+
+
+def _upload_ok_symbol(row: dict[str, str]) -> str:
+    """JSON に upload_ok が無い既存データは空欄。無効値も空欄に寄せる。"""
+    if "upload_ok" not in row:
+        return ""
+    v = (row.get("upload_ok") or "").strip()
+    return v if v in ("〇", "✖") else ""
+
+
 def _one_summary_data_line(r: dict[str, str]) -> str:
-    """10列1行分（集計用）。ユーザ判断は初期値は match_company と同じ。"""
+    """11列1行分（集計用）。先頭はアップロード成否（〇/✖）、ユーザ判断は初期値は match_company と同じ。"""
+    u_sym = _escape_md_table_cell(_upload_ok_symbol(r))
     fn = _escape_md_table_cell(r.get("file_name", ""))
     co1 = _escape_md_table_cell((r.get("name_company_1") or "").strip() or "不明")
     co2 = _escape_md_table_cell((r.get("name_company_2") or "").strip() or "")
@@ -993,7 +1059,9 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     mc = _escape_md_table_cell(r.get("match_company", "✖"))
     uj = (r.get("user_judgment_company") or "").strip() or (r.get("match_company") or "✖")
     uj = _escape_md_table_cell(uj)
-    return f"| {fn} | {co1} | {co2} | {pe} | {emp} | {th} | {lr} | {se} | {mc} | {uj} |"
+    return (
+        f"| {u_sym} | {fn} | {co1} | {co2} | {pe} | {emp} | {th} | {lr} | {se} | {mc} | {uj} |"
+    )
 
 
 def _summary_table_md_lines(results: list[dict[str, str]]) -> list[str]:
@@ -1015,6 +1083,7 @@ def summary_header_cells() -> tuple[str, ...]:
 
 def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
     """グリッド表示用（Markdown エスケープなし）。 _one_summary_data_line と同一ルール。"""
+    up_sym = _upload_ok_symbol(r)
     fn = r.get("file_name", "") or ""
     co1 = (r.get("name_company_1") or "").strip() or "不明"
     co2 = (r.get("name_company_2") or "").strip() or ""
@@ -1025,7 +1094,7 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
     se = (r.get("seal_in_doc") or "").strip() or "不明"
     mc = r.get("match_company", "✖") or "✖"
     uj = (r.get("user_judgment_company") or "").strip() or mc
-    return (fn, co1, co2, pe, emp, th, lr, se, mc, uj)
+    return (up_sym, fn, co1, co2, pe, emp, th, lr, se, mc, uj)
 
 
 def run_analysis(
@@ -1040,18 +1109,22 @@ def run_analysis(
     on_row_completed: Callable[[dict[str, str]], None] | None = None,
     cancel_event=None,
     skip_file_names: set[str] | None = None,
+    parallel_chats: int = DEFAULT_PARALLEL_ANALYSIS_CHATS,
 ) -> list[dict[str, str]]:
     """
     指定フォルダ直下の画像と PDF を名前順で解析し、結果行のリストを返す。
+    NewtonX では parallel_chats 本のチャットを同一フォルダに作成し、
+    ファイルをラウンドロビンで割り当ててスレッド並列処理する（終了時は全スレッド join）。
+    各ワーカーは独自の NewtonXClient で API を呼び出す。
+    アップロードは、失敗のたびに最大 UPLOAD_MAX_RETRIES 回まで再試行します（総試行は多くとも 1+UPLOAD_MAX_RETRIES 回）。
     save_md_path が None のときは cwd に 解析結果.md を出力する。
     emit_progress_md_rows が False のとき、コンソール向け Markdown 行は on_log に流さない。
     on_file_progress: 処理が終わったファイル数を (実行済み数, 対象総数) で通知する（各ファイルの試行の末尾で1回）。
-    on_row_completed: 解析結果を1件 results に載せた直後に呼ぶ（画像・PDF それぞれ成功時のみ）。
+    on_row_completed: 解析結果またはアップロード失敗行を1件 results に載せた直後に呼ぶ。
     cancel_event: threading.Event 互換。set() されたら以降の解析を中断する（処理中の1ファイルは止まらず、次の境界で止まる）。
     skip_file_names: ここに含まれるファイル名は解析処理自体をスキップする（progress は進める）。
     """
     log = on_log if on_log is not None else print
-    results: list[dict[str, str]] = []
 
     if not data_dir.is_dir():
         raise FileNotFoundError(f"フォルダが存在しません: {data_dir}")
@@ -1071,6 +1144,7 @@ def run_analysis(
 
     total_files = len(image_files) + len(pdf_files)
     progress_done = 0
+    progress_lock = threading.Lock()
 
     def is_cancelled() -> bool:
         try:
@@ -1080,9 +1154,11 @@ def run_analysis(
 
     def notify_file_finished() -> None:
         nonlocal progress_done
-        progress_done += 1
+        with progress_lock:
+            progress_done += 1
+            cur = progress_done
         if on_file_progress is not None:
-            on_file_progress(progress_done, total_files)
+            on_file_progress(cur, total_files)
 
     if on_file_progress is not None:
         on_file_progress(0, total_files)
@@ -1102,8 +1178,10 @@ def run_analysis(
         None,
     )
     if matched is not None:
-        raw_id = matched.get("uid") if matched.get("uid") is not None else matched.get(
-            "id"
+        raw_id = (
+            matched.get("uid")
+            if matched.get("uid") is not None
+            else matched.get("id")
         )
         folder_uid = str(raw_id) if raw_id is not None else None
         if not folder_uid:
@@ -1117,156 +1195,268 @@ def run_analysis(
             raise RuntimeError("NewtonX 上でフォルダの作成に失敗しました。")
         log(f"フォルダが作成されました: {folder_uid}")
 
-    chat_id: str | None = None
-    if image_files:
+    n_workers = int(parallel_chats)
+    if n_workers < 1:
+        n_workers = DEFAULT_PARALLEL_ANALYSIS_CHATS
+    elif n_workers > PARALLEL_WORKERS_MAX:
+        n_workers = PARALLEL_WORKERS_MAX
+
+    chat_uids: list[str] = []
+    for wi in range(n_workers):
         chat_uid = client.create_chat_in_folder(
             assistant_uid=assistant_uid,
             folder_uid=folder_uid,
-            title="業務課集計",
+            title=f"業務課集計 #{wi + 1}",
         )
+        if chat_uid:
+            client.move_chat_to_folder(chat_uid=chat_uid, folder_uid=folder_uid)
         if not chat_uid:
-            raise RuntimeError("画像用チャットの作成に失敗しました。")
-        log(f"チャットが作成されました（画像用）: {chat_uid}")
-        client.move_chat_to_folder(chat_uid=chat_uid, folder_uid=folder_uid)
-        log(f"チャットが移動されました: {chat_uid}")
-        chat_id = chat_uid
+            raise RuntimeError(
+                f"NewtonX 上でチャットの作成に失敗しました（{wi + 1} / {n_workers}）。"
+            )
+        log(f"チャットが作成されました（並列ワーカー {wi + 1}）: {chat_uid}")
+        chat_uids.append(chat_uid)
 
     summary_header_done = False
+    summary_lock = threading.Lock()
 
     def emit_summary_row_md(row_dict: dict[str, str]) -> None:
         nonlocal summary_header_done
         if not emit_progress_md_rows:
             return
-        if not summary_header_done:
-            log(SUMMARY_MD_HEADER)
-            summary_header_done = True
-        log(_one_summary_data_line(row_dict))
+        with summary_lock:
+            if not summary_header_done:
+                log(SUMMARY_MD_HEADER)
+                summary_header_done = True
+            log(_one_summary_data_line(row_dict))
 
-    for file_path in image_files:
-        if is_cancelled():
-            log("中断: 画像の解析を中断しました")
-            break
-        try:
+    tasks_ordered: list[tuple[str, Path]] = [
+        ("image", p) for p in image_files
+    ] + [("pdf", p) for p in pdf_files]
+
+    buckets: list[list[tuple[str, Path]]] = [[] for _ in range(n_workers)]
+    for i, task in enumerate(tasks_ordered):
+        buckets[i % n_workers].append(task)
+
+    bucket_results: list[list[dict[str, str]]] = [[] for _ in range(n_workers)]
+    worker_exc: list[BaseException | None] = [None] * n_workers
+
+    def append_upload_failure_row(
+        worker_ix: int,
+        file_path: Path,
+        *,
+        prefer_pdf_section: bool,
+        message: str,
+    ) -> None:
+        row = {
+            "upload_ok": "✖",
+            "file_name": file_path.name,
+            "resolved_path": str(file_path.resolve()),
+            "analysis": message,
+        }
+        _enrich_with_match_scores(
+            row,
+            row["analysis"],
+            prefer_kintai_section=prefer_pdf_section,
+        )
+        bucket_results[worker_ix].append(row)
+        emit_summary_row_md(row)
+        if on_row_completed is not None:
+            on_row_completed(row)
+
+    def worker_loop(worker_idx: int, chat_uid: str, tasks: list[tuple[str, Path]]) -> None:
+        wc = create_client()
+
+        def signal_fatal(exc: BaseException) -> None:
+            worker_exc[worker_idx] = exc
             try:
-                upload_src, tmp_upload = _resolve_upload_path(file_path)
-            except (OSError, RuntimeError, ValueError, UnidentifiedImageError) as e:
+                if cancel_event is not None:
+                    cancel_event.set()
+            except Exception:
+                pass
+
+        for kind, file_path in tasks:
+            if is_cancelled():
                 log(
-                    f"スキップ: 画像の読み込み／圧縮に失敗しました — {file_path.name}: {e}"
+                    f"中断: ワーカー {worker_idx + 1} がキャンセルにより停止しました"
                 )
-            else:
-                if is_cancelled():
-                    log("中断: 画像のアップロード前にキャンセルされました")
-                    break
-                tmp_upload_path: Path | None = tmp_upload
-                try:
-                    image_id = client.upload_image(
-                        chat_uid=chat_id,
-                        file_path=upload_src,
-                        file_name=file_path.name,
-                    )
-                    if not image_id:
-                        log(
-                            f"スキップ: アップロードに失敗しました — {file_path.name}"
-                        )
-                    else:
-                        if is_cancelled():
-                            log("中断: 画像の解析要求前にキャンセルされました")
-                            break
-                        response = client.send_message(
-                            chat_uid=chat_id,
-                            message=_build_check_message(file_path.name),
-                            image_ids=[image_id],
-                        )
-                        if is_cancelled():
-                            log("中断: 画像の解析応答待ち後にキャンセルされました")
-                            break
-                        row = {
-                            "file_name": file_path.name,
-                            "resolved_path": str(file_path.resolve()),
-                            "analysis": response
-                            if response
-                            else "（解析結果を取得できませんでした）",
-                        }
-                        _enrich_with_match_scores(row, row["analysis"])
-                        results.append(row)
-                        emit_summary_row_md(row)
-                        if on_row_completed is not None:
-                            on_row_completed(row)
-                finally:
-                    if tmp_upload_path is not None:
-                        tmp_upload_path.unlink(missing_ok=True)
-        finally:
-            notify_file_finished()
-
-    for file_path in pdf_files:
-        if is_cancelled():
-            log("中断: PDFの解析を中断しました")
-            break
-        try:
+                break
             try:
-                if is_cancelled():
-                    log("中断: PDFチャット作成前にキャンセルされました")
-                    break
-                pdf_chat_uid = client.create_chat_in_folder(
-                    assistant_uid=assistant_uid,
-                    folder_uid=folder_uid,
-                    title=f"業務課集計 PDF: {file_path.name}",
-                )
-                if not pdf_chat_uid:
-                    log(
-                        f"スキップ: PDF用チャットの作成に失敗しました — {file_path.name}"
-                    )
-                else:
-                    log(
-                        f"PDF用チャットを作成しました: {pdf_chat_uid} ({file_path.name})"
-                    )
-                    client.move_chat_to_folder(
-                        chat_uid=pdf_chat_uid, folder_uid=folder_uid
-                    )
-
-                    if is_cancelled():
-                        log("中断: PDFアップロード前にキャンセルされました")
-                        break
-                    success = client.upload_document(
-                        chat_uid=pdf_chat_uid,
-                        file_path=str(file_path),
-                        file_name=file_path.name,
-                    )
-                    if not success:
+                if kind == "image":
+                    try:
+                        upload_src, tmp_upload = _resolve_upload_path(file_path)
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        UnidentifiedImageError,
+                    ) as e:
                         log(
-                            f"スキップ: PDFのアップロードに失敗しました — {file_path.name}"
+                            f"スキップ: 画像の読み込み／圧縮に失敗しました — "
+                            f"{file_path.name}: {e}"
+                        )
+                        append_upload_failure_row(
+                            worker_idx,
+                            file_path,
+                            prefer_pdf_section=False,
+                            message="（画像の読み込み／圧縮に失敗しました）",
                         )
                     else:
-                        log(f"PDFがアップロードされました: {file_path.name}")
+                        if is_cancelled():
+                            log("中断: 画像のアップロード前にキャンセルされました")
+                            break
+                        tmp_upload_path: Path | None = tmp_upload
+                        try:
+                            image_id, upload_succeeded = _upload_image_with_retries(
+                                wc,
+                                chat_uid=chat_uid,
+                                upload_src=upload_src,
+                                file_name=file_path.name,
+                            )
+                            if not image_id:
+                                log(
+                                    f"スキップ: アップロードに失敗しました（最大 "
+                                    f"{UPLOAD_MAX_RETRIES} 回までリトライ）— "
+                                    f"{file_path.name}"
+                                )
+                                append_upload_failure_row(
+                                    worker_idx,
+                                    file_path,
+                                    prefer_pdf_section=False,
+                                    message=(
+                                        f"（画像アップロード失敗／{UPLOAD_MAX_RETRIES}回リトライまで）"
+                                    ),
+                                )
+                            else:
+                                if is_cancelled():
+                                    log(
+                                        "中断: 画像の解析要求前にキャンセルされました"
+                                    )
+                                    break
+                                response = wc.send_message(
+                                    chat_uid=chat_uid,
+                                    message=_build_check_message(file_path.name),
+                                    image_ids=[image_id],
+                                )
+                                if is_cancelled():
+                                    log(
+                                        "中断: 画像の解析応答待ち後にキャンセルされました"
+                                    )
+                                    break
+                                row = {
+                                    "upload_ok": "〇" if upload_succeeded else "✖",
+                                    "file_name": file_path.name,
+                                    "resolved_path": str(file_path.resolve()),
+                                    "analysis": response
+                                    if response
+                                    else "（解析結果を取得できませんでした）",
+                                }
+                                _enrich_with_match_scores(row, row["analysis"])
+                                bucket_results[worker_idx].append(row)
+                                emit_summary_row_md(row)
+                                if on_row_completed is not None:
+                                    on_row_completed(row)
+                        finally:
+                            if tmp_upload_path is not None:
+                                tmp_upload_path.unlink(missing_ok=True)
+                else:
+                    try:
+                        if is_cancelled():
+                            log("中断: PDFアップロード前にキャンセルされました")
+                            break
+                        success, upload_succeeded = _upload_document_with_retries(
+                            wc,
+                            chat_uid=chat_uid,
+                            file_path=str(file_path),
+                            file_name=file_path.name,
+                        )
+                        if not success:
+                            log(
+                                f"スキップ: PDFのアップロードに失敗しました（最大 "
+                                f"{UPLOAD_MAX_RETRIES} 回までリトライ）— "
+                                f"{file_path.name}"
+                            )
+                            append_upload_failure_row(
+                                worker_idx,
+                                file_path,
+                                prefer_pdf_section=True,
+                                message=(
+                                    f"（PDFアップロード失敗／{UPLOAD_MAX_RETRIES}回リトライまで）"
+                                ),
+                            )
+                        else:
+                            log(f"PDFがアップロードされました: {file_path.name}")
+                            if is_cancelled():
+                                log(
+                                    "中断: PDFの解析要求前にキャンセルされました"
+                                )
+                                break
+                            response = wc.send_message(
+                                chat_uid=chat_uid,
+                                message=_build_pdf_check_message(file_path.name),
+                            )
+                            if is_cancelled():
+                                log(
+                                    "中断: PDFの解析応答待ち後にキャンセルされました"
+                                )
+                                break
+                            row2 = {
+                                "upload_ok": "〇" if upload_succeeded else "✖",
+                                "file_name": file_path.name,
+                                "resolved_path": str(file_path.resolve()),
+                                "analysis": response
+                                if response
+                                else "（解析結果を取得できませんでした）",
+                            }
+                            _enrich_with_match_scores(
+                                row2,
+                                row2["analysis"],
+                                prefer_kintai_section=True,
+                            )
+                            bucket_results[worker_idx].append(row2)
+                            emit_summary_row_md(row2)
+                            if on_row_completed is not None:
+                                on_row_completed(row2)
+                    except Exception as e:
+                        log(
+                            f"スキップ: PDFの処理に失敗しました — "
+                            f"{file_path.name}: {e}"
+                        )
+            except BaseException as e:
+                signal_fatal(e)
+                break
+            finally:
+                notify_file_finished()
 
-                        if is_cancelled():
-                            log("中断: PDFの解析要求前にキャンセルされました")
-                            break
-                        response = client.send_message(
-                            chat_uid=pdf_chat_uid,
-                            message=_build_pdf_check_message(file_path.name),
-                        )
-                        if is_cancelled():
-                            log("中断: PDFの解析応答待ち後にキャンセルされました")
-                            break
-                        row2 = {
-                            "file_name": file_path.name,
-                            "resolved_path": str(file_path.resolve()),
-                            "analysis": response
-                            if response
-                            else "（解析結果を取得できませんでした）",
-                        }
-                        _enrich_with_match_scores(
-                            row2, row2["analysis"], prefer_kintai_section=True
-                        )
-                        results.append(row2)
-                        emit_summary_row_md(row2)
-                        if on_row_completed is not None:
-                            on_row_completed(row2)
-            except Exception as e:
-                log(f"スキップ: PDFの処理に失敗しました — {file_path.name}: {e}")
-        finally:
-            notify_file_finished()
+    threads = [
+        threading.Thread(
+            target=worker_loop,
+            args=(wi, chat_uids[wi], buckets[wi]),
+            name=f"kintai-worker-{wi}",
+            daemon=False,
+        )
+        for wi in range(n_workers)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    results = []
+    for wi in range(n_workers):
+        results.extend(bucket_results[wi])
+
+    def _row_kind_order(row: dict[str, str]) -> tuple[int, str]:
+        fn = row.get("file_name") or ""
+        ext = Path(fn).suffix.lower()
+        kind_order = 0 if ext != PDF_SUFFIX else 1
+        return (kind_order, fn)
+
+    results.sort(key=_row_kind_order)
+
+    fatal = next((e for e in worker_exc if e is not None), None)
+    if fatal is not None:
+        raise fatal
 
     if is_cancelled():
         log("中断: 結果ファイルの出力前にキャンセルされました")

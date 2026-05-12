@@ -16,6 +16,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from kintai_core import (
+    DEFAULT_PARALLEL_ANALYSIS_CHATS,
+    PARALLEL_WORKERS_MAX,
     TARGET_ASSISTANT_NAME,
     create_client,
     row_display_values,
@@ -34,6 +36,7 @@ class KintaiApp(tk.Frame):
         *,
         client,
         assistant_uid: str,
+        parallel_workers: int = DEFAULT_PARALLEL_ANALYSIS_CHATS,
     ) -> None:
         super().__init__(master)
         self._root = master
@@ -41,6 +44,8 @@ class KintaiApp(tk.Frame):
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._client = client
         self._assistant_uid = assistant_uid
+        nw = int(parallel_workers)
+        self._parallel_workers = max(1, min(nw, PARALLEL_WORKERS_MAX))
         self._data_dir: Path | None = None
         self._busy = False
         self._item_paths: dict[str, str] = {}
@@ -113,7 +118,7 @@ class KintaiApp(tk.Frame):
         # headings（列名）と col_px（列幅）の数がズレると zip(strict=True) で落ちるため、
         # headings の列数に追従して幅リストを整形する。
         default_w_px = 120
-        col_px_base = [320, 200, 120, 120, 140, 80, 220, 72]
+        col_px_base = [56, 320, 200, 120, 120, 140, 80, 220, 72]
         if len(col_px_base) < len(headings):
             col_px = col_px_base + [default_w_px] * (len(headings) - len(col_px_base))
         else:
@@ -571,6 +576,7 @@ class KintaiApp(tk.Frame):
                     on_row_completed=on_row_merge,
                     cancel_event=self._cancel_event,
                     skip_file_names=skip_names,
+                    parallel_chats=self._parallel_workers,
                 )
             except BaseException as e:
                 err = e
@@ -738,7 +744,7 @@ def main() -> None:
         sys.exit(1)
 
     dlg = tk.Toplevel(root)
-    dlg.title("アシスタント選択")
+    dlg.title("アシスタント・並列設定")
     dlg.transient(root)
     dlg.grab_set()
 
@@ -754,17 +760,39 @@ def main() -> None:
     default_name = TARGET_ASSISTANT_NAME if TARGET_ASSISTANT_NAME in assistant_names else assistant_names[0]
     sel_var.set(default_name)
 
+    wf = ttk.Frame(dlg)
+    wf.pack(fill=tk.X, padx=12, pady=(12, 0))
+    ttk.Label(wf, text="ワーカースレッド数（並列チャット数）:").pack(side=tk.LEFT)
+    workers_var = tk.StringVar(value=str(DEFAULT_PARALLEL_ANALYSIS_CHATS))
+    tk.Spinbox(
+        wf,
+        from_=1,
+        to=PARALLEL_WORKERS_MAX,
+        textvariable=workers_var,
+        width=6,
+        justify="center",
+    ).pack(side=tk.LEFT, padx=(8, 0))
+    ttk.Label(wf, text=f"（1〜{PARALLEL_WORKERS_MAX}、既定 {DEFAULT_PARALLEL_ANALYSIS_CHATS}）").pack(
+        side=tk.LEFT, padx=(8, 0)
+    )
+
     btns = ttk.Frame(dlg)
     btns.pack(fill=tk.X, padx=12, pady=12)
 
-    chosen: dict[str, str | None] = {"name": None}
+    chosen_name: dict[str, str | None] = {"value": None}
+    chosen_workers: dict[str, int] = {"value": DEFAULT_PARALLEL_ANALYSIS_CHATS}
 
     def on_ok() -> None:
-        chosen["name"] = (sel_var.get() or "").strip() or default_name
+        chosen_name["value"] = (sel_var.get() or "").strip() or default_name
+        try:
+            nw = int(str(workers_var.get()).strip())
+        except (TypeError, ValueError):
+            nw = DEFAULT_PARALLEL_ANALYSIS_CHATS
+        chosen_workers["value"] = max(1, min(nw, PARALLEL_WORKERS_MAX))
         dlg.destroy()
 
     def on_cancel() -> None:
-        chosen["name"] = None
+        chosen_name["value"] = None
         dlg.destroy()
 
     ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
@@ -781,11 +809,11 @@ def main() -> None:
 
     root.wait_window(dlg)
 
-    if not chosen["name"]:
+    if not chosen_name["value"]:
         root.destroy()
         sys.exit(0)
 
-    selected_name = str(chosen["name"])
+    selected_name = str(chosen_name["value"])
     selected = next(
         (a for a in assistants if str(a.get("name") or "").strip() == selected_name),
         None,
@@ -812,6 +840,7 @@ def main() -> None:
         root,
         client=client,
         assistant_uid=assistant_uid,
+        parallel_workers=chosen_workers["value"],
     )
     app.pack(fill=tk.BOTH, expand=True)
     root.update_idletasks()
