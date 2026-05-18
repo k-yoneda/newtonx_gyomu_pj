@@ -19,6 +19,8 @@ from kintai_core import (
     DEFAULT_PARALLEL_ANALYSIS_CHATS,
     PARALLEL_WORKERS_MAX,
     TARGET_ASSISTANT_NAME,
+    _decimal_for_table_display,
+    _work_hours_string_to_decimal,
     create_client,
     row_display_values,
     run_analysis,
@@ -30,6 +32,8 @@ from newtonx_adk.exceptions import APIError
 class KintaiApp(tk.Frame):
     USER_JUDGMENT_COL = "ユーザ判断"
     EMPLOYEE_NO_COL = "社員番号"
+    TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
+    TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
 
     def __init__(
         self,
@@ -209,6 +213,12 @@ class KintaiApp(tk.Frame):
     def _employee_no_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.EMPLOYEE_NO_COL)
 
+    def _total_hours_decimal_column_index(self) -> int:
+        return list(self._tree["columns"]).index(self.TOTAL_HOURS_DECIMAL_COL)
+
+    def _total_hours_raw_column_index(self) -> int:
+        return list(self._tree["columns"]).index(self.TOTAL_HOURS_RAW_COL)
+
     def _on_tree_right_click(self, event: tk.Event) -> None:
         if self._busy:
             return
@@ -248,6 +258,11 @@ class KintaiApp(tk.Frame):
         # 社員番号列: 右クリックで入力（空欄許可）
         if cols[ci] == self.EMPLOYEE_NO_COL:
             self._prompt_edit_employee_no(rid)
+            return
+
+        # 合計勤務時間（読取）列: 右クリックで入力し、10進列も更新
+        if cols[ci] == self.TOTAL_HOURS_RAW_COL:
+            self._prompt_edit_total_hours_raw(rid)
             return
 
     def _set_user_judgment_cell(self, rid: str, value: str) -> None:
@@ -312,6 +327,62 @@ class KintaiApp(tk.Frame):
                 while len(vals) <= ci:
                     vals.append("")
             vals[ci] = new_v
+            self._tree.item(rid, values=tuple(vals))
+            top.destroy()
+
+        def on_cancel() -> None:
+            top.destroy()
+
+        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="キャンセル", command=on_cancel).pack(side=tk.RIGHT, padx=(0, 8))
+
+        top.bind("<Return>", lambda _e: on_ok())
+        top.bind("<Escape>", lambda _e: on_cancel())
+
+    def _prompt_edit_total_hours_raw(self, rid: str) -> None:
+        """合計勤務時間（読取）を右クリックから編集し、10進列も同時更新する。"""
+        try:
+            raw_ci = self._total_hours_raw_column_index()
+            dec_ci = self._total_hours_decimal_column_index()
+        except ValueError:
+            return
+
+        vals = list(self._tree.item(rid, "values") or [])
+        cur = vals[raw_ci] if raw_ci < len(vals) else ""
+
+        top = tk.Toplevel(self)
+        top.title("合計勤務時間（読取）を編集")
+        top.transient(self)
+        top.grab_set()
+
+        ttk.Label(
+            top,
+            text=(
+                "合計勤務時間（読取）を入力してください。\n"
+                "例: 8:20 / 8時間20分 / 8.20 / 101_10H / 86.17H\n"
+                "入力後、同じ規則で10進数へ変換して右列へ反映します。"
+            ),
+            justify="left",
+        ).pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        var = tk.StringVar(value=str(cur))
+        ent = ttk.Entry(top, textvariable=var, width=28)
+        ent.pack(fill=tk.X, padx=10)
+        ent.focus_set()
+        ent.select_range(0, tk.END)
+
+        btns = ttk.Frame(top)
+        btns.pack(fill=tk.X, padx=10, pady=10)
+
+        def on_ok() -> None:
+            new_raw = (var.get() or "").strip()
+            new_dec = _decimal_for_table_display(_work_hours_string_to_decimal(new_raw)) if new_raw else "（なし）"
+            max_ci = max(raw_ci, dec_ci)
+            if max_ci >= len(vals):
+                while len(vals) <= max_ci:
+                    vals.append("")
+            vals[raw_ci] = new_raw or "（なし）"
+            vals[dec_ci] = new_dec
             self._tree.item(rid, values=tuple(vals))
             top.destroy()
 
