@@ -255,10 +255,19 @@ def _extract_excel_target_sheet_row(
         person = (ws["J7"].value or "")
         total_raw_value = ws["F42"].value
 
+        file_company, _file_person = _parse_filename_company_and_person(file_path.name)
+        doc_company_raw = str(company).strip() if company is not None else ""
+        doc_company_match = _document_company_for_match(doc_company_raw)
+        match_company = _match_company_symbol_single(file_company, doc_company_match)
+
+        row["name_company_from_file"] = file_company
+        row["name_company_from_doc"] = doc_company_raw
         row["name_company_1"] = str(company).strip() if company is not None else ""
         row["name_person_from_doc"] = str(person).strip() if person is not None else ""
         row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
         row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
+        row["match_company"] = match_company
+        row["user_judgment_company"] = match_company
     except Exception as e:
         row["analysis"] = f"Excelセル読み取り失敗: {e}"
     finally:
@@ -1181,8 +1190,8 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     se = _escape_md_table_cell(
         "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
     )
-    mc = _escape_md_table_cell("" if is_excel else (r.get("match_company", "✖") or "✖"))
-    uj = "" if is_excel else ((r.get("user_judgment_company") or "").strip() or (r.get("match_company") or "✖"))
+    mc = _escape_md_table_cell((r.get("match_company") or ("" if is_excel else "✖")))
+    uj = (r.get("user_judgment_company") or "").strip() or (r.get("match_company") or ("" if is_excel else "✖"))
     uj = _escape_md_table_cell(uj)
     return (
         f"| {u_sym} | {fn} | {ts} | {co1} | {pe} | {emp} | {th} | {lr} | {se} | {mc} | {uj} |"
@@ -1222,8 +1231,8 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
     )
     lr = ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
     se = "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
-    mc = "" if is_excel else (r.get("match_company", "✖") or "✖")
-    uj = "" if is_excel else ((r.get("user_judgment_company") or "").strip() or mc)
+    mc = (r.get("match_company") or ("" if is_excel else "✖"))
+    uj = (r.get("user_judgment_company") or "").strip() or mc
     return (up_sym, fn, ts, co1, pe, emp, th, lr, se, mc, uj)
 
 

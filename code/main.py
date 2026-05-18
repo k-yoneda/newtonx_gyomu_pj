@@ -125,7 +125,9 @@ class KintaiApp(tk.Frame):
         else:
             col_px = col_px_base[: len(headings)]
 
-        total_min = sum(col_px) + 28
+        total_w = sum(col_px) + 28
+        initial_w = max(1920, total_w)
+        min_w = min(960, initial_w)
         self._tree = ttk.Treeview(
             grid_frame,
             columns=list(headings),
@@ -149,8 +151,8 @@ class KintaiApp(tk.Frame):
         self._tree.bind("<Button-3>", self._on_tree_right_click)
         self._tree.bind("<Double-1>", self._on_row_double_click)
 
-        self._root.minsize(total_min, 520)
-        self._root.geometry(f"{total_min}x680")
+        self._root.minsize(min_w, 520)
+        self._root.geometry(f"{initial_w}x680")
 
     def _browse_folder(self) -> None:
         self._prepare_native_dialog()
