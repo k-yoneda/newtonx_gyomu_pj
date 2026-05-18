@@ -172,6 +172,15 @@ class KintaiApp(tk.Frame):
             self._tree.delete(iid)
         self._item_paths.clear()
 
+    def _grid_values_from_row(self, row: dict[str, str]) -> tuple[str, ...]:
+        """内部row形式・UI保存形式のどちらでも Treeview 表示値へ変換する。"""
+        cols = list(self._tree["columns"])
+        # JSON保存後の UI 行（日本語列名）
+        if any((row.get(c) or "") != "" for c in cols):
+            return tuple((row.get(c) or "") for c in cols)
+        # 解析直後の内部 row 形式
+        return row_display_values(row)
+
     def _user_judgment_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.USER_JUDGMENT_COL)
 
@@ -399,10 +408,9 @@ class KintaiApp(tk.Frame):
 
     def _rebuild_grid_from_rows(self, rows: list[dict[str, str]]) -> None:
         self._clear_grid()
-        cols = list(self._tree["columns"])
         for r in rows:
-            vals = [r.get(c, "") for c in cols]
-            iid = self._tree.insert("", tk.END, values=tuple(vals))
+            vals = self._grid_values_from_row(r)
+            iid = self._tree.insert("", tk.END, values=vals)
             self._item_paths[iid] = (r.get("resolved_path") or "").strip()
 
     def _update_title(self) -> None:
@@ -523,14 +531,17 @@ class KintaiApp(tk.Frame):
 
         def _as_core_row(r: dict[str, str]) -> dict[str, str]:
             """UI行(dict) -> kintai_core の row(dict) に寄せる"""
-            # kintai_core 側の row_display_values は key ベース。必要なものだけ入れる。
-            # 継続解析で user_judgment_company を引き継ぐため、UIの「ユーザ判断」を反映。
-            out: dict[str, str] = {}
+            # 継続解析時に既存行の情報を落とさないよう、UI行をできるだけ保持したまま
+            # kintai_core が参照するキーへ寄せる。
+            out: dict[str, str] = dict(r)
             out["file_name"] = (r.get("画像ファイル名") or r.get("file_name") or "").strip()
             out["resolved_path"] = (r.get("resolved_path") or "").strip()
             uj = (r.get(self.USER_JUDGMENT_COL) or r.get("user_judgment_company") or "").strip()
             if uj:
                 out["user_judgment_company"] = uj
+            ts = (r.get("対象シート有無") or r.get("target_sheet_exists") or "").strip()
+            if ts:
+                out["target_sheet_exists"] = ts
             return out
 
         def worker() -> None:
