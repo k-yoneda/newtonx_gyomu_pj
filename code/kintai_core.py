@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from newtonx_adk import NewtonXClient, ConfigManager, FileUploadError
+from openpyxl import load_workbook
 import json
 import threading
 import math
@@ -12,6 +13,7 @@ import tempfile
 import time
 import types
 import unicodedata
+from datetime import datetime as DTDateTime, time as DTTime, timedelta as DTTimeDelta
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -178,6 +180,91 @@ def _excel_target_sheet_symbol(
     except (FileNotFoundError, OSError, KeyError, ET.ParseError, zipfile.BadZipFile) as e:
         return "✖", f"Excelシート確認失敗: {e}"
     return ("〇", "") if target_sheet_name in sheet_names else ("✖", "")
+
+
+def _excel_cell_value_to_raw_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, DTDateTime):
+        return value.strftime("%H:%M")
+    if isinstance(value, DTTime):
+        return value.strftime("%H:%M")
+    if isinstance(value, DTTimeDelta):
+        total_minutes = max(0, int(round(value.total_seconds() / 60.0)))
+        hh, mm = divmod(total_minutes, 60)
+        return f"{hh}:{mm:02d}"
+    return str(value).strip()
+
+
+def _excel_cell_value_to_decimal_hours(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, DTDateTime):
+        hours = (
+            value.hour
+            + value.minute / 60.0
+            + value.second / 3600.0
+            + value.microsecond / 3600000000.0
+        )
+        return _format_decimal_str(hours)
+    if isinstance(value, DTTime):
+        hours = (
+            value.hour
+            + value.minute / 60.0
+            + value.second / 3600.0
+            + value.microsecond / 3600000000.0
+        )
+        return _format_decimal_str(hours)
+    if isinstance(value, DTTimeDelta):
+        return _format_decimal_str(value.total_seconds() / 3600.0)
+    if isinstance(value, (int, float)):
+        return _format_decimal_str(float(value) * 24.0)
+    return _work_hours_string_to_decimal(str(value))
+
+
+def _extract_excel_target_sheet_row(
+    file_path: Path,
+    *,
+    target_sheet_name: str = TARGET_EXCEL_SHEET_NAME,
+) -> dict[str, str]:
+    row = {
+        "upload_ok": "",
+        "file_name": file_path.name,
+        "resolved_path": str(file_path.resolve()),
+        "target_sheet_exists": "✖",
+        "analysis": "",
+        "source_kind": "excel",
+    }
+
+    sheet_symbol, note = _excel_target_sheet_symbol(
+        file_path,
+        target_sheet_name=target_sheet_name,
+    )
+    row["target_sheet_exists"] = sheet_symbol
+    if note:
+        row["analysis"] = note
+        return row
+    if sheet_symbol != "〇":
+        return row
+
+    wb = None
+    try:
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb[target_sheet_name]
+        company = (ws["G5"].value or "")
+        person = (ws["J7"].value or "")
+        total_raw_value = ws["F42"].value
+
+        row["name_company_1"] = str(company).strip() if company is not None else ""
+        row["name_person_from_doc"] = str(person).strip() if person is not None else ""
+        row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
+        row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
+    except Exception as e:
+        row["analysis"] = f"Excelセル読み取り失敗: {e}"
+    finally:
+        if wb is not None:
+            wb.close()
+    return row
 
 
 # --- 合計勤務時間の10進化 -----------------------------------------------------------------
@@ -1075,21 +1162,21 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     fn = _escape_md_table_cell(r.get("file_name", ""))
     ts = _escape_md_table_cell(_target_sheet_ok_symbol(r))
     co1 = _escape_md_table_cell(
-        "" if is_excel else ((r.get("name_company_1") or "").strip() or "不明")
+        ((r.get("name_company_1") or "").strip() or ("" if is_excel else "不明"))
     )
     pe = _escape_md_table_cell(
-        "" if is_excel else ((r.get("name_person_from_doc") or "").strip() or "不明")
+        ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
     )
     emp = _escape_md_table_cell(
-        "" if is_excel else ((r.get("employee_no") or "").strip() or "")
+        (r.get("employee_no") or "").strip() or ""
     )
     th = _escape_md_table_cell(
-        ""
-        if is_excel
-        else _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
+        ((
+            _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
+        ) if (r.get("total_hours_decimal") or "").strip() else ("" if is_excel else "（なし）"))
     )
     lr = _escape_md_table_cell(
-        "" if is_excel else ((r.get("total_hours_raw") or "").strip() or "（なし）")
+        ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
     )
     se = _escape_md_table_cell(
         "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
@@ -1125,11 +1212,15 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
     up_sym = _upload_ok_symbol(r)
     fn = r.get("file_name", "") or ""
     ts = _target_sheet_ok_symbol(r)
-    co1 = "" if is_excel else ((r.get("name_company_1") or "").strip() or "不明")
-    pe = "" if is_excel else ((r.get("name_person_from_doc") or "").strip() or "不明")
-    emp = "" if is_excel else ((r.get("employee_no") or "").strip() or "")
-    th = "" if is_excel else _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
-    lr = "" if is_excel else ((r.get("total_hours_raw") or "").strip() or "（なし）")
+    co1 = ((r.get("name_company_1") or "").strip() or ("" if is_excel else "不明"))
+    pe = ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
+    emp = (r.get("employee_no") or "").strip() or ""
+    th = (
+        _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
+        if (r.get("total_hours_decimal") or "").strip()
+        else ("" if is_excel else "（なし）")
+    )
+    lr = ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
     se = "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
     mc = "" if is_excel else (r.get("match_company", "✖") or "✖")
     uj = "" if is_excel else ((r.get("user_judgment_company") or "").strip() or mc)
@@ -1356,21 +1447,13 @@ def run_analysis(
                 break
             try:
                 if kind == "excel":
-                    sheet_symbol, note = _excel_target_sheet_symbol(file_path)
-                    row_excel = {
-                        "upload_ok": "",
-                        "file_name": file_path.name,
-                        "resolved_path": str(file_path.resolve()),
-                        "target_sheet_exists": sheet_symbol,
-                        "analysis": note,
-                        "source_kind": "excel",
-                    }
+                    row_excel = _extract_excel_target_sheet_row(file_path)
                     bucket_results[worker_idx].append(row_excel)
                     emit_summary_row_md(row_excel)
                     if on_row_completed is not None:
                         on_row_completed(row_excel)
-                    if note:
-                        log(f"Excelシート確認警告: {file_path.name}: {note}")
+                    if row_excel.get("analysis"):
+                        log(f"Excel処理警告: {file_path.name}: {row_excel['analysis']}")
                 elif kind == "image":
                     try:
                         upload_src, tmp_upload = _resolve_upload_path(file_path)

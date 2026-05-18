@@ -153,7 +153,11 @@ class KintaiApp(tk.Frame):
         self._root.geometry(f"{total_min}x680")
 
     def _browse_folder(self) -> None:
-        d = filedialog.askdirectory(title="データを読み込むフォルダを選択")
+        self._prepare_native_dialog()
+        d = filedialog.askdirectory(
+            title="データを読み込むフォルダを選択",
+            parent=self._root,
+        )
         if not d:
             return
         self._data_dir = Path(d)
@@ -171,6 +175,22 @@ class KintaiApp(tk.Frame):
         for iid in self._tree.get_children():
             self._tree.delete(iid)
         self._item_paths.clear()
+
+    def _prepare_native_dialog(self) -> None:
+        """Windows/Tk でネイティブダイアログが背面化・ハング見えしないよう状態を整える。"""
+        try:
+            grabbed = self._root.grab_current()
+            if grabbed is not None:
+                grabbed.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            self._root.deiconify()
+            self._root.lift()
+            self._root.focus_force()
+            self._root.update_idletasks()
+        except tk.TclError:
+            pass
 
     def _grid_values_from_row(self, row: dict[str, str]) -> tuple[str, ...]:
         """内部row形式・UI保存形式のどちらでも Treeview 表示値へ変換する。"""
@@ -354,6 +374,7 @@ class KintaiApp(tk.Frame):
         if not rows:
             messagebox.showinfo("保存", "保存する行がありません。")
             return
+        self._prepare_native_dialog()
         initialfile = (
             os.path.basename(str(self._loaded_json_path))
             if self._loaded_json_path
@@ -364,6 +385,7 @@ class KintaiApp(tk.Frame):
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
             initialfile=initialfile,
+            parent=self._root,
         )
         if not fp:
             return
@@ -378,9 +400,11 @@ class KintaiApp(tk.Frame):
     def _load_json(self) -> None:
         if self._busy:
             return
+        self._prepare_native_dialog()
         fp = filedialog.askopenfilename(
             title="結果JSONを読み込み",
             filetypes=[("JSON", "*.json"), ("すべて", "*.*")],
+            parent=self._root,
         )
         if not fp:
             return
@@ -819,10 +843,18 @@ def main() -> None:
         except (TypeError, ValueError):
             nw = DEFAULT_PARALLEL_ANALYSIS_CHATS
         chosen_workers["value"] = max(1, min(nw, PARALLEL_WORKERS_MAX))
+        try:
+            dlg.grab_release()
+        except tk.TclError:
+            pass
         dlg.destroy()
 
     def on_cancel() -> None:
         chosen_name["value"] = None
+        try:
+            dlg.grab_release()
+        except tk.TclError:
+            pass
         dlg.destroy()
 
     ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
@@ -838,6 +870,15 @@ def main() -> None:
     dlg.focus_force()
 
     root.wait_window(dlg)
+
+    try:
+        root.grab_release()
+    except tk.TclError:
+        pass
+    root.update_idletasks()
+    root.deiconify()
+    root.lift()
+    root.focus_force()
 
     if not chosen_name["value"]:
         root.destroy()
