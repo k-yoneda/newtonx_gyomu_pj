@@ -369,13 +369,12 @@ class KintaiApp(tk.Frame):
 
         return time.strftime("%Y%m%d_%H%M")
 
-    def _save_json(self) -> None:
-        if self._busy:
-            return
+    def _save_json_via_dialog(self) -> bool:
+        """保存ボタン相当の保存処理。保存成功時 True、キャンセル/未保存時 False。"""
         rows = self._current_grid_rows()
         if not rows:
             messagebox.showinfo("保存", "保存する行がありません。")
-            return
+            return False
         self._prepare_native_dialog()
         initialfile = (
             os.path.basename(str(self._loaded_json_path))
@@ -390,7 +389,7 @@ class KintaiApp(tk.Frame):
             parent=self._root,
         )
         if not fp:
-            return
+            return False
         out = Path(fp)
         self._write_json_file(out, rows)
         self._loaded_json_path = out
@@ -398,6 +397,12 @@ class KintaiApp(tk.Frame):
         self._last_saved_snapshot = self._compute_snapshot(rows)
         self._status_var.set(f"保存しました: {self._loaded_json_path}")
         self._update_title()
+        return True
+
+    def _save_json(self) -> None:
+        if self._busy:
+            return
+        self._save_json_via_dialog()
 
     def _load_json(self) -> None:
         if self._busy:
@@ -479,7 +484,8 @@ class KintaiApp(tk.Frame):
             )
             if ok:
                 try:
-                    self._auto_save_on_exit()
+                    if not self._save_json_via_dialog():
+                        return
                 except Exception as e:
                     messagebox.showerror("保存失敗", str(e))
                     return
