@@ -278,9 +278,10 @@ class KintaiApp(tk.Frame):
         ttk.Label(
             top,
             text=(
-                "社員番号（7桁）を入力してください。\n"
+                "社員番号（7桁数字 または BP+5桁）を入力してください。\n"
                 "- 空欄: 未設定\n"
                 "- 7桁数字: 社員番号\n"
+                "- BP+5桁: 社員番号\n"
                 "- それ以外: 社員番号エラー として扱われます"
             ),
             justify="left",
@@ -301,6 +302,8 @@ class KintaiApp(tk.Frame):
                 return ""
             if t.isdigit() and len(t) == 7:
                 return t
+            if len(t) == 7 and t[:2].upper() == "BP" and t[2:].isdigit():
+                return t[:2].upper() + t[2:]
             return "社員番号エラー"
 
         def on_ok() -> None:

@@ -234,6 +234,8 @@ def _employee_no_from_file_name(file_name: str) -> str:
     tail7 = stem[-7:]
     if tail7.isdigit():
         return tail7
+    if re.fullmatch(r"BP\d{5}", tail7, re.IGNORECASE):
+        return tail7.upper()
     return "社員番号エラー"
 
 
