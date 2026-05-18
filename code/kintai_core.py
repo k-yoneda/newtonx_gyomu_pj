@@ -820,22 +820,41 @@ def _document_company_for_display(ktab_company: str) -> str:
 
 
 def _document_company_for_match(ktab_company: str) -> str:
-    """照合用の文書側会社。セラクを含む場合は空（ファイル名との比較から外す）。"""
-    k = (ktab_company or "").strip()
-    if not k or _company_text_contains_seraku(k):
-        return ""
-    return k
+    """照合用の文書側会社。複数候補はカンマ区切りのまま返し、比較側で分解する。"""
+    return (ktab_company or "").strip()
+
+
+def _split_document_company_candidates(companies_text: str) -> list[str]:
+    """会社名の複数候補を分解する。カンマ区切り想定だが、日本語読点等も緩く許容する。"""
+    raw = unicodedata.normalize("NFKC", (companies_text or "").strip())
+    if not raw:
+        return []
+    parts = re.split(r"\s*[,，、]\s*", raw)
+    out: list[str] = []
+    for p in parts:
+        t = (p or "").strip()
+        if not t:
+            continue
+        if _company_text_contains_seraku(t):
+            continue
+        out.append(t)
+    return out
 
 
 def _match_company_symbol_single(file_co: str, doc_company: str) -> str:
-    """勤怠表から取れた会社名1件とファイル名会社を照合（以前の複数社名マージ版の単一化）。"""
+    """勤怠表から取れた会社名とファイル名会社を照合。複数社名は候補のいずれか一致で判定。"""
     fp = _file_co_for_match(file_co)
-    d = (doc_company or "").strip()
-    if not d:
+    doc_candidates = _split_document_company_candidates(doc_company)
+    if not doc_candidates:
         return "〇" if not fp else "✖"
     if not fp:
         return "△"
-    return _compare_company(fp, d)
+    symbols = [_compare_company(fp, d) for d in doc_candidates]
+    if "〇" in symbols:
+        return "〇"
+    if "△" in symbols:
+        return "△"
+    return "✖"
 
 
 def _series_company_hint(f_raw: str, d_raw: str) -> bool:
