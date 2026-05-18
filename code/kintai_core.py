@@ -227,6 +227,16 @@ def _excel_cell_value_to_decimal_hours(value: object) -> str:
     return _work_hours_string_to_decimal(str(value))
 
 
+def _employee_no_from_file_name(file_name: str) -> str:
+    stem = Path(file_name or "").stem
+    if len(stem) < 7:
+        return ""
+    tail7 = stem[-7:]
+    if tail7.isdigit():
+        return tail7
+    return "社員番号エラー"
+
+
 def _extract_excel_target_sheet_row(
     file_path: Path,
     *,
@@ -236,6 +246,7 @@ def _extract_excel_target_sheet_row(
         "upload_ok": "",
         "file_name": file_path.name,
         "resolved_path": str(file_path.resolve()),
+        "employee_no": _employee_no_from_file_name(file_path.name),
         "target_sheet_exists": "✖",
         "analysis": "",
         "source_kind": "excel",
@@ -967,15 +978,6 @@ def _enrich_with_match_scores(
       - 画像ファイル名の「拡張子の前にある7桁」を社員番号として扱い、氏名の右（別列）に表示する。
       - 末尾7文字が存在するのに数字7桁ではない場合、「社員番号エラー」と表示する。
     """
-
-    def _employee_no_from_file_name(file_name: str) -> str:
-        stem = Path(file_name or "").stem
-        if len(stem) < 7:
-            return ""
-        tail7 = stem[-7:]
-        if tail7.isdigit():
-            return tail7
-        return "社員番号エラー"
 
     text_for_extraction = (
         _prefer_kintai_text_for_extraction(analysis) if prefer_kintai_section else analysis
