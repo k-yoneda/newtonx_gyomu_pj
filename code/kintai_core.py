@@ -1285,6 +1285,7 @@ def run_analysis(
     on_row_completed: Callable[[dict[str, str]], None] | None = None,
     cancel_event=None,
     skip_file_names: set[str] | None = None,
+    target_file_names: set[str] | None = None,
     parallel_chats: int = DEFAULT_PARALLEL_ANALYSIS_CHATS,
 ) -> list[dict[str, str]]:
     """
@@ -1300,6 +1301,7 @@ def run_analysis(
     on_row_completed: 解析結果またはアップロード失敗行を1件 results に載せた直後に呼ぶ。
     cancel_event: threading.Event 互換。set() されたら以降の解析を中断する（処理中の1ファイルは止まらず、次の境界で止まる）。
     skip_file_names: ここに含まれるファイル名は解析処理自体をスキップする（progress は進める）。
+    target_file_names: ここに含まれるファイル名だけを解析対象にする。None の場合は全対象ファイル。
     """
     log = on_log if on_log is not None else print
 
@@ -1307,20 +1309,26 @@ def run_analysis(
         raise FileNotFoundError(f"フォルダが存在しません: {data_dir}")
 
     skip_names = {str(x).strip() for x in (skip_file_names or set()) if str(x).strip()}
+    target_names = {str(x).strip() for x in (target_file_names or set()) if str(x).strip()}
+
+    def _is_target_name(p: Path) -> bool:
+        return (not target_names) or p.name in target_names
 
     image_files = sorted(
         p for p in data_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES and p.name not in skip_names
+        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES and p.name not in skip_names and _is_target_name(p)
     )
     pdf_files = sorted(
         p for p in data_dir.iterdir()
-        if p.is_file() and p.suffix.lower() == PDF_SUFFIX and p.name not in skip_names
+        if p.is_file() and p.suffix.lower() == PDF_SUFFIX and p.name not in skip_names and _is_target_name(p)
     )
     excel_files = sorted(
         p for p in data_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in EXCEL_SUFFIXES and p.name not in skip_names
+        if p.is_file() and p.suffix.lower() in EXCEL_SUFFIXES and p.name not in skip_names and _is_target_name(p)
     )
     if not image_files and not pdf_files and not excel_files:
+        if target_names:
+            raise ValueError(f"指定された対象ファイルが見つかりません: {', '.join(sorted(target_names))}")
         raise ValueError(f"画像・PDF・Excelファイルが見つかりません: {data_dir}")
 
     total_files = len(image_files) + len(pdf_files) + len(excel_files)

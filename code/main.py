@@ -236,9 +236,11 @@ class KintaiApp(tk.Frame):
         if not (0 <= ci < len(cols)):
             return
 
+        self._tree.selection_set(rid)
+        menu = tk.Menu(self, tearoff=0)
+
         # ユーザ判断列: 右クリックで 〇/△/✖ を選択
         if cols[ci] == self.USER_JUDGMENT_COL:
-            menu = tk.Menu(self, tearoff=0)
             opts = (
                 ("〇", "〇"),
                 ("△", "△"),
@@ -249,21 +251,126 @@ class KintaiApp(tk.Frame):
                     label=label,
                     command=lambda v=inner: self._set_user_judgment_cell(rid, v),
                 )
-            try:
-                menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                menu.grab_release()
-            return
+            menu.add_separator()
 
         # 社員番号列: 右クリックで入力（空欄許可）
         if cols[ci] == self.EMPLOYEE_NO_COL:
-            self._prompt_edit_employee_no(rid)
-            return
+            menu.add_command(
+                label="社員番号を編集",
+                command=lambda: self._prompt_edit_employee_no(rid),
+            )
+            menu.add_separator()
 
         # 合計勤務時間（読取）列: 右クリックで入力し、10進列も更新
         if cols[ci] == self.TOTAL_HOURS_RAW_COL:
-            self._prompt_edit_total_hours_raw(rid)
+            menu.add_command(
+                label="合計勤務時間（読取）を編集",
+                command=lambda: self._prompt_edit_total_hours_raw(rid),
+            )
+            menu.add_separator()
+
+        menu.add_command(label="再解析", command=lambda: self._start_row_reanalysis(rid))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _current_row_dict_from_iid(self, rid: str) -> dict[str, str]:
+        cols = list(self._tree["columns"])
+        values = list(self._tree.item(rid, "values") or [])
+        row = {cols[i]: (values[i] if i < len(values) else "") for i in range(len(cols))}
+        row["resolved_path"] = self._item_paths.get(rid, "")
+        return row
+
+    def _replace_row_with_result(self, rid: str, row: dict[str, str]) -> None:
+        self._tree.item(rid, values=row_display_values(row))
+        self._item_paths[rid] = row.get("resolved_path", "")
+
+    def _start_row_reanalysis(self, rid: str) -> None:
+        if self._busy or self._data_dir is None:
             return
+
+        current_row = self._current_row_dict_from_iid(rid)
+        file_name = (current_row.get("画像ファイル名") or current_row.get("file_name") or "").strip()
+        if not file_name:
+            messagebox.showinfo("再解析", "選択行のファイル名を取得できません。")
+            return
+
+        preserved_user_judgment = (current_row.get(self.USER_JUDGMENT_COL) or "").strip()
+        td = self._data_dir.resolve()
+        client = self._client
+        aid = self._assistant_uid
+
+        self._busy = True
+        self._cancel_event = threading.Event()
+        self._new_btn.configure(state=tk.DISABLED)
+        self._cont_btn.configure(state=tk.DISABLED)
+        self._save_btn.configure(state=tk.DISABLED)
+        self._load_btn.configure(state=tk.DISABLED)
+        self._cancel_btn.configure(state=tk.NORMAL)
+        self._progress_var.set("再解析中 0 / 1")
+        self._status_var.set(f"再解析しています… {file_name}")
+
+        def log_line(message: str) -> None:
+            self.after(0, lambda m=message: self._status_var.set(m[:800]))
+
+        def on_progress(done: int, total: int) -> None:
+            self.after(0, lambda d=done, t=total: self._progress_var.set(f"再解析中 {d} / {t}"))
+
+        def worker() -> None:
+            result_rows: list[dict[str, str]] | None = None
+            err: BaseException | None = None
+            try:
+                result_rows = run_analysis(
+                    client,
+                    aid,
+                    td,
+                    save_md_path=Path.cwd() / "解析結果.md",
+                    on_log=log_line,
+                    emit_progress_md_rows=False,
+                    on_file_progress=on_progress,
+                    cancel_event=self._cancel_event,
+                    target_file_names={file_name},
+                    parallel_chats=1,
+                )
+            except BaseException as e:
+                err = e
+
+            def finish() -> None:
+                self._busy = False
+                self._cancel_btn.configure(state=tk.DISABLED)
+                cancelled = self._cancel_event is not None and self._cancel_event.is_set()
+                self._cancel_event = None
+
+                self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
+                self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and (self._loaded_rows or self._tree.get_children())) else tk.DISABLED))
+                self._save_btn.configure(state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED))
+                self._load_btn.configure(state=tk.NORMAL)
+
+                if err is not None:
+                    messagebox.showerror("再解析エラー", str(err))
+                    self._status_var.set(f"再解析エラー: {file_name}")
+                    return
+                if cancelled:
+                    self._status_var.set(f"再解析を中断しました: {file_name}")
+                    return
+                if not result_rows:
+                    messagebox.showwarning("再解析", f"再解析結果を取得できませんでした。\n{file_name}")
+                    self._status_var.set(f"再解析結果なし: {file_name}")
+                    return
+
+                new_row = result_rows[0]
+                if preserved_user_judgment:
+                    new_row["user_judgment_company"] = preserved_user_judgment
+                self._replace_row_with_result(rid, new_row)
+                self._loaded_rows = self._current_grid_rows()
+                self._progress_var.set("再解析完了 1 / 1")
+                self._status_var.set(f"再解析完了: {file_name}")
+                messagebox.showinfo("再解析完了", f"選択行の再解析が完了しました。\n{file_name}")
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _set_user_judgment_cell(self, rid: str, value: str) -> None:
         if value not in ("〇", "△", "×"):
