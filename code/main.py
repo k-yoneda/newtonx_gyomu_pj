@@ -366,7 +366,8 @@ class KintaiApp(tk.Frame):
                 self._replace_row_with_result(rid, new_row)
                 self._loaded_rows = self._current_grid_rows()
                 self._progress_var.set("再解析完了 1 / 1")
-                self._status_var.set(f"再解析完了: {file_name}")
+                ratio_text = self._company_match_ratio_text(self._loaded_rows)
+                self._status_var.set(f"再解析完了: {file_name} / {ratio_text}")
                 messagebox.showinfo("再解析完了", f"選択行の再解析が完了しました。\n{file_name}")
 
             self.after(0, finish)

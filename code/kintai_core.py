@@ -1277,7 +1277,7 @@ def _company_match_ratio_lines(
 
     ratio = (ok_count / processed_count) * 100
     return [
-        f"会社名比較 〇率: {ratio:.1f}% （〇 {ok_count}件 / 実行済 {processed_count}件 / 対象 {target_count}件）",
+        f"会社名比較 〇率: {ratio:.1f}% （〇扱い {ok_count}件 / 実行済 {processed_count}件 / 対象 {target_count}件）",
         "",
     ]
 
@@ -1296,7 +1296,7 @@ def _company_match_ratio_progress_line(
     ratio = (ok_count / processed_count) * 100
     return (
         f"会社名比較 〇率(途中経過): {ratio:.1f}% "
-        f"（〇 {ok_count}件 / 実行済 {processed_count}件 / 対象 {total_target_count}件）"
+        f"（〇扱い {ok_count}件 / 実行済 {processed_count}件 / 対象 {total_target_count}件）"
     )
 
 
