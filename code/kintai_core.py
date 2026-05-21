@@ -1360,8 +1360,9 @@ def run_analysis(
 ) -> list[dict[str, str]]:
     """
     指定フォルダ直下の画像・PDF・Excel を名前順で処理し、結果行のリストを返す。
-    NewtonX では parallel_chats 本のチャットを同一フォルダに作成し、
-    ファイルをラウンドロビンで割り当ててスレッド並列処理する（終了時は全スレッド join）。
+    NewtonX では parallel_chats 本のワーカーでファイルを並列処理するが、
+    チャットはワーカー固定ではなく **1ファイルごとに新規作成** し、
+    処理完了後に削除する。
     各ワーカーは独自の NewtonXClient で API を呼び出す。
     アップロードは、失敗のたびに最大 UPLOAD_MAX_RETRIES 回まで再試行します（総試行は多くとも 1+UPLOAD_MAX_RETRIES 回）。
     Excel は生成AIへアップロードせず、対象シート名の有無のみを判定する。
@@ -1460,22 +1461,6 @@ def run_analysis(
     elif n_workers > PARALLEL_WORKERS_MAX:
         n_workers = PARALLEL_WORKERS_MAX
 
-    chat_uids: list[str] = []
-    for wi in range(n_workers):
-        chat_uid = client.create_chat_in_folder(
-            assistant_uid=assistant_uid,
-            folder_uid=folder_uid,
-            title=f"業務課集計 #{wi + 1}",
-        )
-        if chat_uid:
-            client.move_chat_to_folder(chat_uid=chat_uid, folder_uid=folder_uid)
-        if not chat_uid:
-            raise RuntimeError(
-                f"NewtonX 上でチャットの作成に失敗しました（{wi + 1} / {n_workers}）。"
-            )
-        log(f"チャットが作成されました（並列ワーカー {wi + 1}）: {chat_uid}")
-        chat_uids.append(chat_uid)
-
     summary_header_done = False
     summary_lock = threading.Lock()
     company_ratio_lock = threading.Lock()
@@ -1541,37 +1526,41 @@ def run_analysis(
         if on_row_completed is not None:
             on_row_completed(row)
 
-    def worker_loop(worker_idx: int, chat_uid: str, tasks: list[tuple[str, Path]]) -> None:
+    def worker_loop(worker_idx: int, tasks: list[tuple[str, Path]]) -> None:
         wc = create_client()
-        chat_holder: dict[str, str] = {"chat_uid": chat_uid}
 
-        def recreate_worker_chat(_exc: BaseException) -> bool:
-            """アップロード系 HTTP エラー時に、本ワーカーの作業チャットを作り直す。"""
+        def create_file_chat(title_suffix: str) -> str | None:
             try:
                 nc = wc.create_chat_in_folder(
                     assistant_uid=assistant_uid,
                     folder_uid=folder_uid,
-                    title=f"業務課集計 #{worker_idx + 1}",
+                    title=f"業務課集計 {title_suffix}",
                 )
                 if not nc:
-                    log(f"ワーカー {worker_idx + 1}: チャットの再作成に失敗しました（API）。")
-                    return False
+                    return None
                 try:
                     wc.move_chat_to_folder(chat_uid=nc, folder_uid=folder_uid)
                 except Exception as me:
                     log(
                         f"ワーカー {worker_idx + 1}: "
-                        f"再作成チャットのフォルダ移動に警告 — {me}"
+                        f"チャットのフォルダ移動に警告 — {me}"
                     )
-                chat_holder["chat_uid"] = str(nc).strip()
-                log(
-                    f"ワーカー {worker_idx + 1}: "
-                    f"チャットを再作成しました: {chat_holder['chat_uid']}"
-                )
-                return True
+                return str(nc).strip()
             except Exception as e:
-                log(f"ワーカー {worker_idx + 1}: チャット再作成処理で異常 — {e}")
-                return False
+                log(f"ワーカー {worker_idx + 1}: チャット作成処理で異常 — {e}")
+                return None
+
+        def delete_file_chat(chat_uid: str | None) -> None:
+            if not chat_uid:
+                return
+            try:
+                success = wc.delete_chat(chat_uid)
+                if success:
+                    log(f"チャットが削除されました: {chat_uid}")
+                else:
+                    log(f"チャット削除に失敗しました: {chat_uid}")
+            except Exception as e:
+                log(f"チャット削除時に異常が発生しました: {chat_uid} / {e}")
 
         def signal_fatal(exc: BaseException) -> None:
             worker_exc[worker_idx] = exc
@@ -1587,6 +1576,7 @@ def run_analysis(
                     f"中断: ワーカー {worker_idx + 1} がキャンセルにより停止しました"
                 )
                 break
+            chat_holder: dict[str, str] = {"chat_uid": ""}
             try:
                 if kind == "excel":
                     row_excel = _extract_excel_target_sheet_row(file_path)
@@ -1622,12 +1612,16 @@ def run_analysis(
                             break
                         tmp_upload_path: Path | None = tmp_upload
                         try:
+                            chat_uid = create_file_chat(f"#{worker_idx + 1} {file_path.name}")
+                            if not chat_uid:
+                                raise RuntimeError(f"NewtonX 上でチャットの作成に失敗しました — {file_path.name}")
+                            chat_holder["chat_uid"] = chat_uid
                             image_id, upload_succeeded = _upload_image_with_retries(
                                 wc,
                                 chat_uid_holder=chat_holder,
                                 upload_src=upload_src,
                                 file_name=file_path.name,
-                                recreate_chat_fn=recreate_worker_chat,
+                                recreate_chat_fn=None,
                                 log_emit=log,
                             )
                             if not image_id:
@@ -1675,6 +1669,7 @@ def run_analysis(
                                 if on_row_completed is not None:
                                     on_row_completed(row)
                         finally:
+                            delete_file_chat(chat_holder.get("chat_uid") or None)
                             if tmp_upload_path is not None:
                                 tmp_upload_path.unlink(missing_ok=True)
                 else:
@@ -1682,12 +1677,16 @@ def run_analysis(
                         if is_cancelled():
                             log("中断: PDFアップロード前にキャンセルされました")
                             break
+                        chat_uid = create_file_chat(f"#{worker_idx + 1} {file_path.name}")
+                        if not chat_uid:
+                            raise RuntimeError(f"NewtonX 上でチャットの作成に失敗しました — {file_path.name}")
+                        chat_holder["chat_uid"] = chat_uid
                         success, upload_succeeded = _upload_document_with_retries(
                             wc,
                             chat_uid_holder=chat_holder,
                             file_path=str(file_path),
                             file_name=file_path.name,
-                            recreate_chat_fn=recreate_worker_chat,
+                            recreate_chat_fn=None,
                             log_emit=log,
                         )
                         if not success:
@@ -1743,6 +1742,8 @@ def run_analysis(
                             f"スキップ: PDFの処理に失敗しました — "
                             f"{file_path.name}: {e}"
                         )
+                    finally:
+                        delete_file_chat(chat_holder.get("chat_uid") or None)
             except BaseException as e:
                 signal_fatal(e)
                 break
@@ -1752,7 +1753,7 @@ def run_analysis(
     threads = [
         threading.Thread(
             target=worker_loop,
-            args=(wi, chat_uids[wi], buckets[wi]),
+            args=(wi, buckets[wi]),
             name=f"kintai-worker-{wi}",
             daemon=False,
         )
