@@ -34,6 +34,7 @@ UPLOAD_RETRY_DELAY_SEC = 0.35
 
 DEFAULT_PARALLEL_ANALYSIS_CHATS = 1
 PARALLEL_WORKERS_MAX = 32
+UNKNOWN_COMPANY_RETRY_MAX = 2
 
 # グリッド・集計表の先頭列（〇: リトライ上限内でアップロード成功 / ✖: それ以外）
 SUMMARY_UPLOAD_COL = "アップロード"
@@ -1312,6 +1313,11 @@ def _summary_table_md_lines(
     ]
 
 
+def _row_needs_unknown_company_retry(row: dict[str, str]) -> bool:
+    """会社名が不明なら再解析対象。"""
+    return ((row.get("name_company_1") or "").strip() == "不明")
+
+
 def summary_header_cells() -> tuple[str, ...]:
     """SUMMARY_MD_HEADER から見出し要素を返す（Treeview 列名用）。"""
     raw = SUMMARY_MD_HEADER.strip()
@@ -1562,6 +1568,84 @@ def run_analysis(
             except Exception as e:
                 log(f"チャット削除時に異常が発生しました: {chat_uid} / {e}")
 
+        def retry_unknown_company_with_new_chat(
+            file_path: Path,
+            *,
+            is_pdf: bool,
+            upload_src: str | None = None,
+        ) -> dict[str, str] | None:
+            """会社名が不明のとき、最大2回だけ新規チャットで再解析する。"""
+            latest_row: dict[str, str] | None = None
+            for retry_idx in range(1, UNKNOWN_COMPANY_RETRY_MAX + 1):
+                if is_cancelled():
+                    break
+                retry_chat_uid: str | None = None
+                try:
+                    retry_chat_uid = create_file_chat(
+                        f"#{worker_idx + 1} {file_path.name} retry{retry_idx}"
+                    )
+                    if not retry_chat_uid:
+                        log(f"会社名不明再解析用チャットの作成に失敗しました — {file_path.name}")
+                        break
+                    retry_holder = {"chat_uid": retry_chat_uid}
+
+                    if is_pdf:
+                        success, upload_succeeded = _upload_document_with_retries(
+                            wc,
+                            chat_uid_holder=retry_holder,
+                            file_path=str(file_path),
+                            file_name=file_path.name,
+                            recreate_chat_fn=None,
+                            log_emit=log,
+                        )
+                        if not success:
+                            log(f"会社名不明再解析のPDFアップロードに失敗しました — {file_path.name} / retry {retry_idx}")
+                            break
+                        response = wc.send_message(
+                            chat_uid=retry_holder["chat_uid"],
+                            message=_build_pdf_check_message(file_path.name),
+                        )
+                    else:
+                        image_id, upload_succeeded = _upload_image_with_retries(
+                            wc,
+                            chat_uid_holder=retry_holder,
+                            upload_src=str(upload_src or file_path),
+                            file_name=file_path.name,
+                            recreate_chat_fn=None,
+                            log_emit=log,
+                        )
+                        if not image_id:
+                            log(f"会社名不明再解析の画像アップロードに失敗しました — {file_path.name} / retry {retry_idx}")
+                            break
+                        response = wc.send_message(
+                            chat_uid=retry_holder["chat_uid"],
+                            message=_build_check_message(file_path.name),
+                            image_ids=[image_id],
+                        )
+
+                    latest_row = {
+                        "upload_ok": "〇" if upload_succeeded else "✖",
+                        "file_name": file_path.name,
+                        "resolved_path": str(file_path.resolve()),
+                        "analysis": response if response else "（解析結果を取得できませんでした）",
+                    }
+                    _enrich_with_match_scores(
+                        latest_row,
+                        latest_row["analysis"],
+                        prefer_kintai_section=is_pdf,
+                    )
+
+                    if not _row_needs_unknown_company_retry(latest_row):
+                        log(f"会社名不明の再解析で会社名を取得しました — {file_path.name} / retry {retry_idx}")
+                        return latest_row
+
+                    log(f"会社名不明の再解析でも不明でした — {file_path.name} / retry {retry_idx}")
+                except Exception as e:
+                    log(f"会社名不明再解析に失敗しました — {file_path.name} / retry {retry_idx}: {e}")
+                finally:
+                    delete_file_chat(retry_chat_uid)
+            return latest_row
+
         def signal_fatal(exc: BaseException) -> None:
             worker_exc[worker_idx] = exc
             try:
@@ -1663,6 +1747,14 @@ def run_analysis(
                                     else "（解析結果を取得できませんでした）",
                                 }
                                 _enrich_with_match_scores(row, row["analysis"])
+                                if _row_needs_unknown_company_retry(row):
+                                    retried_row = retry_unknown_company_with_new_chat(
+                                        file_path,
+                                        is_pdf=False,
+                                        upload_src=upload_src,
+                                    )
+                                    if retried_row is not None:
+                                        row = retried_row
                                 bucket_results[worker_idx].append(row)
                                 emit_summary_row_md(row)
                                 emit_company_match_ratio_progress(row)
@@ -1732,6 +1824,13 @@ def run_analysis(
                                 row2["analysis"],
                                 prefer_kintai_section=True,
                             )
+                            if _row_needs_unknown_company_retry(row2):
+                                retried_row2 = retry_unknown_company_with_new_chat(
+                                    file_path,
+                                    is_pdf=True,
+                                )
+                                if retried_row2 is not None:
+                                    row2 = retried_row2
                             bucket_results[worker_idx].append(row2)
                             emit_summary_row_md(row2)
                             emit_company_match_ratio_progress(row2)
