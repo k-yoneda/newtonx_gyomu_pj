@@ -745,24 +745,38 @@ class KintaiApp(tk.Frame):
         # 以降は worker スレッドで解析
 
         def log_line(message: str) -> None:
-            self.after(
-                0,
-                lambda m=message: self._status_var.set(m[:800]),
-            )
+            def apply_log(m: str = message) -> None:
+                if m.startswith("会社名比較 〇率(途中経過):"):
+                    return
+                self._status_var.set(m[:800])
+
+            self.after(0, apply_log)
 
         base_done = 0
         if base_rows:
             base_done = len([r for r in base_rows if isinstance(r, dict)])
             self._progress_var.set(f"実行済 {base_done} / 対象 ?")
 
+        progress_state = {"target": base_done}
+
+        def refresh_running_ratio_status() -> None:
+            current_rows = self._current_grid_rows()
+            target_count = max(progress_state["target"], len(current_rows))
+            ratio_text = self._company_match_ratio_text(
+                current_rows,
+                total_target_count=target_count,
+                prefix="会社名比較 〇率(途中経過)",
+            )
+            self._status_var.set(f"解析中… / {ratio_text}")
+
         def on_progress(done: int, total: int) -> None:
             # 継続解析時は読み込み済み件数を加算して表示
-            self.after(
-                0,
-                lambda d=done, t=total, b=base_done: self._progress_var.set(
-                    f"実行済 {b + d} / 対象 {b + t}"
-                ),
-            )
+            def apply_progress(d: int = done, t: int = total, b: int = base_done) -> None:
+                progress_state["target"] = b + t
+                self._progress_var.set(f"実行済 {b + d} / 対象 {b + t}")
+                refresh_running_ratio_status()
+
+            self.after(0, apply_progress)
 
         def on_row(r: dict[str, str]) -> None:
             def append_row(row: dict[str, str]) -> None:
@@ -773,6 +787,7 @@ class KintaiApp(tk.Frame):
                     self._tree.yview_moveto(1)
                 except tk.TclError:
                     pass
+                refresh_running_ratio_status()
 
             self.after(0, lambda rr=r: append_row(rr))
 
