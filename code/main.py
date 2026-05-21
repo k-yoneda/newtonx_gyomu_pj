@@ -34,6 +34,7 @@ class KintaiApp(tk.Frame):
     EMPLOYEE_NO_COL = "社員番号"
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
+    MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
 
     def __init__(
         self,
@@ -528,6 +529,37 @@ class KintaiApp(tk.Frame):
         except Exception:
             return str(rows)
 
+    def _company_match_ratio_text(
+        self,
+        rows: list[dict[str, str]],
+        *,
+        total_target_count: int | None = None,
+        prefix: str = "会社名比較 〇率",
+    ) -> str:
+        """会社名比較の〇率文字列を返す。△は〇側に含め、分母は全レコード件数。"""
+        ok_count = 0
+        processed_count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = (
+                (row.get(self.MATCH_COMPANY_COL) or "").strip()
+                or (row.get("match_company") or "").strip()
+            )
+            processed_count += 1
+            if symbol in ("〇", "△"):
+                ok_count += 1
+
+        target_count = total_target_count if total_target_count is not None else processed_count
+        if processed_count <= 0:
+            return f"{prefix}: 対象データなし（実行済 0 / 対象 {target_count}）"
+
+        ratio = (ok_count / processed_count) * 100
+        return (
+            f"{prefix}: {ratio:.1f}% "
+            f"（〇扱い {ok_count}件 / 実行済 {processed_count}件 / 対象 {target_count}件）"
+        )
+
     def _write_json_file(self, path: Path, rows: list[dict[str, str]]) -> None:
         payload = {
             "version": 1,
@@ -615,7 +647,8 @@ class KintaiApp(tk.Frame):
         if not self._busy:
             self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
             self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and self._loaded_rows) else tk.DISABLED))
-        self._status_var.set(f"読み込みました: {self._loaded_json_path}")
+        ratio_text = self._company_match_ratio_text(self._loaded_rows)
+        self._status_var.set(f"読み込みました: {self._loaded_json_path} / {ratio_text}")
         self._update_title()
 
     def _rebuild_grid_from_rows(self, rows: list[dict[str, str]]) -> None:
@@ -863,6 +896,7 @@ class KintaiApp(tk.Frame):
 
                 # --- ステータス表示 ---
                 n_rows = len(self._loaded_rows or [])
+                ratio_text = self._company_match_ratio_text(self._loaded_rows)
                 if err is not None:
                     # 要件: 送信エラー等でも中断状態・保存/継続解析を有効にする
                     messagebox.showerror(
@@ -870,18 +904,18 @@ class KintaiApp(tk.Frame):
                         str(err),
                     )
                     self._status_var.set(
-                        f"エラーで停止しました: {n_rows} 件を保持（JSON保存で続きから再開できます）"
+                        f"エラーで停止しました: {n_rows} 件を保持（JSON保存で続きから再開できます） / {ratio_text}"
                     )
                     # 進捗は固定せず、最後に見えていた値を維持（空にはしない）
                     return
 
                 if cancelled:
                     self._status_var.set(
-                        f"中断しました: {n_rows} 件を保持（JSON保存で続きから再開できます）"
+                        f"中断しました: {n_rows} 件を保持（JSON保存で続きから再開できます） / {ratio_text}"
                     )
                 else:
                     self._status_var.set(
-                        f"完了: {n_rows} 件をグリッド表示（解析結果.md を出力）"
+                        f"完了: {n_rows} 件をグリッド表示（解析結果.md を出力） / {ratio_text}"
                     )
 
             self.after(0, finish)

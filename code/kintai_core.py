@@ -32,15 +32,16 @@ TARGET_EXCEL_SHEET_NAME = "タイムシート兼作業報告書_お客様先用"
 UPLOAD_MAX_RETRIES = 3
 UPLOAD_RETRY_DELAY_SEC = 0.35
 
-DEFAULT_PARALLEL_ANALYSIS_CHATS = 2
+DEFAULT_PARALLEL_ANALYSIS_CHATS = 1
 PARALLEL_WORKERS_MAX = 32
 
 # グリッド・集計表の先頭列（〇: リトライ上限内でアップロード成功 / ✖: それ以外）
 SUMMARY_UPLOAD_COL = "アップロード"
 SUMMARY_TARGET_SHEET_COL = "対象シート有無"
 
-TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
+#TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
 #TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
+TARGET_ASSISTANT_NAME = "Gemini 3.1 Pro(高性能)"
 
 def _process_sse_response_no_print(self, response) -> str:
     full_response = ""
@@ -132,10 +133,19 @@ def _build_check_message(display_file_name: str) -> str:
     """解析結果に出すファイル名をローカルの実名に固定する。"""
     return f"""
 勤務表の画像を解析し、１画像１行で以下の内容にあたるものをmd形式で表で出力してください。
+１）会社名の抽出について
 画像ファイル名の会社名は会社名として出力しないこと。
-会社名とは、画像上に法人の会社名として認識できた名前のことである。会社名は契約先、常駐先、会社名という文字の近辺にある場合が多い。
-会社名が複数存在する場合は、会社名：会社名2,会社名2とカンマで区切って出力してください。
-会社名でセラクという名称を含むものは、株式会社セラクなどは会社名から除外してください。
+会社名は、{display_file_name}から、先頭に[]でくくられた部分がある場合はそれ以降から、次の'_’までの会社名を参考に
+画像内から、その名称の全部または一部をさがしてください。それを会社名として表示してください。存在しない場合は、'（存在しない）'と出力してください。
+会社名のアルファベット、カタカナの全角、半角、大文字小文字の違いは、同じものとみなしてください。
+読み取った会社名にスペースを含んでいる場合もあるが、スペースは無視して、抽出してください。
+ーと-など、画像解析で読み取った文字がおおよそ類似している場合は、同一とみなして出力してください。
+ファイル名内の会社名には様な度の継承がついている。これはないものとして画像内を検索してください
+抽出した会社名がセラクという名称を含むものは、当社の会社名なので、除外してください。
+２）氏名の抽出
+ファイル名の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。その前の_から次の_までの文字列が氏名である。
+上記の文字列を氏名として類似した文字列を画像内から氏名として抜き出してください。スペースなどがはいってる場合もあるので、無視してください。
+
 画像ファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
 {display_file_name}
 
@@ -153,10 +163,18 @@ def _build_pdf_check_message(display_file_name: str) -> str:
 同じPDFに勤怠（出退勤・打刻・勤務時間等）の情報と経費精算（領収書・立替等）の情報の両方が含まれている場合は、経費精算は無視し、必ず勤怠（勤務表）の情報だけを根拠に回答してください。経費側の社名・氏名・金額は採用しないでください。
 PDFファイル名の会社名は会社名として抽出しないこと。
 勤務表（勤怠）のPDFを解析し、１ファイルあたり適切な行数で以下の内容にあたるものをmd形式で表で出力してください。出力する勤務先・氏名・合計勤務時間・押印はすべて勤怠部分の記載に基づきます。
-会社名とは、ファイル上に法人の会社名として認識できた名前のことである。会社名は契約先、常駐先、会社名という文字の近辺にある場合が多い。
-会社名が複数存在する場合は、会社名：会社名2,会社名2とカンマで区切って出力してください。
-会社名でセラクという名称を含むものは、株式会社セラクなどは会社名から除外してください。
-PDFファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
+１）会社名の抽出について
+PDFファイル名の会社名は会社名として出力しないこと。
+会社名は、{display_file_name}から、先頭に[]でくくられた部分がある場合はそれ以降から、次の'_’までの会社名を参考に
+PDF内から、その名称の全部または一部をさがしてください。それを会社名として表示してください。存在しない場合は、'（存在しない）'と出力してください。
+会社名のアルファベット、カタカナの全角、半角、大文字小文字の違いは、同じものとみなしてください。
+読み取った会社名にスペースを含んでいる場合もあるが、スペースは無視して、抽出してください。
+ーと-など、画像解析で読み取った文字がおおよそ類似している場合は、同一とみなして出力してください。
+抽出した会社名がセラクという名称を含むものは、当社の会社名なので、除外してください。
+２）氏名の抽出
+ファイル名の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。その前の_から次の_までの文字列が氏名である。
+上記の文字列を氏名として類似した文字列をＰＤＦ内から氏名として抜き出してください。スペースなどがはいってる場合もあるので、無視してください
+ＰＤＦファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
 {display_file_name}
 
 会社名：
@@ -1235,11 +1253,63 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     )
 
 
-def _summary_table_md_lines(results: list[dict[str, str]]) -> list[str]:
+def _company_match_counts(results: list[dict[str, str]]) -> tuple[int, int]:
+    """会社名比較の集計用に (〇扱い件数, 実行済件数) を返す。△は〇側に含める。"""
+    ok_count = 0
+    processed_count = 0
+    for row in results:
+        processed_count += 1
+        symbol = (row.get("match_company") or "").strip()
+        if symbol in ("〇", "△"):
+            ok_count += 1
+    return ok_count, processed_count
+
+
+def _company_match_ratio_lines(
+    results: list[dict[str, str]],
+    total_target_count: int | None = None,
+) -> list[str]:
+    """会社名比較の〇率を、画像・PDF・Excel の全処理件数ベースで返す。"""
+    ok_count, processed_count = _company_match_counts(results)
+    target_count = total_target_count if total_target_count is not None else processed_count
+    if processed_count == 0:
+        return ["会社名比較 〇率: 対象データなし（実行済 0 / 対象 0）", ""]
+
+    ratio = (ok_count / processed_count) * 100
+    return [
+        f"会社名比較 〇率: {ratio:.1f}% （〇 {ok_count}件 / 実行済 {processed_count}件 / 対象 {target_count}件）",
+        "",
+    ]
+
+
+def _company_match_ratio_progress_line(
+    ok_count: int,
+    processed_count: int,
+    total_target_count: int,
+) -> str:
+    """逐次ログ用の会社名比較〇率文字列を返す。"""
+    if processed_count <= 0:
+        return (
+            "会社名比較 〇率(途中経過): "
+            f"対象データなし（実行済 0 / 対象 {total_target_count}）"
+        )
+    ratio = (ok_count / processed_count) * 100
+    return (
+        f"会社名比較 〇率(途中経過): {ratio:.1f}% "
+        f"（〇 {ok_count}件 / 実行済 {processed_count}件 / 対象 {total_target_count}件）"
+    )
+
+
+def _summary_table_md_lines(
+    results: list[dict[str, str]],
+    total_target_count: int | None = None,
+) -> list[str]:
     """
     解析結果.md 用: ヘッダ1行＋区切り行なし。データは各1行。
     """
-    return [SUMMARY_MD_HEADER] + [_one_summary_data_line(r) for r in results]
+    return _company_match_ratio_lines(results, total_target_count=total_target_count) + [SUMMARY_MD_HEADER] + [
+        _one_summary_data_line(r) for r in results
+    ]
 
 
 def summary_header_cells() -> tuple[str, ...]:
@@ -1408,6 +1478,9 @@ def run_analysis(
 
     summary_header_done = False
     summary_lock = threading.Lock()
+    company_ratio_lock = threading.Lock()
+    company_match_ok_count = 0
+    company_match_processed_count = 0
 
     def emit_summary_row_md(row_dict: dict[str, str]) -> None:
         nonlocal summary_header_done
@@ -1418,6 +1491,20 @@ def run_analysis(
                 log(SUMMARY_MD_HEADER)
                 summary_header_done = True
             log(_one_summary_data_line(row_dict))
+
+    def emit_company_match_ratio_progress(row_dict: dict[str, str]) -> None:
+        nonlocal company_match_ok_count, company_match_processed_count
+        symbol = (row_dict.get("match_company") or "").strip()
+        with company_ratio_lock:
+            company_match_processed_count += 1
+            if symbol in ("〇", "△"):
+                company_match_ok_count += 1
+            line = _company_match_ratio_progress_line(
+                company_match_ok_count,
+                company_match_processed_count,
+                total_files,
+            )
+        log(line)
 
     tasks_ordered: list[tuple[str, Path]] = [
         ("image", p) for p in image_files
@@ -1450,6 +1537,7 @@ def run_analysis(
         )
         bucket_results[worker_ix].append(row)
         emit_summary_row_md(row)
+        emit_company_match_ratio_progress(row)
         if on_row_completed is not None:
             on_row_completed(row)
 
@@ -1504,6 +1592,7 @@ def run_analysis(
                     row_excel = _extract_excel_target_sheet_row(file_path)
                     bucket_results[worker_idx].append(row_excel)
                     emit_summary_row_md(row_excel)
+                    emit_company_match_ratio_progress(row_excel)
                     if on_row_completed is not None:
                         on_row_completed(row_excel)
                     if row_excel.get("analysis"):
@@ -1582,6 +1671,7 @@ def run_analysis(
                                 _enrich_with_match_scores(row, row["analysis"])
                                 bucket_results[worker_idx].append(row)
                                 emit_summary_row_md(row)
+                                emit_company_match_ratio_progress(row)
                                 if on_row_completed is not None:
                                     on_row_completed(row)
                         finally:
@@ -1645,6 +1735,7 @@ def run_analysis(
                             )
                             bucket_results[worker_idx].append(row2)
                             emit_summary_row_md(row2)
+                            emit_company_match_ratio_progress(row2)
                             if on_row_completed is not None:
                                 on_row_completed(row2)
                     except Exception as e:
@@ -1701,7 +1792,9 @@ def run_analysis(
 
     output_md = save_md_path if save_md_path is not None else Path.cwd() / "解析結果.md"
     if results:
-        lines_content = "\n".join(_summary_table_md_lines(results))
+        lines_content = "\n".join(
+            _summary_table_md_lines(results, total_target_count=total_files)
+        )
     else:
         lines_content = "（アップロード・解析に成功した画像・PDFがありませんでした）"
     output_md.write_text(lines_content + "\n", encoding="utf-8")
