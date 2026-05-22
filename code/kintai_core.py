@@ -1314,8 +1314,9 @@ def _summary_table_md_lines(
 
 
 def _row_needs_unknown_company_retry(row: dict[str, str]) -> bool:
-    """会社名が不明なら再解析対象。"""
-    return ((row.get("name_company_1") or "").strip() == "不明")
+    """会社名が不明、または「（存在しない）」なら再解析対象。"""
+    company_name = (row.get("name_company_1") or "").strip()
+    return company_name in ("不明", "（存在しない）")
 
 
 def summary_header_cells() -> tuple[str, ...]:
@@ -1456,10 +1457,37 @@ def run_analysis(
             )
         log(f"既存フォルダを使用します: {target_folder_name} ({folder_uid})")
     else:
-        folder_uid = client.create_folder(target_folder_name)
-        if not folder_uid:
+        created_folder_uid = client.create_folder(target_folder_name)
+        if not created_folder_uid:
             raise RuntimeError("NewtonX 上でフォルダの作成に失敗しました。")
-        log(f"フォルダが作成されました: {folder_uid}")
+        log(f"フォルダが作成されました: {created_folder_uid}")
+
+        # 作成直後はレスポンスの UID だけでは不十分な場合があるため、
+        # 一覧を再取得して最終的に利用するフォルダ UID を確定する。
+        folders = client.get_folders()
+        matched = next(
+            (
+                f
+                for f in folders
+                if (f.get("name") or "").strip() == target_folder_name
+            ),
+            None,
+        )
+        if matched is not None:
+            raw_id = (
+                matched.get("uid")
+                if matched.get("uid") is not None
+                else matched.get("id")
+            )
+            folder_uid = str(raw_id) if raw_id is not None else None
+        else:
+            folder_uid = str(created_folder_uid)
+
+        if not folder_uid:
+            raise RuntimeError(
+                "NewtonX 上で作成したフォルダの ID を確定できませんでした。"
+            )
+        log(f"作成後に利用するフォルダを確定しました: {target_folder_name} ({folder_uid})")
 
     n_workers = int(parallel_chats)
     if n_workers < 1:
