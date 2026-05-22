@@ -34,7 +34,6 @@ UPLOAD_RETRY_DELAY_SEC = 0.35
 
 DEFAULT_PARALLEL_ANALYSIS_CHATS = 1
 PARALLEL_WORKERS_MAX = 32
-UNKNOWN_COMPANY_RETRY_MAX = 2
 
 # グリッド・集計表の先頭列（〇: リトライ上限内でアップロード成功 / ✖: それ以外）
 SUMMARY_UPLOAD_COL = "アップロード"
@@ -1313,44 +1312,6 @@ def _summary_table_md_lines(
     ]
 
 
-def _row_needs_unknown_company_retry(row: dict[str, str]) -> bool:
-    """会社名1 が不明、または「（存在しない）/(（存在しない）)」なら再解析対象。"""
-    company_name = unicodedata.normalize(
-        "NFKC", (row.get("name_company_1") or "").strip()
-    )
-    return company_name in ("不明", "（存在しない）", "(存在しない)")
-
-
-def _analyze_row_with_unknown_company_retries(
-    row: dict[str, str],
-    analyze_once: Callable[[], str],
-    *,
-    prefer_kintai_section: bool = False,
-    log_emit: Callable[[str], None] | None = None,
-) -> None:
-    """会社名1 が不明系なら、解析を最大 UNKNOWN_COMPANY_RETRY_MAX 回まで再試行する。"""
-    log = log_emit if log_emit is not None else print
-
-    for attempt in range(UNKNOWN_COMPANY_RETRY_MAX + 1):
-        response = analyze_once()
-        row["analysis"] = response if response else "（解析結果を取得できませんでした）"
-        _enrich_with_match_scores(
-            row,
-            row["analysis"],
-            prefer_kintai_section=prefer_kintai_section,
-        )
-        if not _row_needs_unknown_company_retry(row):
-            return
-        if attempt >= UNKNOWN_COMPANY_RETRY_MAX:
-            return
-        company_name = (row.get("name_company_1") or "").strip() or "不明"
-        file_name = (row.get("file_name") or "").strip()
-        log(
-            f"会社名1 が {company_name} のため再解析します "
-            f"({attempt + 1}/{UNKNOWN_COMPANY_RETRY_MAX}) — {file_name}"
-        )
-
-
 def summary_header_cells() -> tuple[str, ...]:
     """SUMMARY_MD_HEADER から見出し要素を返す（Treeview 列名用）。"""
     raw = SUMMARY_MD_HEADER.strip()
@@ -1716,11 +1677,11 @@ def run_analysis(
                                     "resolved_path": str(file_path.resolve()),
                                     "analysis": "",
                                 }
-                                _analyze_row_with_unknown_company_retries(
-                                    row,
-                                    analyze_image_once,
-                                    log_emit=log,
+                                response = analyze_image_once()
+                                row["analysis"] = (
+                                    response if response else "（解析結果を取得できませんでした）"
                                 )
+                                _enrich_with_match_scores(row, row["analysis"])
                                 bucket_results[worker_idx].append(row)
                                 emit_summary_row_md(row)
                                 emit_company_match_ratio_progress(row)
@@ -1785,11 +1746,14 @@ def run_analysis(
                                 "resolved_path": str(file_path.resolve()),
                                 "analysis": "",
                             }
-                            _analyze_row_with_unknown_company_retries(
+                            response = analyze_pdf_once()
+                            row2["analysis"] = (
+                                response if response else "（解析結果を取得できませんでした）"
+                            )
+                            _enrich_with_match_scores(
                                 row2,
-                                analyze_pdf_once,
+                                row2["analysis"],
                                 prefer_kintai_section=True,
-                                log_emit=log,
                             )
                             bucket_results[worker_idx].append(row2)
                             emit_summary_row_md(row2)

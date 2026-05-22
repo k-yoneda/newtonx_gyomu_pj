@@ -35,6 +35,8 @@ class KintaiApp(tk.Frame):
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
     MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
+    COMPANY1_COL = "会社名1"
+    _ERROR_REANALYSIS_COMPANY1_VALUES = ("不明", "（存在しない）")
 
     def __init__(
         self,
@@ -110,9 +112,30 @@ class KintaiApp(tk.Frame):
         ttk.Label(ctrl, textvariable=self._progress_var, width=18).grid(
             row=0, column=5, sticky="w", padx=(16, 0)
         )
-        ttk.Label(ctrl, textvariable=self._status_var).grid(
-            row=0, column=6, sticky="w", padx=(12, 0)
+
+        # ステータスは可変長だが、要求幅が大きくなりすぎると右端ボタンが見えなくなる。
+        # 右端に必ず「エラー再解析」を表示するため、ラベルの要求幅を抑制（固定幅＋折り返し）する。
+        self._status_label = ttk.Label(
+            ctrl,
+            textvariable=self._status_var,
+            anchor="w",
+            width=70,
+            wraplength=900,
+            justify="left",
         )
+        self._status_label.grid(row=0, column=6, sticky="ew", padx=(12, 0))
+        ctrl.columnconfigure(6, weight=1)
+        # 右端ボタン領域の最低幅を確保
+        ctrl.columnconfigure(7, minsize=120)
+
+        # 右側: エラー再解析（会社名1が「不明」「（存在しない）」のみを対象に再解析）
+        self._error_reanalysis_btn = ttk.Button(
+            ctrl,
+            text="エラー再解析",
+            command=self._start_error_reanalysis,
+            state=tk.DISABLED,
+        )
+        self._error_reanalysis_btn.grid(row=0, column=7, sticky="e", padx=(12, 0))
 
         grid_frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         grid_frame.pack(fill=tk.BOTH, expand=True)
@@ -177,6 +200,30 @@ class KintaiApp(tk.Frame):
             )
             self._save_btn.configure(state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED))
             self._cancel_btn.configure(state=tk.DISABLED)
+            self._refresh_error_reanalysis_button_state()
+
+    def _company1_value_from_row(self, row: dict[str, str]) -> str:
+        # UI保存形式: 「会社名1」 / core形式: name_company_1
+        return ((row.get(self.COMPANY1_COL) or row.get("name_company_1") or "").strip())
+
+    def _is_error_reanalysis_target_row(self, row: dict[str, str]) -> bool:
+        return self._company1_value_from_row(row) in self._ERROR_REANALYSIS_COMPANY1_VALUES
+
+    def _eligible_error_reanalysis_iids(self) -> list[str]:
+        iids: list[str] = []
+        for iid in self._tree.get_children():
+            r = self._current_row_dict_from_iid(iid)
+            if self._is_error_reanalysis_target_row(r):
+                iids.append(iid)
+        return iids
+
+    def _refresh_error_reanalysis_button_state(self) -> None:
+        if self._busy or self._data_dir is None:
+            self._error_reanalysis_btn.configure(state=tk.DISABLED)
+            return
+        # 対象行が1件でもあれば有効
+        enabled = bool(self._eligible_error_reanalysis_iids())
+        self._error_reanalysis_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
 
     def _clear_grid(self) -> None:
         for iid in self._tree.get_children():
@@ -292,6 +339,17 @@ class KintaiApp(tk.Frame):
             return
 
         current_row = self._current_row_dict_from_iid(rid)
+
+        # 要件: 会社名1が「不明」「（存在しない）」の行のみ解析を実行する
+        if not self._is_error_reanalysis_target_row(current_row):
+            cur = self._company1_value_from_row(current_row) or "（空欄）"
+            messagebox.showinfo(
+                "再解析",
+                "会社名1が『不明』または『（存在しない）』の行のみ再解析できます。\n"
+                f"現在の会社名1: {cur}",
+            )
+            return
+
         file_name = (current_row.get("画像ファイル名") or current_row.get("file_name") or "").strip()
         if not file_name:
             messagebox.showinfo("再解析", "選択行のファイル名を取得できません。")
@@ -368,7 +426,134 @@ class KintaiApp(tk.Frame):
                 self._progress_var.set("再解析完了 1 / 1")
                 ratio_text = self._company_match_ratio_text(self._loaded_rows)
                 self._status_var.set(f"再解析完了: {file_name} / {ratio_text}")
+                self._refresh_error_reanalysis_button_state()
                 messagebox.showinfo("再解析完了", f"選択行の再解析が完了しました。\n{file_name}")
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_error_reanalysis(self) -> None:
+        """会社名1が「不明」「（存在しない）」の行だけをまとめて再解析する。"""
+        if self._busy or self._data_dir is None:
+            return
+
+        target_iids = self._eligible_error_reanalysis_iids()
+        if not target_iids:
+            messagebox.showinfo("エラー再解析", "対象行がありません（会社名1が『不明』または『（存在しない）』の行）。")
+            self._refresh_error_reanalysis_button_state()
+            return
+
+        # iid -> file_name / preserved user judgment
+        iid_by_file: dict[str, str] = {}
+        preserved_uj_by_file: dict[str, str] = {}
+        for iid in target_iids:
+            row = self._current_row_dict_from_iid(iid)
+            file_name = (row.get("画像ファイル名") or row.get("file_name") or "").strip()
+            if not file_name:
+                continue
+            iid_by_file[file_name] = iid
+            uj = (row.get(self.USER_JUDGMENT_COL) or row.get("user_judgment_company") or "").strip()
+            if uj:
+                preserved_uj_by_file[file_name] = uj
+
+        if not iid_by_file:
+            messagebox.showwarning("エラー再解析", "対象行のファイル名を取得できませんでした。")
+            self._refresh_error_reanalysis_button_state()
+            return
+
+        file_names = set(iid_by_file.keys())
+        total = len(file_names)
+
+        td = self._data_dir.resolve()
+        client = self._client
+        aid = self._assistant_uid
+
+        self._busy = True
+        self._cancel_event = threading.Event()
+        self._new_btn.configure(state=tk.DISABLED)
+        self._cont_btn.configure(state=tk.DISABLED)
+        self._save_btn.configure(state=tk.DISABLED)
+        self._load_btn.configure(state=tk.DISABLED)
+        self._cancel_btn.configure(state=tk.NORMAL)
+        self._error_reanalysis_btn.configure(state=tk.DISABLED)
+        self._progress_var.set(f"エラー再解析中 0 / {total}")
+        self._status_var.set(f"エラー再解析しています… {total} 件")
+
+        def log_line(message: str) -> None:
+            self.after(0, lambda m=message: self._status_var.set(m[:800]))
+
+        def on_progress(done: int, t: int) -> None:
+            self.after(0, lambda d=done, tt=t: self._progress_var.set(f"エラー再解析中 {d} / {tt}"))
+
+        def on_row_completed(row: dict[str, str]) -> None:
+            fn = (row.get("file_name") or "").strip()
+            if not fn:
+                return
+            if fn in preserved_uj_by_file:
+                row["user_judgment_company"] = preserved_uj_by_file[fn]
+
+            rid = iid_by_file.get(fn)
+            if not rid:
+                return
+
+            def apply_row() -> None:
+                self._replace_row_with_result(rid, row)
+                # 途中経過でも割合等を更新
+                current_rows = self._current_grid_rows()
+                ratio_text = self._company_match_ratio_text(current_rows, total_target_count=len(current_rows))
+                self._status_var.set(f"エラー再解析中… / {ratio_text}")
+
+            self.after(0, apply_row)
+
+        def worker() -> None:
+            err: BaseException | None = None
+            try:
+                run_analysis(
+                    client,
+                    aid,
+                    td,
+                    save_md_path=Path.cwd() / "解析結果.md",
+                    on_log=log_line,
+                    emit_progress_md_rows=False,
+                    on_file_progress=on_progress,
+                    on_row_completed=on_row_completed,
+                    cancel_event=self._cancel_event,
+                    target_file_names=file_names,
+                    parallel_chats=self._parallel_workers,
+                )
+            except BaseException as e:
+                err = e
+
+            def finish() -> None:
+                self._busy = False
+                self._cancel_btn.configure(state=tk.DISABLED)
+                cancelled = self._cancel_event is not None and self._cancel_event.is_set()
+                self._cancel_event = None
+
+                self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
+                self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and (self._loaded_rows or self._tree.get_children())) else tk.DISABLED))
+                self._save_btn.configure(state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED))
+                self._load_btn.configure(state=tk.NORMAL)
+
+                # 確定: 現在グリッドの内容を loaded_rows に反映
+                self._loaded_rows = self._current_grid_rows()
+                self._progress_var.set(f"エラー再解析完了 {total} / {total}")
+                ratio_text = self._company_match_ratio_text(self._loaded_rows)
+
+                # ボタン状態更新
+                self._refresh_error_reanalysis_button_state()
+
+                if err is not None:
+                    messagebox.showerror("エラー再解析エラー", str(err))
+                    self._status_var.set(f"エラー再解析エラー（途中結果は保持） / {ratio_text}")
+                    return
+                if cancelled:
+                    self._status_var.set(f"エラー再解析を中断しました（途中結果は保持） / {ratio_text}")
+                    return
+
+                self._status_var.set(f"エラー再解析完了: {total} 件 / {ratio_text}")
+                messagebox.showinfo("エラー再解析完了", f"会社名1が不明/（存在しない）の行を再解析しました。\n対象: {total} 件")
 
             self.after(0, finish)
 
@@ -648,6 +833,7 @@ class KintaiApp(tk.Frame):
         if not self._busy:
             self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
             self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and self._loaded_rows) else tk.DISABLED))
+        self._refresh_error_reanalysis_button_state()
         ratio_text = self._company_match_ratio_text(self._loaded_rows)
         self._status_var.set(f"読み込みました: {self._loaded_json_path} / {ratio_text}")
         self._update_title()
@@ -923,6 +1109,7 @@ class KintaiApp(tk.Frame):
                         f"エラーで停止しました: {n_rows} 件を保持（JSON保存で続きから再開できます） / {ratio_text}"
                     )
                     # 進捗は固定せず、最後に見えていた値を維持（空にはしない）
+                    self._refresh_error_reanalysis_button_state()
                     return
 
                 if cancelled:
@@ -933,6 +1120,8 @@ class KintaiApp(tk.Frame):
                     self._status_var.set(
                         f"完了: {n_rows} 件をグリッド表示（解析結果.md を出力） / {ratio_text}"
                     )
+
+                self._refresh_error_reanalysis_button_state()
 
             self.after(0, finish)
 
