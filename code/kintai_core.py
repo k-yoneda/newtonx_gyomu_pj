@@ -1318,7 +1318,7 @@ def _row_needs_unknown_company_retry(row: dict[str, str]) -> bool:
     company_name = unicodedata.normalize(
         "NFKC", (row.get("name_company_1") or "").strip()
     )
-    return company_name in ("不明", "（存在しない）")
+    return company_name in ("不明", "（存在しない）", "(存在しない)")
 
 
 def _analyze_row_with_unknown_company_retries(
@@ -1570,11 +1570,26 @@ def run_analysis(
 
         def create_file_chat(title_suffix: str) -> str | None:
             try:
-                nc = wc.create_chat_in_folder(
-                    assistant_uid=assistant_uid,
-                    folder_uid=folder_uid,
-                    title=f"業務課集計 {title_suffix}",
-                )
+                title = f"業務課集計 {title_suffix}"
+                create_chat_in_folder = getattr(wc, "create_chat_in_folder", None)
+                if callable(create_chat_in_folder):
+                    try:
+                        nc = create_chat_in_folder(
+                            assistant_uid=assistant_uid,
+                            folder_uid=folder_uid,
+                            title=title,
+                        )
+                    except TypeError:
+                        nc = create_chat_in_folder(
+                            assistant_uid,
+                            folder_uid,
+                            title,
+                        )
+                else:
+                    nc = wc.create_chat(
+                        assistant_uid=assistant_uid,
+                        title=title,
+                    )
                 if not nc:
                     return None
                 try:
