@@ -1314,9 +1314,41 @@ def _summary_table_md_lines(
 
 
 def _row_needs_unknown_company_retry(row: dict[str, str]) -> bool:
-    """会社名が不明、または「（存在しない）」なら再解析対象。"""
-    company_name = (row.get("name_company_1") or "").strip()
+    """会社名1 が不明、または「（存在しない）/(（存在しない）)」なら再解析対象。"""
+    company_name = unicodedata.normalize(
+        "NFKC", (row.get("name_company_1") or "").strip()
+    )
     return company_name in ("不明", "（存在しない）")
+
+
+def _analyze_row_with_unknown_company_retries(
+    row: dict[str, str],
+    analyze_once: Callable[[], str],
+    *,
+    prefer_kintai_section: bool = False,
+    log_emit: Callable[[str], None] | None = None,
+) -> None:
+    """会社名1 が不明系なら、解析を最大 UNKNOWN_COMPANY_RETRY_MAX 回まで再試行する。"""
+    log = log_emit if log_emit is not None else print
+
+    for attempt in range(UNKNOWN_COMPANY_RETRY_MAX + 1):
+        response = analyze_once()
+        row["analysis"] = response if response else "（解析結果を取得できませんでした）"
+        _enrich_with_match_scores(
+            row,
+            row["analysis"],
+            prefer_kintai_section=prefer_kintai_section,
+        )
+        if not _row_needs_unknown_company_retry(row):
+            return
+        if attempt >= UNKNOWN_COMPANY_RETRY_MAX:
+            return
+        company_name = (row.get("name_company_1") or "").strip() or "不明"
+        file_name = (row.get("file_name") or "").strip()
+        log(
+            f"会社名1 が {company_name} のため再解析します "
+            f"({attempt + 1}/{UNKNOWN_COMPANY_RETRY_MAX}) — {file_name}"
+        )
 
 
 def summary_header_cells() -> tuple[str, ...]:
@@ -1457,37 +1489,10 @@ def run_analysis(
             )
         log(f"既存フォルダを使用します: {target_folder_name} ({folder_uid})")
     else:
-        created_folder_uid = client.create_folder(target_folder_name)
-        if not created_folder_uid:
-            raise RuntimeError("NewtonX 上でフォルダの作成に失敗しました。")
-        log(f"フォルダが作成されました: {created_folder_uid}")
-
-        # 作成直後はレスポンスの UID だけでは不十分な場合があるため、
-        # 一覧を再取得して最終的に利用するフォルダ UID を確定する。
-        folders = client.get_folders()
-        matched = next(
-            (
-                f
-                for f in folders
-                if (f.get("name") or "").strip() == target_folder_name
-            ),
-            None,
-        )
-        if matched is not None:
-            raw_id = (
-                matched.get("uid")
-                if matched.get("uid") is not None
-                else matched.get("id")
-            )
-            folder_uid = str(raw_id) if raw_id is not None else None
-        else:
-            folder_uid = str(created_folder_uid)
-
+        folder_uid = client.create_folder(target_folder_name)
         if not folder_uid:
-            raise RuntimeError(
-                "NewtonX 上で作成したフォルダの ID を確定できませんでした。"
-            )
-        log(f"作成後に利用するフォルダを確定しました: {target_folder_name} ({folder_uid})")
+            raise RuntimeError("NewtonX 上でフォルダの作成に失敗しました。")
+        log(f"フォルダが作成されました: {folder_uid}")
 
     n_workers = int(parallel_chats)
     if n_workers < 1:
@@ -1596,84 +1601,6 @@ def run_analysis(
             except Exception as e:
                 log(f"チャット削除時に異常が発生しました: {chat_uid} / {e}")
 
-        def retry_unknown_company_with_new_chat(
-            file_path: Path,
-            *,
-            is_pdf: bool,
-            upload_src: str | None = None,
-        ) -> dict[str, str] | None:
-            """会社名が不明のとき、最大2回だけ新規チャットで再解析する。"""
-            latest_row: dict[str, str] | None = None
-            for retry_idx in range(1, UNKNOWN_COMPANY_RETRY_MAX + 1):
-                if is_cancelled():
-                    break
-                retry_chat_uid: str | None = None
-                try:
-                    retry_chat_uid = create_file_chat(
-                        f"#{worker_idx + 1} {file_path.name} retry{retry_idx}"
-                    )
-                    if not retry_chat_uid:
-                        log(f"会社名不明再解析用チャットの作成に失敗しました — {file_path.name}")
-                        break
-                    retry_holder = {"chat_uid": retry_chat_uid}
-
-                    if is_pdf:
-                        success, upload_succeeded = _upload_document_with_retries(
-                            wc,
-                            chat_uid_holder=retry_holder,
-                            file_path=str(file_path),
-                            file_name=file_path.name,
-                            recreate_chat_fn=None,
-                            log_emit=log,
-                        )
-                        if not success:
-                            log(f"会社名不明再解析のPDFアップロードに失敗しました — {file_path.name} / retry {retry_idx}")
-                            break
-                        response = wc.send_message(
-                            chat_uid=retry_holder["chat_uid"],
-                            message=_build_pdf_check_message(file_path.name),
-                        )
-                    else:
-                        image_id, upload_succeeded = _upload_image_with_retries(
-                            wc,
-                            chat_uid_holder=retry_holder,
-                            upload_src=str(upload_src or file_path),
-                            file_name=file_path.name,
-                            recreate_chat_fn=None,
-                            log_emit=log,
-                        )
-                        if not image_id:
-                            log(f"会社名不明再解析の画像アップロードに失敗しました — {file_path.name} / retry {retry_idx}")
-                            break
-                        response = wc.send_message(
-                            chat_uid=retry_holder["chat_uid"],
-                            message=_build_check_message(file_path.name),
-                            image_ids=[image_id],
-                        )
-
-                    latest_row = {
-                        "upload_ok": "〇" if upload_succeeded else "✖",
-                        "file_name": file_path.name,
-                        "resolved_path": str(file_path.resolve()),
-                        "analysis": response if response else "（解析結果を取得できませんでした）",
-                    }
-                    _enrich_with_match_scores(
-                        latest_row,
-                        latest_row["analysis"],
-                        prefer_kintai_section=is_pdf,
-                    )
-
-                    if not _row_needs_unknown_company_retry(latest_row):
-                        log(f"会社名不明の再解析で会社名を取得しました — {file_path.name} / retry {retry_idx}")
-                        return latest_row
-
-                    log(f"会社名不明の再解析でも不明でした — {file_path.name} / retry {retry_idx}")
-                except Exception as e:
-                    log(f"会社名不明再解析に失敗しました — {file_path.name} / retry {retry_idx}: {e}")
-                finally:
-                    delete_file_chat(retry_chat_uid)
-            return latest_row
-
         def signal_fatal(exc: BaseException) -> None:
             worker_exc[worker_idx] = exc
             try:
@@ -1756,11 +1683,13 @@ def run_analysis(
                                         "中断: 画像の解析要求前にキャンセルされました"
                                     )
                                     break
-                                response = wc.send_message(
-                                    chat_uid=chat_holder["chat_uid"],
-                                    message=_build_check_message(file_path.name),
-                                    image_ids=[image_id],
-                                )
+                                def analyze_image_once() -> str:
+                                    return wc.send_message(
+                                        chat_uid=chat_holder["chat_uid"],
+                                        message=_build_check_message(file_path.name),
+                                        image_ids=[image_id],
+                                    )
+
                                 if is_cancelled():
                                     log(
                                         "中断: 画像の解析応答待ち後にキャンセルされました"
@@ -1770,19 +1699,13 @@ def run_analysis(
                                     "upload_ok": "〇" if upload_succeeded else "✖",
                                     "file_name": file_path.name,
                                     "resolved_path": str(file_path.resolve()),
-                                    "analysis": response
-                                    if response
-                                    else "（解析結果を取得できませんでした）",
+                                    "analysis": "",
                                 }
-                                _enrich_with_match_scores(row, row["analysis"])
-                                if _row_needs_unknown_company_retry(row):
-                                    retried_row = retry_unknown_company_with_new_chat(
-                                        file_path,
-                                        is_pdf=False,
-                                        upload_src=upload_src,
-                                    )
-                                    if retried_row is not None:
-                                        row = retried_row
+                                _analyze_row_with_unknown_company_retries(
+                                    row,
+                                    analyze_image_once,
+                                    log_emit=log,
+                                )
                                 bucket_results[worker_idx].append(row)
                                 emit_summary_row_md(row)
                                 emit_company_match_ratio_progress(row)
@@ -1830,10 +1753,12 @@ def run_analysis(
                                     "中断: PDFの解析要求前にキャンセルされました"
                                 )
                                 break
-                            response = wc.send_message(
-                                chat_uid=chat_holder["chat_uid"],
-                                message=_build_pdf_check_message(file_path.name),
-                            )
+                            def analyze_pdf_once() -> str:
+                                return wc.send_message(
+                                    chat_uid=chat_holder["chat_uid"],
+                                    message=_build_pdf_check_message(file_path.name),
+                                )
+
                             if is_cancelled():
                                 log(
                                     "中断: PDFの解析応答待ち後にキャンセルされました"
@@ -1843,22 +1768,14 @@ def run_analysis(
                                 "upload_ok": "〇" if upload_succeeded else "✖",
                                 "file_name": file_path.name,
                                 "resolved_path": str(file_path.resolve()),
-                                "analysis": response
-                                if response
-                                else "（解析結果を取得できませんでした）",
+                                "analysis": "",
                             }
-                            _enrich_with_match_scores(
+                            _analyze_row_with_unknown_company_retries(
                                 row2,
-                                row2["analysis"],
+                                analyze_pdf_once,
                                 prefer_kintai_section=True,
+                                log_emit=log,
                             )
-                            if _row_needs_unknown_company_retry(row2):
-                                retried_row2 = retry_unknown_company_with_new_chat(
-                                    file_path,
-                                    is_pdf=True,
-                                )
-                                if retried_row2 is not None:
-                                    row2 = retried_row2
                             bucket_results[worker_idx].append(row2)
                             emit_summary_row_md(row2)
                             emit_company_match_ratio_progress(row2)
