@@ -393,15 +393,8 @@ class KintaiApp(tk.Frame):
 
         current_row = self._current_row_dict_from_iid(rid)
 
-        # 要件: 会社名1が「不明」「（存在しない）」の行のみ解析を実行する
-        if not self._is_error_reanalysis_target_row(current_row):
-            cur = self._company1_value_from_row(current_row) or "（空欄）"
-            messagebox.showinfo(
-                "再解析",
-                "会社名1が『不明』または『（存在しない）』の行のみ再解析できます。\n"
-                f"現在の会社名1: {cur}",
-            )
-            return
+        # 選択行の「再解析」は、会社名1の内容に関わらず実行可能とする。
+        # （不明/（存在しない）のみ一括で再解析したい場合は「エラー再解析」ボタンを使用。）
 
         file_name = (current_row.get("画像ファイル名") or current_row.get("file_name") or "").strip()
         if not file_name:
