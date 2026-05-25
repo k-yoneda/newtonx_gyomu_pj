@@ -40,8 +40,8 @@ SUMMARY_UPLOAD_COL = "アップロード"
 SUMMARY_TARGET_SHEET_COL = "対象シート有無"
 
 #TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
-#TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
-TARGET_ASSISTANT_NAME = "Gemini 3.1 Pro(高性能)"
+TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
+#TARGET_ASSISTANT_NAME = "Gemini 3.1 Pro(高性能)"
 
 def _process_sse_response_no_print(self, response) -> str:
     full_response = ""
@@ -1351,6 +1351,7 @@ def run_analysis(
     save_md_path: Path | None = None,
     on_log: Callable[[str], None] | None = None,
     emit_progress_md_rows: bool = True,
+    on_file_started: Callable[[str], None] | None = None,
     on_file_progress: Callable[[int, int], None] | None = None,
     on_row_completed: Callable[[dict[str, str]], None] | None = None,
     cancel_event=None,
@@ -1368,6 +1369,8 @@ def run_analysis(
     Excel は生成AIへアップロードせず、対象シート名の有無のみを判定する。
     save_md_path が None のときは cwd に 解析結果.md を出力する。
     emit_progress_md_rows が False のとき、コンソール向け Markdown 行は on_log に流さない。
+    on_file_started: ワーカーが各ファイルの処理に着手したタイミングでファイル名を通知する。
+        GUI などで「現在処理中の行」をハイライトする用途を想定。
     on_file_progress: 処理が終わったファイル数を (実行済み数, 対象総数) で通知する（各ファイルの試行の末尾で1回）。
     on_row_completed: 解析結果またはアップロード失敗行を1件 results に載せた直後に呼ぶ。
     cancel_event: threading.Event 互換。set() されたら以降の解析を中断する（処理中の1ファイルは止まらず、次の境界で止まる）。
@@ -1595,6 +1598,15 @@ def run_analysis(
                     f"中断: ワーカー {worker_idx + 1} がキャンセルにより停止しました"
                 )
                 break
+
+            # GUI 向け: 「今からこのファイルを処理する」通知（並列ワーカーの場合は同時に複数呼ばれ得る）
+            if on_file_started is not None:
+                try:
+                    on_file_started(file_path.name)
+                except Exception:
+                    # 通知失敗は解析処理自体に影響させない
+                    pass
+
             chat_holder: dict[str, str] = {"chat_uid": ""}
             try:
                 if kind == "excel":

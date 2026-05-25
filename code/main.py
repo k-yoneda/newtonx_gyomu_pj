@@ -37,6 +37,7 @@ class KintaiApp(tk.Frame):
     MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
     COMPANY1_COL = "会社名1"
     _ERROR_REANALYSIS_COMPANY1_VALUES = ("不明", "（存在しない）")
+    _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
 
     def __init__(
         self,
@@ -167,6 +168,10 @@ class KintaiApp(tk.Frame):
             yscrollcommand=y_scroll.set,
             xscrollcommand=x_scroll.set,
         )
+
+        # 再解析中の行を反転表示（背景/文字色）
+        # OSテーマにより見え方が変わるため、強めのコントラストにする。
+        self._tree.tag_configure(self._TAG_REANALYSIS_ACTIVE, background="#1f2937", foreground="#ffffff")
         y_scroll.configure(command=self._tree.yview)
         x_scroll.configure(command=self._tree.xview)
 
@@ -363,6 +368,24 @@ class KintaiApp(tk.Frame):
         self._tree.item(rid, values=row_display_values(row))
         self._item_paths[rid] = row.get("resolved_path", "")
 
+    def _set_row_reanalysis_highlight(self, rid: str, active: bool) -> None:
+        """Treeview の指定行に、再解析中ハイライト（反転）を付与/解除する。"""
+        try:
+            cur = tuple(self._tree.item(rid, "tags") or ())
+        except tk.TclError:
+            return
+        tag = self._TAG_REANALYSIS_ACTIVE
+        if active:
+            if tag not in cur:
+                self._tree.item(rid, tags=cur + (tag,))
+        else:
+            if tag in cur:
+                self._tree.item(rid, tags=tuple(t for t in cur if t != tag))
+
+    def _set_rows_reanalysis_highlight(self, rids: list[str], active: bool) -> None:
+        for rid in rids:
+            self._set_row_reanalysis_highlight(rid, active)
+
     def _start_row_reanalysis(self, rid: str) -> None:
         if self._busy or self._data_dir is None:
             return
@@ -399,6 +422,9 @@ class KintaiApp(tk.Frame):
         self._progress_var.set("再解析中 0 / 1")
         self._status_var.set(f"再解析しています… {file_name}")
 
+        # 対象行を反転表示
+        self._set_row_reanalysis_highlight(rid, True)
+
         def log_line(message: str) -> None:
             def apply_log(m: str = message) -> None:
                 if self._should_ignore_status_log(m):
@@ -434,6 +460,9 @@ class KintaiApp(tk.Frame):
                 self._cancel_btn.configure(state=tk.DISABLED)
                 cancelled = self._cancel_event is not None and self._cancel_event.is_set()
                 self._cancel_event = None
+
+                # 反転表示を解除
+                self._set_row_reanalysis_highlight(rid, False)
 
                 self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
                 self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and (self._loaded_rows or self._tree.get_children())) else tk.DISABLED))
@@ -514,6 +543,9 @@ class KintaiApp(tk.Frame):
         self._progress_var.set(f"エラー再解析中 0 / {total}")
         self._status_var.set(f"エラー再解析しています… {total} 件")
 
+        # 対象行を一括で反転表示（終了時に解除）
+        self._set_rows_reanalysis_highlight(target_iids, True)
+
         def log_line(message: str) -> None:
             def apply_log(m: str = message) -> None:
                 if self._should_ignore_status_log(m):
@@ -569,6 +601,9 @@ class KintaiApp(tk.Frame):
                 self._cancel_btn.configure(state=tk.DISABLED)
                 cancelled = self._cancel_event is not None and self._cancel_event.is_set()
                 self._cancel_event = None
+
+                # 反転表示を解除（成功/エラー/中断いずれも）
+                self._set_rows_reanalysis_highlight(target_iids, False)
 
                 self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
                 self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and (self._loaded_rows or self._tree.get_children())) else tk.DISABLED))
