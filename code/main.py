@@ -8,7 +8,7 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 _CODE_DIR = Path(__file__).resolve().parent
 _ROOT = _CODE_DIR.parent
@@ -67,6 +67,34 @@ class KintaiApp(tk.Frame):
         self._last_saved_snapshot: str = ""
 
         self._build_ui()
+
+    def _tree_heading_font(self) -> tkfont.Font:
+        spec = ttk.Style().lookup("Treeview.Heading", "font")
+        if spec:
+            return tkfont.Font(root=self._root, font=spec)
+        return tkfont.nametofont("TkDefaultFont")
+
+    def _column_width_for_heading(
+        self, heading: str, *, font: tkfont.Font | None = None
+    ) -> int:
+        """見出し文字列の描画幅に合わせた列幅（px）を返す。"""
+        f = font or self._tree_heading_font()
+        padding_px = 20
+        min_px = 48
+        return max(f.measure(heading) + padding_px, min_px)
+
+    def _window_width_for_columns(
+        self, col_px: list[int], *, y_scroll: ttk.Scrollbar
+    ) -> int:
+        """全列が欠けずに見えるよう、ウィンドウ幅（px）を算出する。"""
+        self.update_idletasks()
+        scrollbar_w = y_scroll.winfo_reqwidth()
+        if scrollbar_w <= 1:
+            scrollbar_w = 18
+        grid_pad_x = 16  # grid_frame padding (8, 0, 8, 8)
+        chrome_x = 16
+        w = sum(col_px) + scrollbar_w + grid_pad_x + chrome_x
+        return min(w, self._root.winfo_screenwidth())
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=8)
@@ -152,18 +180,11 @@ class KintaiApp(tk.Frame):
         y_scroll = ttk.Scrollbar(grid_frame)
         x_scroll = ttk.Scrollbar(grid_frame, orient=tk.HORIZONTAL)
 
-        # headings（列名）と col_px（列幅）の数がズレると zip(strict=True) で落ちるため、
-        # headings の列数に追従して幅リストを整形する。
-        default_w_px = 120
-        col_px_base = [56, 320, 200, 120, 120, 140, 80, 220, 72]
-        if len(col_px_base) < len(headings):
-            col_px = col_px_base + [default_w_px] * (len(headings) - len(col_px_base))
-        else:
-            col_px = col_px_base[: len(headings)]
+        heading_font = self._tree_heading_font()
+        col_px = [
+            self._column_width_for_heading(h, font=heading_font) for h in headings
+        ]
 
-        total_w = sum(col_px) + 28
-        initial_w = max(1920, total_w)
-        min_w = min(960, initial_w)
         self._tree = ttk.Treeview(
             grid_frame,
             columns=list(headings),
@@ -179,7 +200,9 @@ class KintaiApp(tk.Frame):
         x_scroll.configure(command=self._tree.xview)
 
         for w_px, h in zip(col_px, headings, strict=True):
-            self._tree.column(h, width=w_px, minwidth=60, anchor="w")
+            self._tree.column(
+                h, width=w_px, minwidth=48, stretch=tk.NO, anchor="w"
+            )
             self._tree.heading(h, text=h, anchor="w")
 
         self._tree.grid(row=0, column=0, sticky="nsew")
@@ -191,6 +214,8 @@ class KintaiApp(tk.Frame):
         self._tree.bind("<Button-3>", self._on_tree_right_click)
         self._tree.bind("<Double-1>", self._on_row_double_click)
 
+        initial_w = self._window_width_for_columns(col_px, y_scroll=y_scroll)
+        min_w = min(960, initial_w)
         self._root.minsize(min_w, 520)
         self._root.geometry(f"{initial_w}x680")
 
