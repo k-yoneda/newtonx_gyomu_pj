@@ -27,6 +27,11 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".ti
 PDF_SUFFIX = ".pdf"
 EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 TARGET_EXCEL_SHEET_NAME = "タイムシート兼作業報告書_お客様先用"
+# --- Excel フォーマット個別対応 -----------------------------------------------------------
+# アコードワークス株式会社様向け（TARGET_EXCEL_SHEET_NAME が無い場合の代替）
+_ACCORD_WORKS_FILENAME_MARKER = "アコードワークス株式会社様"
+_ACCORD_WORKS_ALT_SHEET_NAME = "作業報告書"
+_ACCORD_WORKS_COMPANY_NAME_1 = "アコードワークス株式会社"
 
 # アップロード: 初回試行後、最大 UPLOAD_MAX_RETRIES 回まで再試行（合計で最大 1 + UPLOAD_MAX_RETRIES 回）
 UPLOAD_MAX_RETRIES = 3
@@ -280,35 +285,84 @@ def _extract_excel_target_sheet_row(
     if note:
         row["analysis"] = note
         return row
-    if sheet_symbol != "〇":
+
+    # 1) 通常: TARGET_EXCEL_SHEET_NAME があれば従来通り読み取る
+    if sheet_symbol == "〇":
+        wb = None
+        try:
+            wb = load_workbook(file_path, data_only=True, read_only=True)
+            ws = wb[target_sheet_name]
+            company = (ws["G5"].value or "")
+            person = (ws["J7"].value or "")
+            total_raw_value = ws["F42"].value
+
+            file_company, _file_person = _parse_filename_company_and_person(file_path.name)
+            doc_company_raw = str(company).strip() if company is not None else ""
+            doc_company_match = _document_company_for_match(doc_company_raw)
+            match_company = _match_company_symbol_single(file_company, doc_company_match)
+
+            row["name_company_from_file"] = file_company
+            row["name_company_from_doc"] = doc_company_raw
+            row["name_company_1"] = str(company).strip() if company is not None else ""
+            row["name_person_from_doc"] = str(person).strip() if person is not None else ""
+            row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
+            row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
+            row["match_company"] = match_company
+            row["user_judgment_company"] = match_company
+        except Exception as e:
+            row["analysis"] = f"Excelセル読み取り失敗: {e}"
+        finally:
+            if wb is not None:
+                wb.close()
         return row
 
-    wb = None
-    try:
-        wb = load_workbook(file_path, data_only=True, read_only=True)
-        ws = wb[target_sheet_name]
-        company = (ws["G5"].value or "")
-        person = (ws["J7"].value or "")
-        total_raw_value = ws["F42"].value
+    # 2) 代替: アコードワークス株式会社様フォーマット
+    # TARGET_EXCEL_SHEET_NAME が無い場合、以下を満たせば解析する。
+    #   (1) ファイル名に "アコードワークス株式会社様" を含む
+    #   (2) "作業報告書" シートが存在
+    #   (3) 氏名=E6, 合計勤務時間=M47, 会社名1="アコードワークス株式会社"
+    fn_norm = unicodedata.normalize("NFKC", file_path.name or "")
+    if _ACCORD_WORKS_FILENAME_MARKER in fn_norm:
+        alt_symbol, alt_note = _excel_target_sheet_symbol(
+            file_path,
+            target_sheet_name=_ACCORD_WORKS_ALT_SHEET_NAME,
+        )
+        if alt_note:
+            row["analysis"] = alt_note
+            return row
+        if alt_symbol == "〇":
+            wb = None
+            try:
+                wb = load_workbook(file_path, data_only=True, read_only=True)
+                ws = wb[_ACCORD_WORKS_ALT_SHEET_NAME]
+                person = ws["E6"].value
+                total_raw_value = ws["M47"].value
 
-        file_company, _file_person = _parse_filename_company_and_person(file_path.name)
-        doc_company_raw = str(company).strip() if company is not None else ""
-        doc_company_match = _document_company_for_match(doc_company_raw)
-        match_company = _match_company_symbol_single(file_company, doc_company_match)
+                file_company, _file_person = _parse_filename_company_and_person(
+                    file_path.name
+                )
+                doc_company_raw = _ACCORD_WORKS_COMPANY_NAME_1
+                doc_company_match = _document_company_for_match(doc_company_raw)
+                match_company = _match_company_symbol_single(file_company, doc_company_match)
 
-        row["name_company_from_file"] = file_company
-        row["name_company_from_doc"] = doc_company_raw
-        row["name_company_1"] = str(company).strip() if company is not None else ""
-        row["name_person_from_doc"] = str(person).strip() if person is not None else ""
-        row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
-        row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
-        row["match_company"] = match_company
-        row["user_judgment_company"] = match_company
-    except Exception as e:
-        row["analysis"] = f"Excelセル読み取り失敗: {e}"
-    finally:
-        if wb is not None:
-            wb.close()
+                # 代替シートを使えた場合は「対象シート有無」を 〇 扱いにする
+                row["target_sheet_exists"] = "〇"
+                row["name_company_from_file"] = file_company
+                row["name_company_from_doc"] = doc_company_raw
+                row["name_company_1"] = doc_company_raw
+                row["name_person_from_doc"] = str(person).strip() if person is not None else ""
+                row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
+                row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
+                row["match_company"] = match_company
+                row["user_judgment_company"] = match_company
+            except Exception as e:
+                row["analysis"] = f"Excelセル読み取り失敗: {e}"
+            finally:
+                if wb is not None:
+                    wb.close()
+            return row
+
+    # 3) どちらにも該当しない場合は（従来通り）対象シートなしで終了
     return row
 
 

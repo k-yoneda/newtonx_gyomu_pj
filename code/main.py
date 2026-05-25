@@ -401,7 +401,12 @@ class KintaiApp(tk.Frame):
             messagebox.showinfo("再解析", "選択行のファイル名を取得できません。")
             return
 
-        preserved_user_judgment = (current_row.get(self.USER_JUDGMENT_COL) or "").strip()
+        # ユーザ判断は「ユーザが手動で match_company から変更した」場合のみ保持する。
+        # 初回解析では user_judgment_company=match_company をセットしているため、
+        # それを常に保持してしまうと、再解析で match_company が改善しても UI に反映されない。
+        cur_match = (current_row.get(self.MATCH_COMPANY_COL) or current_row.get("match_company") or "").strip()
+        cur_uj = (current_row.get(self.USER_JUDGMENT_COL) or current_row.get("user_judgment_company") or "").strip()
+        preserved_user_judgment = cur_uj if (cur_uj and cur_uj != cur_match) else ""
         td = self._data_dir.resolve()
         client = self._client
         aid = self._assistant_uid
@@ -510,8 +515,11 @@ class KintaiApp(tk.Frame):
             if not file_name:
                 continue
             iid_by_file[file_name] = iid
+            # ユーザ判断は「ユーザが手動で match_company から変更した」場合のみ保持する。
+            # そうでなければ再解析結果（match_company に追従した user_judgment_company）を採用させる。
+            mc = (row.get(self.MATCH_COMPANY_COL) or row.get("match_company") or "").strip()
             uj = (row.get(self.USER_JUDGMENT_COL) or row.get("user_judgment_company") or "").strip()
-            if uj:
+            if uj and uj != mc:
                 preserved_uj_by_file[file_name] = uj
 
         if not iid_by_file:
