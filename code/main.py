@@ -112,11 +112,12 @@ class KintaiApp(tk.Frame):
         self._status_var = tk.StringVar(value="準備完了")
         # 「実行済 100 / 対象 120」など3桁になっても欠けないよう、表示幅を広げる
         # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
-        ttk.Label(ctrl, textvariable=self._progress_var, width=26).grid(
+        # （環境によってフォントが少し太く、26文字だと末尾が欠けるケースがあったため更に増やす）
+        ttk.Label(ctrl, textvariable=self._progress_var, width=30).grid(
             row=0, column=5, sticky="w", padx=(16, 0)
         )
         # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
-        ctrl.columnconfigure(5, minsize=200)
+        ctrl.columnconfigure(5, minsize=240)
 
         # ステータスは可変長だが、要求幅が大きくなりすぎると右端ボタンが見えなくなる。
         # 右端に必ず「エラー再解析」を表示するため、ラベルの要求幅を抑制（固定幅＋折り返し）する。
@@ -543,8 +544,12 @@ class KintaiApp(tk.Frame):
         self._progress_var.set(f"エラー再解析中 0 / {total}")
         self._status_var.set(f"エラー再解析しています… {total} 件")
 
-        # 対象行を一括で反転表示（終了時に解除）
-        self._set_rows_reanalysis_highlight(target_iids, True)
+        # 念のため、前回の異常終了等で反転が残っていた場合に備えて全解除してから開始する。
+        self._set_rows_reanalysis_highlight(target_iids, False)
+
+        # 「現在再解析中の1行」だけを反転表示する。
+        # ※複数並列だと同時に複数行が“処理中”になり得るため、ここでは逐次処理(1並列)で運用する。
+        current_active: dict[str, str] = {"rid": ""}
 
         def log_line(message: str) -> None:
             def apply_log(m: str = message) -> None:
@@ -556,6 +561,31 @@ class KintaiApp(tk.Frame):
 
         def on_progress(done: int, t: int) -> None:
             self.after(0, lambda d=done, tt=t: self._progress_var.set(f"エラー再解析中 {d} / {tt}"))
+
+        def on_file_started(file_name: str) -> None:
+            """core側が「このファイルの処理を開始した」タイミングで呼ばれる。
+
+            GUI側では、今処理中の1行のみ反転表示する。
+            """
+            fn = (file_name or "").strip()
+            if not fn:
+                return
+            rid = iid_by_file.get(fn) or ""
+            if not rid:
+                return
+
+            def apply_started() -> None:
+                prev = current_active.get("rid") or ""
+                if prev and prev != rid:
+                    self._set_row_reanalysis_highlight(prev, False)
+                current_active["rid"] = rid
+                self._set_row_reanalysis_highlight(rid, True)
+                try:
+                    self._tree.see(rid)
+                except tk.TclError:
+                    pass
+
+            self.after(0, apply_started)
 
         def on_row_completed(row: dict[str, str]) -> None:
             fn = (row.get("file_name") or "").strip()
@@ -570,6 +600,10 @@ class KintaiApp(tk.Frame):
 
             def apply_row() -> None:
                 self._replace_row_with_result(rid, row)
+                # この行の処理が終わったので反転を戻す（次の on_file_started で次行が反転する）
+                self._set_row_reanalysis_highlight(rid, False)
+                if (current_active.get("rid") or "") == rid:
+                    current_active["rid"] = ""
                 # 途中経過でも割合等を更新
                 current_rows = self._current_grid_rows()
                 ratio_text = self._company_match_ratio_text(current_rows, total_target_count=len(current_rows))
@@ -587,11 +621,12 @@ class KintaiApp(tk.Frame):
                     save_md_path=Path.cwd() / "解析結果.md",
                     on_log=log_line,
                     emit_progress_md_rows=False,
+                    on_file_started=on_file_started,
                     on_file_progress=on_progress,
                     on_row_completed=on_row_completed,
                     cancel_event=self._cancel_event,
                     target_file_names=file_names,
-                    parallel_chats=self._parallel_workers,
+                    parallel_chats=1,
                 )
             except BaseException as e:
                 err = e
@@ -603,6 +638,9 @@ class KintaiApp(tk.Frame):
                 self._cancel_event = None
 
                 # 反転表示を解除（成功/エラー/中断いずれも）
+                cur = (current_active.get("rid") or "").strip()
+                if cur:
+                    self._set_row_reanalysis_highlight(cur, False)
                 self._set_rows_reanalysis_highlight(target_iids, False)
 
                 self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
