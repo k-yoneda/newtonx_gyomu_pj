@@ -1566,16 +1566,20 @@ def run_analysis(
                 return None
 
         def delete_file_chat(chat_uid: str | None) -> None:
+            """解析用に作成したチャットを後片付けする。
+
+            UI のステータス欄へ on_log が流れるため、削除失敗はユーザーにとってノイズになりやすい。
+            ここでは削除失敗/例外は握りつぶし（静かに無視）とし、成功時のみログを残す。
+            """
             if not chat_uid:
                 return
             try:
                 success = wc.delete_chat(chat_uid)
                 if success:
                     log(f"チャットが削除されました: {chat_uid}")
-                else:
-                    log(f"チャット削除に失敗しました: {chat_uid}")
-            except Exception as e:
-                log(f"チャット削除時に異常が発生しました: {chat_uid} / {e}")
+            except Exception:
+                # 削除失敗は後続処理に影響しないため、表示・停止させない
+                return
 
         def signal_fatal(exc: BaseException) -> None:
             worker_exc[worker_idx] = exc

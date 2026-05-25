@@ -109,9 +109,13 @@ class KintaiApp(tk.Frame):
 
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
-        ttk.Label(ctrl, textvariable=self._progress_var, width=18).grid(
+        # 「実行済 100 / 対象 120」など3桁になっても欠けないよう、表示幅を広げる
+        # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
+        ttk.Label(ctrl, textvariable=self._progress_var, width=26).grid(
             row=0, column=5, sticky="w", padx=(16, 0)
         )
+        # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
+        ctrl.columnconfigure(5, minsize=200)
 
         # ステータスは可変長だが、要求幅が大きくなりすぎると右端ボタンが見えなくなる。
         # 右端に必ず「エラー再解析」を表示するため、ラベルの要求幅を抑制（固定幅＋折り返し）する。
@@ -205,6 +209,31 @@ class KintaiApp(tk.Frame):
     def _company1_value_from_row(self, row: dict[str, str]) -> str:
         # UI保存形式: 「会社名1」 / core形式: name_company_1
         return ((row.get(self.COMPANY1_COL) or row.get("name_company_1") or "").strip())
+
+    def _should_ignore_status_log(self, message: str) -> bool:
+        """run_analysis(on_log=...) 経由で流れてくるログのうち、
+        GUIステータス欄に出すとノイズになりやすいものを除外する。
+
+        例: チャット削除失敗（後片付け）など。
+        """
+        m = (message or "").strip()
+        if not m:
+            return False
+
+        # 途中経過の割合はGUI側で組み立てるため、素のログは出さない
+        if m.startswith("会社名比較 〇率(途中経過):"):
+            return True
+
+        # 後片付けのチャット削除失敗は、解析結果そのものには影響しないためステータスには出さない
+        # （文言揺れ: 「チャットの削除に失敗」「チャット削除に失敗しました」「Failed to delete chat」など）
+        low = m.lower()
+        if ("チャット" in m or "chat" in low) and ("削除" in m or "delete" in low) and (
+            "失敗" in m or "failed" in low
+        ):
+            return True
+        if "削除に失敗" in m:
+            return True
+        return False
 
     def _is_error_reanalysis_target_row(self, row: dict[str, str]) -> bool:
         return self._company1_value_from_row(row) in self._ERROR_REANALYSIS_COMPANY1_VALUES
@@ -371,7 +400,12 @@ class KintaiApp(tk.Frame):
         self._status_var.set(f"再解析しています… {file_name}")
 
         def log_line(message: str) -> None:
-            self.after(0, lambda m=message: self._status_var.set(m[:800]))
+            def apply_log(m: str = message) -> None:
+                if self._should_ignore_status_log(m):
+                    return
+                self._status_var.set(m[:800])
+
+            self.after(0, apply_log)
 
         def on_progress(done: int, total: int) -> None:
             self.after(0, lambda d=done, t=total: self._progress_var.set(f"再解析中 {d} / {t}"))
@@ -481,7 +515,12 @@ class KintaiApp(tk.Frame):
         self._status_var.set(f"エラー再解析しています… {total} 件")
 
         def log_line(message: str) -> None:
-            self.after(0, lambda m=message: self._status_var.set(m[:800]))
+            def apply_log(m: str = message) -> None:
+                if self._should_ignore_status_log(m):
+                    return
+                self._status_var.set(m[:800])
+
+            self.after(0, apply_log)
 
         def on_progress(done: int, t: int) -> None:
             self.after(0, lambda d=done, tt=t: self._progress_var.set(f"エラー再解析中 {d} / {tt}"))
@@ -932,7 +971,7 @@ class KintaiApp(tk.Frame):
 
         def log_line(message: str) -> None:
             def apply_log(m: str = message) -> None:
-                if m.startswith("会社名比較 〇率(途中経過):"):
+                if self._should_ignore_status_log(m):
                     return
                 self._status_var.set(m[:800])
 
