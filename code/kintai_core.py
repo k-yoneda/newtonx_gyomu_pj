@@ -308,7 +308,10 @@ def _extract_excel_target_sheet_row(
             row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
             row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
             row["match_company"] = match_company
-            row["user_judgment_company"] = match_company
+            # 仕様: 1行解析時は自動判断をユーザ判断にもセットする
+            aj = _auto_judgment_symbol(row)
+            row["auto_judgment"] = aj
+            row["user_judgment_company"] = aj
         except Exception as e:
             row["analysis"] = f"Excelセル読み取り失敗: {e}"
         finally:
@@ -354,7 +357,10 @@ def _extract_excel_target_sheet_row(
                 row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
                 row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
                 row["match_company"] = match_company
-                row["user_judgment_company"] = match_company
+                # 仕様: 1行解析時は自動判断をユーザ判断にもセットする
+                aj = _auto_judgment_symbol(row)
+                row["auto_judgment"] = aj
+                row["user_judgment_company"] = aj
             except Exception as e:
                 row["analysis"] = f"Excelセル読み取り失敗: {e}"
             finally:
@@ -1106,7 +1112,10 @@ def _enrich_with_match_scores(
     row["name_company_from_doc"] = k_co
     row["name_person_from_doc"] = d_pe
     row["match_company"] = _match_company_symbol_single(fp_co, doc_co_match)
-    row["user_judgment_company"] = row["match_company"]
+    # 仕様: 1行解析時は自動判断をユーザ判断にもセットする
+    aj = _auto_judgment_symbol(row)
+    row["auto_judgment"] = aj
+    row["user_judgment_company"] = aj
     row["match_person"] = _compare_person(fp_pe, d_pe)
     th_dec = _work_hours_string_to_decimal(th_raw)
     row["total_hours_raw"] = th_raw
@@ -1161,10 +1170,48 @@ def _upload_http_error_should_recreate_chat(exc: BaseException) -> bool:
 
 
 SUMMARY_MD_HEADER = (
-    f"| {SUMMARY_UPLOAD_COL} | 画像ファイル名 | {SUMMARY_TARGET_SHEET_COL} | 会社名1 | 氏名 | 社員番号 | "
-    "合計勤務時間（10進） | 合計勤務時間（読取） | 押印有無 | "
-    "会社名比較（ファイル名✖文書） | ユーザ判断 |"
+    f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | 画像ファイル名 | ユーザ判断 | 自動判断 | "
+    "会社名1 | 氏名 | 社員番号 | 合計勤務時間（10進） | 合計勤務時間（読取） | "
+    "会社名比較（ファイル名✖文書） | 押印有無 |"
 )
+
+
+_EMPLOYEE_NO_VALID_RE = re.compile(r"^(?:\d{7}|BP\d{5})$", re.IGNORECASE)
+_DECIMAL_HOURS_VALID_RE = re.compile(r"^\d+(?:\.\d{1,2})?$")
+
+
+def _is_valid_employee_no(employee_no: str) -> bool:
+    t = (employee_no or "").strip()
+    return bool(t and _EMPLOYEE_NO_VALID_RE.fullmatch(t))
+
+
+def _is_valid_total_hours_decimal(total_hours_decimal: str) -> bool:
+    """合計勤務時間（10進）が「整数 or 小数点以下2桁まで」の形式かを判定する。"""
+    t = (total_hours_decimal or "").strip()
+    if not t or t in ("（なし）", "不明"):
+        return False
+    # 表示用（8.5等）/内部用（8.50等）どちらでも許容
+    return bool(_DECIMAL_HOURS_VALID_RE.fullmatch(t))
+
+
+def _auto_judgment_symbol(row: dict[str, str]) -> str:
+    """自動判断（〇/△/✖）を計算する。
+
+    仕様:
+      - 〇: 社員番号が有効、合計勤務時間(10進)が整数または小数点以下2桁まで、会社名比較が〇
+      - △: 上記と同様だが会社名比較が△
+      - ✖: それ以外
+    """
+    emp = (row.get("employee_no") or "").strip()
+    th = (row.get("total_hours_decimal") or "").strip()
+    mc = (row.get("match_company") or "").strip()
+    if not (_is_valid_employee_no(emp) and _is_valid_total_hours_decimal(th)):
+        return "✖"
+    if mc == "〇":
+        return "〇"
+    if mc == "△":
+        return "△"
+    return "✖"
 
 
 def _upload_image_with_retries(
@@ -1274,11 +1321,21 @@ def _upload_ok_symbol(row: dict[str, str]) -> str:
 
 
 def _one_summary_data_line(r: dict[str, str]) -> str:
-    """11列1行分（集計用）。Excel 行は対象シート有無のみを埋め、AI読取列は空欄にする。"""
+    """12列1行分（集計用）。Excel 行は対象シート有無のみを埋め、AI読取列は空欄にする。"""
     is_excel = _row_is_excel(r)
     u_sym = _escape_md_table_cell(_upload_ok_symbol(r))
-    fn = _escape_md_table_cell(r.get("file_name", ""))
     ts = _escape_md_table_cell(_target_sheet_ok_symbol(r))
+    fn = _escape_md_table_cell(r.get("file_name", ""))
+
+    aj = _auto_judgment_symbol(r)
+    r["auto_judgment"] = aj
+    uj_raw = (r.get("user_judgment_company") or "").strip()
+    # 初回（1行解析）では自動判断をユーザ判断へもセットする
+    uj = uj_raw or aj
+    r["user_judgment_company"] = uj
+    uj = _escape_md_table_cell(uj)
+    aj = _escape_md_table_cell(aj)
+
     co1 = _escape_md_table_cell(
         ((r.get("name_company_1") or "").strip() or ("" if is_excel else "不明"))
     )
@@ -1296,14 +1353,12 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     lr = _escape_md_table_cell(
         ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
     )
+    mc = _escape_md_table_cell((r.get("match_company") or ("" if is_excel else "✖")))
     se = _escape_md_table_cell(
         "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
     )
-    mc = _escape_md_table_cell((r.get("match_company") or ("" if is_excel else "✖")))
-    uj = (r.get("user_judgment_company") or "").strip() or (r.get("match_company") or ("" if is_excel else "✖"))
-    uj = _escape_md_table_cell(uj)
     return (
-        f"| {u_sym} | {fn} | {ts} | {co1} | {pe} | {emp} | {th} | {lr} | {se} | {mc} | {uj} |"
+        f"| {u_sym} | {ts} | {fn} | {uj} | {aj} | {co1} | {pe} | {emp} | {th} | {lr} | {mc} | {se} |"
     )
 
 
@@ -1380,8 +1435,15 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
     """グリッド表示用（Markdown エスケープなし）。 _one_summary_data_line と同一ルール。"""
     is_excel = _row_is_excel(r)
     up_sym = _upload_ok_symbol(r)
-    fn = r.get("file_name", "") or ""
     ts = _target_sheet_ok_symbol(r)
+
+    aj = _auto_judgment_symbol(r)
+    r["auto_judgment"] = aj
+    uj_raw = (r.get("user_judgment_company") or "").strip()
+    uj = uj_raw or aj
+    r["user_judgment_company"] = uj
+
+    fn = r.get("file_name", "") or ""
     co1 = ((r.get("name_company_1") or "").strip() or ("" if is_excel else "不明"))
     pe = ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
     emp = (r.get("employee_no") or "").strip() or ""
@@ -1391,10 +1453,9 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
         else ("" if is_excel else "（なし）")
     )
     lr = ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
-    se = "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
     mc = (r.get("match_company") or ("" if is_excel else "✖"))
-    uj = (r.get("user_judgment_company") or "").strip() or mc
-    return (up_sym, fn, ts, co1, pe, emp, th, lr, se, mc, uj)
+    se = "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
+    return (up_sym, ts, fn, uj, aj, co1, pe, emp, th, lr, mc, se)
 
 
 def run_analysis(
