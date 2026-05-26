@@ -38,11 +38,20 @@ class KintaiApp(tk.Frame):
     EMPLOYEE_NO_COL = "社員番号"
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
-    MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
+    MATCH_COMPANY_COL = "会社名比較"
+    LEGACY_MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
     COMPANY1_COL = "会社名1"
-    # 「エラー再解析」対象: 会社名比較が「〇」以外の行
-    # ※従来は会社名1が不明/（存在しない）を対象としていたが、運用要件に合わせて変更。
-    _ERROR_REANALYSIS_MATCH_OK_VALUES = ("〇",)
+    # 「エラー再解析」対象: ユーザ判断が「〇」以外の行
+    _ERROR_REANALYSIS_OK_VALUES = ("〇",)
+    # 記号列（〇/△/✖ 等）の列幅（px）
+    _SYMBOL_COLUMN_WIDTHS: dict[str, int] = {
+        "アップロード": 72,
+        "対象シート有無": 88,
+        USER_JUDGMENT_COL: 72,
+        AUTO_JUDGMENT_COL: 72,
+        MATCH_COMPANY_COL: 72,
+        "押印有無": 72,
+    }
     _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
 
     def __init__(
@@ -82,6 +91,8 @@ class KintaiApp(tk.Frame):
         self, heading: str, *, font: tkfont.Font | None = None
     ) -> int:
         """見出し文字列の描画幅に合わせた列幅（px）を返す。"""
+        if heading in self._SYMBOL_COLUMN_WIDTHS:
+            return self._SYMBOL_COLUMN_WIDTHS[heading]
         f = font or self._tree_heading_font()
         padding_px = 20
         min_px = 48
@@ -168,7 +179,7 @@ class KintaiApp(tk.Frame):
         # 右端ボタン領域の最低幅を確保
         ctrl.columnconfigure(7, minsize=120)
 
-        # 右側: エラー再解析（会社名比較が「〇」以外の行のみを対象に再解析）
+        # 右側: エラー再解析（ユーザ判断が「〇」以外の行のみを対象に再解析）
         self._error_reanalysis_btn = ttk.Button(
             ctrl,
             text="エラー再解析",
@@ -269,12 +280,15 @@ class KintaiApp(tk.Frame):
         return False
 
     def _is_error_reanalysis_target_row(self, row: dict[str, str]) -> bool:
-        # UI保存形式: 「会社名比較（ファイル名✖文書）」 / core形式: match_company
-        symbol = (
-            (row.get(self.MATCH_COMPANY_COL) or row.get("match_company") or "").strip()
+        symbol = normalize_judgment_symbol(
+            (
+                row.get(self.USER_JUDGMENT_COL)
+                or row.get("user_judgment_company")
+                or ""
+            ).strip()
         )
-        # 空欄や △/× 等も「〇以外」として対象にする
-        return symbol not in self._ERROR_REANALYSIS_MATCH_OK_VALUES
+        # 空欄や △/✖ 等も「〇以外」として対象にする
+        return symbol not in self._ERROR_REANALYSIS_OK_VALUES
 
     def _eligible_error_reanalysis_iids(self) -> list[str]:
         iids: list[str] = []
@@ -332,6 +346,12 @@ class KintaiApp(tk.Frame):
         for ui_key, core_key in pairs:
             if ui_key in row:
                 val = str(row.get(ui_key) or "").strip()
+            elif core_key == "match_company":
+                val = str(
+                    row.get(core_key)
+                    or row.get(self.LEGACY_MATCH_COMPANY_COL)
+                    or ""
+                ).strip()
             else:
                 val = str(row.get(core_key) or "").strip()
             if core_key == "user_judgment_company":
@@ -544,13 +564,13 @@ class KintaiApp(tk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _start_error_reanalysis(self) -> None:
-        """会社名比較が「〇」以外の行だけをまとめて再解析する。"""
+        """ユーザ判断が「〇」以外の行だけをまとめて再解析する。"""
         if self._busy or self._data_dir is None:
             return
 
         target_iids = self._eligible_error_reanalysis_iids()
         if not target_iids:
-            messagebox.showinfo("エラー再解析", "対象行がありません（会社名比較が『〇』以外の行）。")
+            messagebox.showinfo("エラー再解析", "対象行がありません（ユーザ判断が『〇』以外の行）。")
             self._refresh_error_reanalysis_button_state()
             return
 
@@ -707,7 +727,7 @@ class KintaiApp(tk.Frame):
                     return
 
                 self._status_var.set(f"エラー再解析完了: {total} 件 / {ratio_text}")
-                messagebox.showinfo("エラー再解析完了", f"会社名比較が〇以外の行を再解析しました。\n対象: {total} 件")
+                messagebox.showinfo("エラー再解析完了", f"ユーザ判断が〇以外の行を再解析しました。\n対象: {total} 件")
 
             self.after(0, finish)
 
@@ -885,6 +905,7 @@ class KintaiApp(tk.Frame):
                 continue
             symbol = (
                 (row.get(self.MATCH_COMPANY_COL) or "").strip()
+                or (row.get(self.LEGACY_MATCH_COMPANY_COL) or "").strip()
                 or (row.get("match_company") or "").strip()
             )
             processed_count += 1

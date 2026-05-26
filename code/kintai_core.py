@@ -1172,8 +1172,11 @@ def _upload_http_error_should_recreate_chat(exc: BaseException) -> bool:
 SUMMARY_MD_HEADER = (
     f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | 画像ファイル名 | ユーザ判断 | 自動判断 | "
     "会社名1 | 氏名 | 社員番号 | 合計勤務時間（10進） | 合計勤務時間（読取） | "
-    "会社名比較（ファイル名✖文書） | 押印有無 |"
+    "会社名比較 | 押印有無 |"
 )
+
+# 旧UI列名（JSON読み込み互換）
+LEGACY_MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
 
 
 _EMPLOYEE_NO_VALID_RE = re.compile(r"^(?:\d{7}|BP\d{5})$", re.IGNORECASE)
@@ -1206,7 +1209,12 @@ def auto_judgment_symbol(row: dict[str, str]) -> str:
     """自動判断（〇/△/✖）を計算する（UI列名・内部キー両対応）。"""
     emp = (row.get("employee_no") or row.get("社員番号") or "").strip()
     th = (row.get("total_hours_decimal") or row.get("合計勤務時間（10進）") or "").strip()
-    mc = (row.get("match_company") or row.get("会社名比較（ファイル名✖文書）") or "").strip()
+    mc = (
+        row.get("match_company")
+        or row.get("会社名比較")
+        or row.get(LEGACY_MATCH_COMPANY_COL)
+        or ""
+    ).strip()
     return _auto_judgment_symbol(
         {"employee_no": emp, "total_hours_decimal": th, "match_company": mc}
     )
@@ -1223,7 +1231,12 @@ def _effective_user_judgment(row: dict[str, str], auto: str | None = None) -> st
     stored_aj = normalize_judgment_symbol((row.get("auto_judgment") or "").strip())
     if stored_aj and uj_raw == stored_aj:
         return aj
-    mc = (row.get("match_company") or row.get("会社名比較（ファイル名✖文書）") or "").strip()
+    mc = (
+        row.get("match_company")
+        or row.get("会社名比較")
+        or row.get(LEGACY_MATCH_COMPANY_COL)
+        or ""
+    ).strip()
     if mc and uj_raw == mc and uj_raw != aj:
         return aj
     return uj_raw
@@ -1242,7 +1255,12 @@ def is_manual_user_judgment(row: dict[str, str]) -> bool:
     stored_aj = normalize_judgment_symbol((row.get("auto_judgment") or "").strip())
     if stored_aj and uj_raw == stored_aj:
         return False
-    mc = (row.get("match_company") or row.get("会社名比較（ファイル名✖文書）") or "").strip()
+    mc = (
+        row.get("match_company")
+        or row.get("会社名比較")
+        or row.get(LEGACY_MATCH_COMPANY_COL)
+        or ""
+    ).strip()
     if mc and uj_raw == mc:
         return False
     return True
