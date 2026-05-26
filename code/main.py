@@ -6,6 +6,8 @@ import json
 import os
 import sys
 import threading
+import ctypes
+from ctypes import wintypes
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -17,6 +19,7 @@ if str(_ROOT) not in sys.path:
 
 from kintai_core import (
     DEFAULT_PARALLEL_ANALYSIS_CHATS,
+    EXCEL_SUFFIXES,
     PARALLEL_WORKERS_MAX,
     TARGET_ASSISTANT_NAME,
     _decimal_for_table_display,
@@ -30,6 +33,83 @@ from kintai_core import (
     summary_header_cells,
 )
 from newtonx_adk.exceptions import APIError
+
+_WIN32 = sys.platform == "win32"
+_STILL_ACTIVE = 259
+
+
+class _ShellExecuteInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HMODULE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hMonitor", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+
+def _win_shell_open_file(path: Path) -> int | None:
+    """既定アプリでファイルを開き、取得できればプロセスハンドルを返す。"""
+    if not _WIN32:
+        os.startfile(os.fspath(path))
+        return None
+    sei = _ShellExecuteInfo()
+    sei.cbSize = ctypes.sizeof(_ShellExecuteInfo)
+    sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
+    sei.lpVerb = "open"
+    sei.lpFile = os.fspath(path.resolve())
+    sei.nShow = 1  # SW_SHOWNORMAL
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+        raise OSError(ctypes.GetLastError(), "ShellExecuteExW", str(path))
+    return int(sei.hProcess or 0) or None
+
+
+def _win_terminate_process_handle(handle: int | None) -> None:
+    if not handle:
+        return
+    kernel32 = ctypes.windll.kernel32
+    exit_code = wintypes.DWORD()
+    if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+        if exit_code.value == _STILL_ACTIVE:
+            kernel32.TerminateProcess(handle, 0)
+    kernel32.CloseHandle(handle)
+
+
+def _try_close_excel_workbook(path: Path) -> bool:
+    """実行中の Excel から同一ファイルのブックだけを閉じる（pywin32 がある場合）。"""
+    try:
+        import win32com.client  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    try:
+        excel = win32com.client.GetActiveObject("Excel.Application")
+    except Exception:
+        return False
+    target = str(path.resolve()).lower()
+    closed = False
+    try:
+        for i in range(int(excel.Workbooks.Count), 0, -1):
+            wb = excel.Workbooks(i)
+            try:
+                full = str(Path(wb.FullName).resolve()).lower()
+            except Exception:
+                continue
+            if full == target:
+                wb.Close(SaveChanges=0)
+                closed = True
+    except Exception:
+        return closed
+    return closed
 
 
 class KintaiApp(tk.Frame):
@@ -73,6 +153,9 @@ class KintaiApp(tk.Frame):
         self._data_dir: Path | None = None
         self._busy = False
         self._item_paths: dict[str, str] = {}
+        self._preview_row_iid: str = ""
+        self._preview_file_path: Path | None = None
+        self._preview_process_handle: int | None = None
         self._cancel_event: threading.Event | None = None
 
         self._loaded_rows: list[dict[str, str]] = []
@@ -153,19 +236,26 @@ class KintaiApp(tk.Frame):
         )
         self._cancel_btn.grid(row=0, column=4, sticky="w", padx=(16, 0))
 
+        # 中断の右: エラー再解析（ユーザ判断が「〇」以外の行のみを対象に再解析）
+        self._error_reanalysis_btn = ttk.Button(
+            ctrl,
+            text="エラー再解析",
+            command=self._start_error_reanalysis,
+            state=tk.DISABLED,
+        )
+        self._error_reanalysis_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
+
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
         # 「実行済 100 / 対象 120」など3桁になっても欠けないよう、表示幅を広げる
         # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
         # （環境によってフォントが少し太く、26文字だと末尾が欠けるケースがあったため更に増やす）
         ttk.Label(ctrl, textvariable=self._progress_var, width=30).grid(
-            row=0, column=5, sticky="w", padx=(16, 0)
+            row=0, column=6, sticky="w", padx=(16, 0)
         )
         # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
-        ctrl.columnconfigure(5, minsize=240)
+        ctrl.columnconfigure(6, minsize=240)
 
-        # ステータスは可変長だが、要求幅が大きくなりすぎると右端ボタンが見えなくなる。
-        # 右端に必ず「エラー再解析」を表示するため、ラベルの要求幅を抑制（固定幅＋折り返し）する。
         self._status_label = ttk.Label(
             ctrl,
             textvariable=self._status_var,
@@ -174,19 +264,8 @@ class KintaiApp(tk.Frame):
             wraplength=900,
             justify="left",
         )
-        self._status_label.grid(row=0, column=6, sticky="ew", padx=(12, 0))
-        ctrl.columnconfigure(6, weight=1)
-        # 右端ボタン領域の最低幅を確保
-        ctrl.columnconfigure(7, minsize=120)
-
-        # 右側: エラー再解析（ユーザ判断が「〇」以外の行のみを対象に再解析）
-        self._error_reanalysis_btn = ttk.Button(
-            ctrl,
-            text="エラー再解析",
-            command=self._start_error_reanalysis,
-            state=tk.DISABLED,
-        )
-        self._error_reanalysis_btn.grid(row=0, column=7, sticky="e", padx=(12, 0))
+        self._status_label.grid(row=0, column=7, sticky="ew", padx=(12, 0))
+        ctrl.columnconfigure(7, weight=1)
 
         grid_frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         grid_frame.pack(fill=tk.BOTH, expand=True)
@@ -227,6 +306,7 @@ class KintaiApp(tk.Frame):
         grid_frame.columnconfigure(0, weight=1)
 
         self._tree.bind("<Button-3>", self._on_tree_right_click)
+        self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self._tree.bind("<Double-1>", self._on_row_double_click)
 
         initial_w = self._window_width_for_columns(col_px, y_scroll=y_scroll)
@@ -307,9 +387,66 @@ class KintaiApp(tk.Frame):
         self._error_reanalysis_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
 
     def _clear_grid(self) -> None:
+        self._close_row_file()
         for iid in self._tree.get_children():
             self._tree.delete(iid)
         self._item_paths.clear()
+
+    def _resolve_file_path_for_row(self, rid: str) -> Path | None:
+        """行に対応する画像/PDF/Excel の絶対パスを返す。"""
+        path_str = self._item_paths.get(rid, "").strip()
+        if path_str:
+            p = Path(path_str)
+            if p.is_file():
+                return p.resolve()
+
+        if self._data_dir is None:
+            return None
+        row = self._current_row_dict_from_iid(rid)
+        fn = (row.get("画像ファイル名") or row.get("file_name") or "").strip()
+        if not fn:
+            return None
+        p = (self._data_dir / fn).resolve()
+        if p.is_file():
+            self._item_paths[rid] = str(p)
+            return p
+        return None
+
+    def _close_row_file(self) -> None:
+        """前に開いたプレビューファイルを閉じる（可能な範囲）。"""
+        path = self._preview_file_path
+        if path is not None and path.suffix.lower() in EXCEL_SUFFIXES:
+            _try_close_excel_workbook(path)
+
+        _win_terminate_process_handle(self._preview_process_handle)
+        self._preview_process_handle = None
+        self._preview_file_path = None
+        self._preview_row_iid = ""
+
+    def _open_row_file(self, rid: str, *, force: bool = False) -> None:
+        """行に対応するファイルを既定アプリで開く。"""
+        if not force and rid == self._preview_row_iid:
+            return
+        self._close_row_file()
+        path = self._resolve_file_path_for_row(rid)
+        if path is None:
+            return
+        try:
+            handle = _win_shell_open_file(path)
+        except OSError as e:
+            messagebox.showerror("起動できませんでした", str(e))
+            return
+        self._preview_row_iid = rid
+        self._preview_file_path = path
+        self._preview_process_handle = handle
+
+    def _on_tree_select(self, _event: tk.Event | None = None) -> None:
+        """行選択時にファイルを開き、別行選択時は前のファイルを閉じる。"""
+        sel = self._tree.selection()
+        if not sel:
+            self._close_row_file()
+            return
+        self._open_row_file(sel[0])
 
     def _prepare_native_dialog(self) -> None:
         """Windows/Tk でネイティブダイアログが背面化・ハング見えしないよう状態を整える。"""
@@ -1062,6 +1199,7 @@ class KintaiApp(tk.Frame):
                 except Exception as e:
                     messagebox.showerror("保存失敗", str(e))
                     return
+        self._close_row_file()
         self._root.destroy()
 
     def _start_new_analysis(self) -> None:
@@ -1318,27 +1456,16 @@ class KintaiApp(tk.Frame):
         rid = self._tree.identify_row(event.y)
         if not rid:
             return
-        path_str = self._item_paths.get(rid, "").strip()
-        if not path_str:
+        path = self._resolve_file_path_for_row(rid)
+        if path is None:
             messagebox.showinfo(
                 "ファイルを開けません",
-                "この行に関連するファイルパスがありません。",
+                "この行に関連するファイルが見つかりません。\n"
+                "データフォルダまたは resolved_path を確認してください。",
             )
             return
-        p = Path(path_str)
-        if not p.is_file():
-            messagebox.showerror(
-                "ファイルがありません",
-                f"見つかりません: {p}",
-            )
-            return
-        try:
-            os.startfile(os.path.normpath(str(p)))
-        except OSError as e:
-            messagebox.showerror(
-                "起動できませんでした",
-                str(e),
-            )
+        self._tree.selection_set(rid)
+        self._open_row_file(rid, force=True)
 
 
 def _center_window_on_screen(win: tk.Misc) -> None:

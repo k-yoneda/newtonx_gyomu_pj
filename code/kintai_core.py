@@ -391,6 +391,7 @@ def _work_hours_string_to_decimal(raw: str) -> str:
     - 8.35  … 十進（小数点はそのまま時間。8.35 時間 = 8.35）
     - 8.35H … 十進（N.NH は N.N 時間）
     - 8:35  … 60進 → H+MM/60
+    - 144:00:00 … 60進（秒は切り捨て、時・分のみ換算）
     - 8時間35分 … 60進
     - 8_35H  … 60進（時_分H）
     解釈できなければ空文字。
@@ -421,6 +422,17 @@ def _work_hours_string_to_decimal(raw: str) -> str:
         try:
             hh, mm = int(m.group(1)), int(m.group(2))
             if mm > 59:
+                return ""
+            return _format_decimal_str(float(hh) + mm / 60.0)
+        except (ValueError, OverflowError):
+            return ""
+
+    # 1b) HH:MM:SS（秒は切り捨て、時・分のみ 60進 → 10進）
+    m = re.match(r"^(\d+):(\d{1,2}):(\d{1,2})$", t)
+    if m:
+        try:
+            hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if mm > 59 or ss > 59:
                 return ""
             return _format_decimal_str(float(hh) + mm / 60.0)
         except (ValueError, OverflowError):
