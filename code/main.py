@@ -604,14 +604,15 @@ class KintaiApp(tk.Frame):
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._progress_var.set(f"エラー再解析中 0 / {total}")
-        self._status_var.set(f"エラー再解析しています… {total} 件")
+        self._status_var.set(
+            f"エラー再解析しています… {total} 件（並列 {self._parallel_workers}）"
+        )
 
         # 念のため、前回の異常終了等で反転が残っていた場合に備えて全解除してから開始する。
         self._set_rows_reanalysis_highlight(target_iids, False)
 
-        # 「現在再解析中の1行」だけを反転表示する。
-        # ※複数並列だと同時に複数行が“処理中”になり得るため、ここでは逐次処理(1並列)で運用する。
-        current_active: dict[str, str] = {"rid": ""}
+        # 起動時に選んだ並列数（ワーカー）分、同時に処理中の行を反転表示する。
+        active_rids: set[str] = set()
 
         def log_line(message: str) -> None:
             def apply_log(m: str = message) -> None:
@@ -637,10 +638,7 @@ class KintaiApp(tk.Frame):
                 return
 
             def apply_started() -> None:
-                prev = current_active.get("rid") or ""
-                if prev and prev != rid:
-                    self._set_row_reanalysis_highlight(prev, False)
-                current_active["rid"] = rid
+                active_rids.add(rid)
                 self._set_row_reanalysis_highlight(rid, True)
                 try:
                     self._tree.see(rid)
@@ -662,10 +660,8 @@ class KintaiApp(tk.Frame):
 
             def apply_row() -> None:
                 self._replace_row_with_result(rid, row)
-                # この行の処理が終わったので反転を戻す（次の on_file_started で次行が反転する）
                 self._set_row_reanalysis_highlight(rid, False)
-                if (current_active.get("rid") or "") == rid:
-                    current_active["rid"] = ""
+                active_rids.discard(rid)
                 # 途中経過でも割合等を更新
                 current_rows = self._current_grid_rows()
                 ratio_text = self._company_match_ratio_text(current_rows, total_target_count=len(current_rows))
@@ -688,7 +684,7 @@ class KintaiApp(tk.Frame):
                     on_row_completed=on_row_completed,
                     cancel_event=self._cancel_event,
                     target_file_names=file_names,
-                    parallel_chats=1,
+                    parallel_chats=self._parallel_workers,
                 )
             except BaseException as e:
                 err = e
@@ -700,9 +696,9 @@ class KintaiApp(tk.Frame):
                 self._cancel_event = None
 
                 # 反転表示を解除（成功/エラー/中断いずれも）
-                cur = (current_active.get("rid") or "").strip()
-                if cur:
-                    self._set_row_reanalysis_highlight(cur, False)
+                for ar in list(active_rids):
+                    self._set_row_reanalysis_highlight(ar, False)
+                active_rids.clear()
                 self._set_rows_reanalysis_highlight(target_iids, False)
 
                 self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
