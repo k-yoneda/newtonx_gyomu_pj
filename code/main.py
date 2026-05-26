@@ -21,7 +21,10 @@ from kintai_core import (
     TARGET_ASSISTANT_NAME,
     _decimal_for_table_display,
     _work_hours_string_to_decimal,
+    auto_judgment_symbol,
     create_client,
+    is_manual_user_judgment,
+    normalize_judgment_symbol,
     row_display_values,
     run_analysis,
     summary_header_cells,
@@ -31,6 +34,7 @@ from newtonx_adk.exceptions import APIError
 
 class KintaiApp(tk.Frame):
     USER_JUDGMENT_COL = "ユーザ判断"
+    AUTO_JUDGMENT_COL = "自動判断"
     EMPLOYEE_NO_COL = "社員番号"
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
@@ -309,14 +313,36 @@ class KintaiApp(tk.Frame):
         except tk.TclError:
             pass
 
+    def _row_dict_to_core(self, row: dict[str, str]) -> dict[str, str]:
+        """Treeview/JSON 行を kintai_core 互換 dict に変換する。"""
+        out = dict(row)
+        pairs = (
+            ("画像ファイル名", "file_name"),
+            ("アップロード", "upload_ok"),
+            ("対象シート有無", "target_sheet_exists"),
+            (self.USER_JUDGMENT_COL, "user_judgment_company"),
+            (self.COMPANY1_COL, "name_company_1"),
+            ("氏名", "name_person_from_doc"),
+            (self.EMPLOYEE_NO_COL, "employee_no"),
+            (self.TOTAL_HOURS_DECIMAL_COL, "total_hours_decimal"),
+            (self.TOTAL_HOURS_RAW_COL, "total_hours_raw"),
+            (self.MATCH_COMPANY_COL, "match_company"),
+            ("押印有無", "seal_in_doc"),
+        )
+        for ui_key, core_key in pairs:
+            if ui_key in row:
+                val = str(row.get(ui_key) or "").strip()
+            else:
+                val = str(row.get(core_key) or "").strip()
+            if core_key == "user_judgment_company":
+                out[core_key] = normalize_judgment_symbol(val) if val else ""
+            else:
+                out[core_key] = val
+        return out
+
     def _grid_values_from_row(self, row: dict[str, str]) -> tuple[str, ...]:
         """内部row形式・UI保存形式のどちらでも Treeview 表示値へ変換する。"""
-        cols = list(self._tree["columns"])
-        # JSON保存後の UI 行（日本語列名）
-        if any((row.get(c) or "") != "" for c in cols):
-            return tuple((row.get(c) or "") for c in cols)
-        # 解析直後の内部 row 形式
-        return row_display_values(row)
+        return row_display_values(self._row_dict_to_core(row))
 
     def _user_judgment_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.USER_JUDGMENT_COL)
@@ -355,7 +381,7 @@ class KintaiApp(tk.Frame):
             opts = (
                 ("〇", "〇"),
                 ("△", "△"),
-                ("✖", "×"),
+                ("✖", "✖"),
             )
             for label, inner in opts:
                 menu.add_command(
@@ -429,12 +455,6 @@ class KintaiApp(tk.Frame):
             messagebox.showinfo("再解析", "選択行のファイル名を取得できません。")
             return
 
-        # ユーザ判断は「ユーザが手動で match_company から変更した」場合のみ保持する。
-        # 初回解析では user_judgment_company=match_company をセットしているため、
-        # それを常に保持してしまうと、再解析で match_company が改善しても UI に反映されない。
-        cur_match = (current_row.get(self.MATCH_COMPANY_COL) or current_row.get("match_company") or "").strip()
-        cur_uj = (current_row.get(self.USER_JUDGMENT_COL) or current_row.get("user_judgment_company") or "").strip()
-        preserved_user_judgment = cur_uj if (cur_uj and cur_uj != cur_match) else ""
         td = self._data_dir.resolve()
         client = self._client
         aid = self._assistant_uid
@@ -509,8 +529,8 @@ class KintaiApp(tk.Frame):
                     return
 
                 new_row = result_rows[0]
-                if preserved_user_judgment:
-                    new_row["user_judgment_company"] = preserved_user_judgment
+                # 再解析時は自動判断でユーザ判断を上書きする
+                new_row["user_judgment_company"] = auto_judgment_symbol(new_row)
                 self._replace_row_with_result(rid, new_row)
                 self._loaded_rows = self._current_grid_rows()
                 self._progress_var.set("再解析完了 1 / 1")
@@ -534,21 +554,14 @@ class KintaiApp(tk.Frame):
             self._refresh_error_reanalysis_button_state()
             return
 
-        # iid -> file_name / preserved user judgment
+        # iid -> file_name
         iid_by_file: dict[str, str] = {}
-        preserved_uj_by_file: dict[str, str] = {}
         for iid in target_iids:
             row = self._current_row_dict_from_iid(iid)
             file_name = (row.get("画像ファイル名") or row.get("file_name") or "").strip()
             if not file_name:
                 continue
             iid_by_file[file_name] = iid
-            # ユーザ判断は「ユーザが手動で match_company から変更した」場合のみ保持する。
-            # そうでなければ再解析結果（match_company に追従した user_judgment_company）を採用させる。
-            mc = (row.get(self.MATCH_COMPANY_COL) or row.get("match_company") or "").strip()
-            uj = (row.get(self.USER_JUDGMENT_COL) or row.get("user_judgment_company") or "").strip()
-            if uj and uj != mc:
-                preserved_uj_by_file[file_name] = uj
 
         if not iid_by_file:
             messagebox.showwarning("エラー再解析", "対象行のファイル名を取得できませんでした。")
@@ -620,8 +633,8 @@ class KintaiApp(tk.Frame):
             fn = (row.get("file_name") or "").strip()
             if not fn:
                 return
-            if fn in preserved_uj_by_file:
-                row["user_judgment_company"] = preserved_uj_by_file[fn]
+            # 再解析時は自動判断でユーザ判断を上書きする
+            row["user_judgment_company"] = auto_judgment_symbol(row)
 
             rid = iid_by_file.get(fn)
             if not rid:
@@ -701,7 +714,8 @@ class KintaiApp(tk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _set_user_judgment_cell(self, rid: str, value: str) -> None:
-        if value not in ("〇", "△", "×"):
+        value = normalize_judgment_symbol(value)
+        if value not in ("〇", "△", "✖"):
             return
         ci = self._user_judgment_column_index()
         vals = list(self._tree.item(rid, "values"))
@@ -1127,7 +1141,7 @@ class KintaiApp(tk.Frame):
             out["resolved_path"] = (r.get("resolved_path") or "").strip()
             uj = (r.get(self.USER_JUDGMENT_COL) or r.get("user_judgment_company") or "").strip()
             if uj:
-                out["user_judgment_company"] = uj
+                out["user_judgment_company"] = normalize_judgment_symbol(uj)
             ts = (r.get("対象シート有無") or r.get("target_sheet_exists") or "").strip()
             if ts:
                 out["target_sheet_exists"] = ts
@@ -1147,10 +1161,16 @@ class KintaiApp(tk.Frame):
                         base_map[fn] = cr
 
             def on_row_merge(new_row: dict[str, str]) -> None:
-                # user_judgment を引継ぎ（既存があれば上書きしない）
+                # 手動変更済みのユーザ判断のみ引き継ぐ（未変更時は自動判断を採用）
                 fn = (new_row.get("file_name") or "").strip()
-                if fn and fn in base_map:
-                    uj = (base_map[fn].get("user_judgment_company") or "").strip()
+                if fn and fn in base_map and is_manual_user_judgment(base_map[fn]):
+                    uj = normalize_judgment_symbol(
+                        (
+                            base_map[fn].get("user_judgment_company")
+                            or base_map[fn].get(self.USER_JUDGMENT_COL)
+                            or ""
+                        ).strip()
+                    )
                     if uj:
                         new_row["user_judgment_company"] = uj
                 on_row(new_row)

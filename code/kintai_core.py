@@ -1112,14 +1112,14 @@ def _enrich_with_match_scores(
     row["name_company_from_doc"] = k_co
     row["name_person_from_doc"] = d_pe
     row["match_company"] = _match_company_symbol_single(fp_co, doc_co_match)
-    # 仕様: 1行解析時は自動判断をユーザ判断にもセットする
-    aj = _auto_judgment_symbol(row)
-    row["auto_judgment"] = aj
-    row["user_judgment_company"] = aj
     row["match_person"] = _compare_person(fp_pe, d_pe)
     th_dec = _work_hours_string_to_decimal(th_raw)
     row["total_hours_raw"] = th_raw
     row["total_hours_decimal"] = th_dec
+    # 仕様: 1行解析時は自動判断をユーザ判断にもセットする（合計勤務時間設定後に計算）
+    aj = _auto_judgment_symbol(row)
+    row["auto_judgment"] = aj
+    row["user_judgment_company"] = aj
     # 読取列は解析から抜いた文字列をそのまま用いる（60進/10進の別は _work_hours_string_to_decimal 側のルール）
     row["labor_read_display"] = (th_raw or "").strip() or "（なし）"
     row["seal_in_doc"] = _seal_norm or _extract_seal_in_from_document(
@@ -1192,6 +1192,60 @@ def _is_valid_total_hours_decimal(total_hours_decimal: str) -> bool:
         return False
     # 表示用（8.5等）/内部用（8.50等）どちらでも許容
     return bool(_DECIMAL_HOURS_VALID_RE.fullmatch(t))
+
+
+def normalize_judgment_symbol(value: str) -> str:
+    """判断記号を表示用（〇/△/✖）に正規化する。"""
+    t = (value or "").strip()
+    if t in ("×", "✕"):
+        return "✖"
+    return t
+
+
+def auto_judgment_symbol(row: dict[str, str]) -> str:
+    """自動判断（〇/△/✖）を計算する（UI列名・内部キー両対応）。"""
+    emp = (row.get("employee_no") or row.get("社員番号") or "").strip()
+    th = (row.get("total_hours_decimal") or row.get("合計勤務時間（10進）") or "").strip()
+    mc = (row.get("match_company") or row.get("会社名比較（ファイル名✖文書）") or "").strip()
+    return _auto_judgment_symbol(
+        {"employee_no": emp, "total_hours_decimal": th, "match_company": mc}
+    )
+
+
+def _effective_user_judgment(row: dict[str, str], auto: str | None = None) -> str:
+    """表示用ユーザ判断。未設定・解析時自動判断・旧仕様（会社名比較のみ）の場合は auto を返す。"""
+    aj = auto if auto is not None else auto_judgment_symbol(row)
+    uj_raw = normalize_judgment_symbol(
+        (row.get("user_judgment_company") or row.get("ユーザ判断") or "").strip()
+    )
+    if not uj_raw:
+        return aj
+    stored_aj = normalize_judgment_symbol((row.get("auto_judgment") or "").strip())
+    if stored_aj and uj_raw == stored_aj:
+        return aj
+    mc = (row.get("match_company") or row.get("会社名比較（ファイル名✖文書）") or "").strip()
+    if mc and uj_raw == mc and uj_raw != aj:
+        return aj
+    return uj_raw
+
+
+def is_manual_user_judgment(row: dict[str, str]) -> bool:
+    """ユーザ判断が自動判断と異なる＝手動変更済み。"""
+    uj_raw = normalize_judgment_symbol(
+        (row.get("user_judgment_company") or row.get("ユーザ判断") or "").strip()
+    )
+    if not uj_raw:
+        return False
+    aj = auto_judgment_symbol(row)
+    if uj_raw == aj:
+        return False
+    stored_aj = normalize_judgment_symbol((row.get("auto_judgment") or "").strip())
+    if stored_aj and uj_raw == stored_aj:
+        return False
+    mc = (row.get("match_company") or row.get("会社名比較（ファイル名✖文書）") or "").strip()
+    if mc and uj_raw == mc:
+        return False
+    return True
 
 
 def _auto_judgment_symbol(row: dict[str, str]) -> str:
@@ -1329,9 +1383,7 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
 
     aj = _auto_judgment_symbol(r)
     r["auto_judgment"] = aj
-    uj_raw = (r.get("user_judgment_company") or "").strip()
-    # 初回（1行解析）では自動判断をユーザ判断へもセットする
-    uj = uj_raw or aj
+    uj = _effective_user_judgment(r, aj)
     r["user_judgment_company"] = uj
     uj = _escape_md_table_cell(uj)
     aj = _escape_md_table_cell(aj)
@@ -1439,8 +1491,7 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
 
     aj = _auto_judgment_symbol(r)
     r["auto_judgment"] = aj
-    uj_raw = (r.get("user_judgment_company") or "").strip()
-    uj = uj_raw or aj
+    uj = _effective_user_judgment(r, aj)
     r["user_judgment_company"] = uj
 
     fn = r.get("file_name", "") or ""
