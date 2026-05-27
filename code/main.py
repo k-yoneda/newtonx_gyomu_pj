@@ -471,15 +471,18 @@ class KintaiApp(tk.Frame):
     def _on_year_month_changed(self, _event: tk.Event | None = None) -> None:
         self._refresh_year_month_combos()
 
-    def _set_data_path(self, path: Path) -> None:
-        """参照フォルダまたは JSON の data_dir から解析フォルダ・年月表示を同期する。"""
+    def _set_data_path(
+        self, path: Path, *, sync_year_month_from_path: bool = False
+    ) -> None:
+        """解析対象フォルダを設定する。sync_year_month_from_path 時のみパスから年月コンボを更新。"""
         root, year, month, branch = _parse_data_dir_path(path)
         if root is not None:
             self._data_root = root
-        if year is not None:
-            self._year_var.set(str(year))
-        if month is not None:
-            self._month_var.set(str(month))
+        if sync_year_month_from_path:
+            if year is not None:
+                self._year_var.set(str(year))
+            if month is not None:
+                self._month_var.set(str(month))
         self._data_branch = branch
         self._data_dir = path.resolve()
         self._sync_folder_display()
@@ -496,7 +499,7 @@ class KintaiApp(tk.Frame):
         )
         if not d:
             return
-        self._set_data_path(Path(d))
+        self._set_data_path(Path(d), sync_year_month_from_path=False)
 
     def _should_ignore_status_log(self, message: str) -> bool:
         """run_analysis(on_log=...) 経由で流れてくるログのうち、
@@ -1488,7 +1491,7 @@ class KintaiApp(tk.Frame):
         # 保存済みフォルダパスを復元（data_dir / data_folder のいずれか）
         dd = (data.get("data_dir") or data.get("data_folder") or "").strip()
         if dd:
-            self._set_data_path(Path(dd))
+            self._set_data_path(Path(dd), sync_year_month_from_path=True)
         else:
             self._data_dir = None
             self._sync_folder_display()
