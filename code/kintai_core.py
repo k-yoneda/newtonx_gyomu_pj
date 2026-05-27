@@ -1531,7 +1531,7 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     ts = _escape_md_table_cell(_target_sheet_ok_symbol(r))
     fn = _escape_md_table_cell(r.get("file_name", ""))
 
-    aj = _auto_judgment_symbol(r)
+    aj = auto_judgment_symbol(r)
     r["auto_judgment"] = aj
     uj = _effective_user_judgment(r, aj)
     r["user_judgment_company"] = uj
@@ -1641,7 +1641,7 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
     up_sym = _upload_ok_symbol(r)
     ts = _target_sheet_ok_symbol(r)
 
-    aj = _auto_judgment_symbol(r)
+    aj = auto_judgment_symbol(r)
     r["auto_judgment"] = aj
     uj = _effective_user_judgment(r, aj)
     r["user_judgment_company"] = uj
