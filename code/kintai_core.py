@@ -1633,7 +1633,9 @@ def summary_header_cells() -> tuple[str, ...]:
     return tuple(c.strip() for c in raw.split("|"))
 
 
-def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
+def row_display_values(
+    r: dict[str, str], *, sync_user_judgment_to_auto: bool = False
+) -> tuple[str, ...]:
     """グリッド表示用（Markdown エスケープなし）。 _one_summary_data_line と同一ルール。"""
     is_excel = _row_is_excel(r)
     up_sym = _upload_ok_symbol(r)
@@ -1641,7 +1643,10 @@ def row_display_values(r: dict[str, str]) -> tuple[str, ...]:
 
     aj = auto_judgment_symbol(r)
     r["auto_judgment"] = aj
-    uj = _effective_user_judgment(r, aj)
+    if sync_user_judgment_to_auto:
+        uj = aj
+    else:
+        uj = _effective_user_judgment(r, aj)
     r["user_judgment_company"] = uj
 
     fn = r.get("file_name", "") or ""

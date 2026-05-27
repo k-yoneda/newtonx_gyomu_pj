@@ -708,9 +708,14 @@ class KintaiApp(tk.Frame):
             out["expected_month"] = str(em)
         return out
 
-    def _grid_values_from_row(self, row: dict[str, str]) -> tuple[str, ...]:
+    def _grid_values_from_row(
+        self, row: dict[str, str], *, sync_user_judgment_to_auto: bool = False
+    ) -> tuple[str, ...]:
         """内部row形式・UI保存形式のどちらでも Treeview 表示値へ変換する。"""
-        return row_display_values(self._row_dict_to_core(row))
+        return row_display_values(
+            self._row_dict_to_core(row),
+            sync_user_judgment_to_auto=sync_user_judgment_to_auto,
+        )
 
     def _user_judgment_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.USER_JUDGMENT_COL)
@@ -733,12 +738,17 @@ class KintaiApp(tk.Frame):
     def _recalculate_auto_judgment_for_row(
         self, rid: str, row: dict[str, str] | None = None
     ) -> None:
-        """年・月などの変更後に自動判断（および連動するユーザ判断）を再計算して反映する。"""
+        """列編集後に自動判断を再計算し、ユーザ判断も同じ結果で上書きする。"""
         core = self._row_dict_to_core(
             row if row is not None else self._current_row_dict_from_iid(rid)
         )
-        core["auto_judgment"] = auto_judgment_symbol(core)
-        self._replace_row_with_result(rid, core)
+        aj = auto_judgment_symbol(core)
+        core["auto_judgment"] = aj
+        core["user_judgment_company"] = aj
+        core[self.USER_JUDGMENT_COL] = aj
+        self._replace_row_with_result(
+            rid, core, sync_user_judgment_to_auto=True
+        )
 
     def _on_tree_right_click(self, event: tk.Event) -> None:
         if self._busy:
@@ -817,8 +827,19 @@ class KintaiApp(tk.Frame):
         row["resolved_path"] = self._item_paths.get(rid, "")
         return row
 
-    def _replace_row_with_result(self, rid: str, row: dict[str, str]) -> None:
-        self._tree.item(rid, values=self._grid_values_from_row(row))
+    def _replace_row_with_result(
+        self,
+        rid: str,
+        row: dict[str, str],
+        *,
+        sync_user_judgment_to_auto: bool = False,
+    ) -> None:
+        self._tree.item(
+            rid,
+            values=self._grid_values_from_row(
+                row, sync_user_judgment_to_auto=sync_user_judgment_to_auto
+            ),
+        )
         self._item_paths[rid] = row.get("resolved_path", "")
 
     def _set_row_reanalysis_highlight(self, rid: str, active: bool) -> None:
@@ -1172,11 +1193,10 @@ class KintaiApp(tk.Frame):
 
         def on_ok() -> None:
             new_v = normalize(var.get())
-            if ci >= len(vals):
-                while len(vals) <= ci:
-                    vals.append("")
-            vals[ci] = new_v
-            self._tree.item(rid, values=tuple(vals))
+            row = self._row_dict_to_core(self._current_row_dict_from_iid(rid))
+            row["employee_no"] = new_v
+            row[self.EMPLOYEE_NO_COL] = new_v
+            self._recalculate_auto_judgment_for_row(rid, row)
             top.destroy()
 
         def on_cancel() -> None:
@@ -1333,14 +1353,16 @@ class KintaiApp(tk.Frame):
 
         def on_ok() -> None:
             new_raw = (var.get() or "").strip()
-            new_dec = _decimal_for_table_display(_work_hours_string_to_decimal(new_raw)) if new_raw else "（なし）"
-            max_ci = max(raw_ci, dec_ci)
-            if max_ci >= len(vals):
-                while len(vals) <= max_ci:
-                    vals.append("")
-            vals[raw_ci] = new_raw or "（なし）"
-            vals[dec_ci] = new_dec
-            self._tree.item(rid, values=tuple(vals))
+            dec_str = _work_hours_string_to_decimal(new_raw) if new_raw else ""
+            new_dec = (
+                _decimal_for_table_display(dec_str) if dec_str else "（なし）"
+            )
+            row = self._row_dict_to_core(self._current_row_dict_from_iid(rid))
+            row["total_hours_raw"] = new_raw or "（なし）"
+            row[self.TOTAL_HOURS_RAW_COL] = row["total_hours_raw"]
+            row["total_hours_decimal"] = dec_str if dec_str else ""
+            row[self.TOTAL_HOURS_DECIMAL_COL] = new_dec
+            self._recalculate_auto_judgment_for_row(rid, row)
             top.destroy()
 
         def on_cancel() -> None:
