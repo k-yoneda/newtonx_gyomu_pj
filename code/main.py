@@ -25,6 +25,8 @@ from kintai_core import (
     PARALLEL_WORKERS_MAX,
     TARGET_ASSISTANT_NAME,
     _decimal_for_table_display,
+    _normalize_month_value,
+    _normalize_year_value,
     _work_hours_string_to_decimal,
     auto_judgment_symbol,
     create_client,
@@ -688,9 +690,19 @@ class KintaiApp(tk.Frame):
             elif core_key == "file_name":
                 val = self._file_name_from_row(row)
             elif core_key == "year":
-                val = str(row.get(core_key) or self._year_var.get() or "").strip()
+                if core_key in row:
+                    val = str(row.get(core_key) or "").strip()
+                else:
+                    val = str(
+                        row.get(self.YEAR_COL) or self._year_var.get() or ""
+                    ).strip()
             elif core_key == "month":
-                val = str(row.get(core_key) or self._month_var.get() or "").strip()
+                if core_key in row:
+                    val = str(row.get(core_key) or "").strip()
+                else:
+                    val = str(
+                        row.get(self.MONTH_COL) or self._month_var.get() or ""
+                    ).strip()
             elif core_key == "match_company":
                 val = str(
                     row.get(core_key)
@@ -725,6 +737,22 @@ class KintaiApp(tk.Frame):
 
     def _total_hours_raw_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.TOTAL_HOURS_RAW_COL)
+
+    def _year_column_index(self) -> int:
+        return list(self._tree["columns"]).index(self.YEAR_COL)
+
+    def _month_column_index(self) -> int:
+        return list(self._tree["columns"]).index(self.MONTH_COL)
+
+    def _recalculate_auto_judgment_for_row(
+        self, rid: str, row: dict[str, str] | None = None
+    ) -> None:
+        """年・月などの変更後に自動判断（および連動するユーザ判断）を再計算して反映する。"""
+        core = self._row_dict_to_core(
+            row if row is not None else self._current_row_dict_from_iid(rid)
+        )
+        core["auto_judgment"] = auto_judgment_symbol(core)
+        self._replace_row_with_result(rid, core)
 
     def _on_tree_right_click(self, event: tk.Event) -> None:
         if self._busy:
@@ -776,6 +804,20 @@ class KintaiApp(tk.Frame):
             )
             menu.add_separator()
 
+        if cols[ci] == self.YEAR_COL:
+            menu.add_command(
+                label="年を編集",
+                command=lambda: self._prompt_edit_year(rid),
+            )
+            menu.add_separator()
+
+        if cols[ci] == self.MONTH_COL:
+            menu.add_command(
+                label="月を編集",
+                command=lambda: self._prompt_edit_month(rid),
+            )
+            menu.add_separator()
+
         menu.add_command(label="再解析", command=lambda: self._start_row_reanalysis(rid))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -790,7 +832,7 @@ class KintaiApp(tk.Frame):
         return row
 
     def _replace_row_with_result(self, rid: str, row: dict[str, str]) -> None:
-        self._tree.item(rid, values=row_display_values(row))
+        self._tree.item(rid, values=self._grid_values_from_row(row))
         self._item_paths[rid] = row.get("resolved_path", "")
 
     def _set_row_reanalysis_highlight(self, rid: str, active: bool) -> None:
@@ -1157,6 +1199,114 @@ class KintaiApp(tk.Frame):
         ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
         ttk.Button(btns, text="キャンセル", command=on_cancel).pack(side=tk.RIGHT, padx=(0, 8))
 
+        top.bind("<Return>", lambda _e: on_ok())
+        top.bind("<Escape>", lambda _e: on_cancel())
+
+    def _prompt_edit_year(self, rid: str) -> None:
+        """年列を右クリックから編集する（空欄可）。"""
+        row = self._row_dict_to_core(self._current_row_dict_from_iid(rid))
+        cur = (row.get("year") or "").strip()
+
+        top = tk.Toplevel(self)
+        top.title("年を編集")
+        top.transient(self)
+        top.grab_set()
+
+        ttk.Label(
+            top,
+            text="年（4桁の西暦）を入力してください。\n空欄: 未設定",
+            justify="left",
+        ).pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        var = tk.StringVar(value=cur)
+        ent = ttk.Entry(top, textvariable=var, width=12)
+        ent.pack(fill=tk.X, padx=10)
+        ent.focus_set()
+        ent.select_range(0, tk.END)
+
+        btns = ttk.Frame(top)
+        btns.pack(fill=tk.X, padx=10, pady=10)
+
+        def on_ok() -> None:
+            raw = (var.get() or "").strip()
+            if not raw:
+                new_y = ""
+            else:
+                norm = _normalize_year_value(raw)
+                if not norm:
+                    messagebox.showwarning(
+                        "入力エラー",
+                        "年は4桁の西暦（例: 2026）で入力してください。",
+                        parent=top,
+                    )
+                    return
+                new_y = norm
+            row["year"] = new_y
+            row[self.YEAR_COL] = new_y
+            self._recalculate_auto_judgment_for_row(rid, row)
+            top.destroy()
+
+        def on_cancel() -> None:
+            top.destroy()
+
+        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="キャンセル", command=on_cancel).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+        top.bind("<Return>", lambda _e: on_ok())
+        top.bind("<Escape>", lambda _e: on_cancel())
+
+    def _prompt_edit_month(self, rid: str) -> None:
+        """月列を右クリックから編集する（空欄可）。"""
+        row = self._row_dict_to_core(self._current_row_dict_from_iid(rid))
+        cur = (row.get("month") or "").strip()
+
+        top = tk.Toplevel(self)
+        top.title("月を編集")
+        top.transient(self)
+        top.grab_set()
+
+        ttk.Label(
+            top,
+            text="月（1〜12）を入力してください。\n空欄: 未設定",
+            justify="left",
+        ).pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        var = tk.StringVar(value=cur)
+        ent = ttk.Entry(top, textvariable=var, width=8)
+        ent.pack(fill=tk.X, padx=10)
+        ent.focus_set()
+        ent.select_range(0, tk.END)
+
+        btns = ttk.Frame(top)
+        btns.pack(fill=tk.X, padx=10, pady=10)
+
+        def on_ok() -> None:
+            raw = (var.get() or "").strip()
+            if not raw:
+                new_m = ""
+            else:
+                norm = _normalize_month_value(raw)
+                if not norm:
+                    messagebox.showwarning(
+                        "入力エラー",
+                        "月は1〜12の整数（例: 3 または 3月）で入力してください。",
+                        parent=top,
+                    )
+                    return
+                new_m = norm
+            row["month"] = new_m
+            row[self.MONTH_COL] = new_m
+            self._recalculate_auto_judgment_for_row(rid, row)
+            top.destroy()
+
+        def on_cancel() -> None:
+            top.destroy()
+
+        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="キャンセル", command=on_cancel).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
         top.bind("<Return>", lambda _e: on_ok())
         top.bind("<Escape>", lambda _e: on_cancel())
 
