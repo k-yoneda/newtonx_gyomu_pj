@@ -381,20 +381,28 @@ class KintaiApp(tk.Frame):
         )
         self._cont_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
+        self._selected_reanalysis_btn = ttk.Button(
+            ctrl,
+            text="選択行解析",
+            command=self._start_selected_rows_reanalysis,
+            state=tk.DISABLED,
+        )
+        self._selected_reanalysis_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+
         self._save_btn = ttk.Button(
             ctrl, text="保存", command=self._save_json, state=tk.DISABLED
         )
-        self._save_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self._save_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
 
         self._load_btn = ttk.Button(
             ctrl, text="読み込み", command=self._load_json, state=tk.NORMAL
         )
-        self._load_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self._load_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
 
         self._cancel_btn = ttk.Button(
             ctrl, text="中断", command=self._cancel_analysis, state=tk.DISABLED
         )
-        self._cancel_btn.grid(row=0, column=4, sticky="w", padx=(16, 0))
+        self._cancel_btn.grid(row=0, column=5, sticky="w", padx=(16, 0))
 
         # 中断の右: エラー再解析（ユーザ判断が「〇」以外の行のみを対象に再解析）
         self._error_reanalysis_btn = ttk.Button(
@@ -403,7 +411,7 @@ class KintaiApp(tk.Frame):
             command=self._start_error_reanalysis,
             state=tk.DISABLED,
         )
-        self._error_reanalysis_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
+        self._error_reanalysis_btn.grid(row=0, column=6, sticky="w", padx=(8, 0))
 
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
@@ -411,10 +419,10 @@ class KintaiApp(tk.Frame):
         # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
         # （環境によってフォントが少し太く、26文字だと末尾が欠けるケースがあったため更に増やす）
         ttk.Label(ctrl, textvariable=self._progress_var, width=30).grid(
-            row=0, column=6, sticky="w", padx=(16, 0)
+            row=0, column=7, sticky="w", padx=(16, 0)
         )
         # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
-        ctrl.columnconfigure(6, minsize=240)
+        ctrl.columnconfigure(7, minsize=240)
 
         self._status_label = ttk.Label(
             ctrl,
@@ -424,8 +432,8 @@ class KintaiApp(tk.Frame):
             wraplength=900,
             justify="left",
         )
-        self._status_label.grid(row=0, column=7, sticky="ew", padx=(12, 0))
-        ctrl.columnconfigure(7, weight=1)
+        self._status_label.grid(row=0, column=8, sticky="ew", padx=(12, 0))
+        ctrl.columnconfigure(8, weight=1)
 
         grid_frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         grid_frame.pack(fill=tk.BOTH, expand=True)
@@ -443,6 +451,7 @@ class KintaiApp(tk.Frame):
             grid_frame,
             columns=list(headings),
             show="headings",
+            selectmode="extended",
             yscrollcommand=y_scroll.set,
             xscrollcommand=x_scroll.set,
         )
@@ -468,12 +477,14 @@ class KintaiApp(tk.Frame):
         self._tree.bind("<Button-3>", self._on_tree_right_click)
         self._tree.bind("<Button-1>", self._on_tree_left_click, add="+")
         self._tree.bind("<Double-1>", self._on_row_double_click)
+        self._tree.bind("<<TreeviewSelect>>", self._on_tree_selection_changed)
 
         initial_w = self._window_width_for_columns(col_px, y_scroll=y_scroll)
         min_w = min(960, initial_w)
         self._root.minsize(min_w, 520)
         self._root.geometry(f"{initial_w}x680")
         self._sync_folder_display()
+        self._refresh_reanalysis_buttons_state()
 
     def _sync_folder_display(self) -> None:
         """データフォルダ欄を _data_dir の状態に合わせる（未設定時は未選択）。"""
@@ -544,7 +555,10 @@ class KintaiApp(tk.Frame):
             state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED)
         )
         self._cancel_btn.configure(state=tk.DISABLED)
-        self._refresh_error_reanalysis_button_state()
+        self._refresh_reanalysis_buttons_state()
+
+    def _on_tree_selection_changed(self, _event: tk.Event | None = None) -> None:
+        self._refresh_selected_rows_reanalysis_button_state()
 
     def _on_year_month_changed(self, _event: tk.Event | None = None) -> None:
         self._refresh_year_month_combos()
@@ -623,6 +637,16 @@ class KintaiApp(tk.Frame):
                 iids.append(iid)
         return iids
 
+    def _selected_tree_iids(self) -> list[str]:
+        return list(self._tree.selection())
+
+    def _refresh_selected_rows_reanalysis_button_state(self) -> None:
+        if self._busy or self._data_dir is None:
+            self._selected_reanalysis_btn.configure(state=tk.DISABLED)
+            return
+        enabled = bool(self._selected_tree_iids())
+        self._selected_reanalysis_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+
     def _refresh_error_reanalysis_button_state(self) -> None:
         if self._busy or self._data_dir is None:
             self._error_reanalysis_btn.configure(state=tk.DISABLED)
@@ -630,6 +654,10 @@ class KintaiApp(tk.Frame):
         # 対象行が1件でもあれば有効
         enabled = bool(self._eligible_error_reanalysis_iids())
         self._error_reanalysis_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+
+    def _refresh_reanalysis_buttons_state(self) -> None:
+        self._refresh_error_reanalysis_button_state()
+        self._refresh_selected_rows_reanalysis_button_state()
 
     def _clear_grid(self) -> None:
         self._close_row_file()
@@ -962,9 +990,11 @@ class KintaiApp(tk.Frame):
         self._cancel_event = threading.Event()
         self._new_btn.configure(state=tk.DISABLED)
         self._cont_btn.configure(state=tk.DISABLED)
+        self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
+        self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._progress_var.set("再解析中 0 / 1")
         self._status_var.set(f"再解析しています… {file_name}")
 
@@ -1038,40 +1068,37 @@ class KintaiApp(tk.Frame):
                 self._progress_var.set("再解析完了 1 / 1")
                 ratio_text = self._company_match_ratio_text(self._loaded_rows)
                 self._status_var.set(f"再解析完了: {file_name} / {ratio_text}")
-                self._refresh_error_reanalysis_button_state()
+                self._refresh_reanalysis_buttons_state()
                 messagebox.showinfo("再解析完了", f"選択行の再解析が完了しました。\n{file_name}")
 
             self.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _start_error_reanalysis(self) -> None:
-        """ユーザ判断が「〇」以外の行だけをまとめて再解析する。"""
-        if self._busy or self._data_dir is None:
-            return
-
-        target_iids = self._eligible_error_reanalysis_iids()
-        if not target_iids:
-            messagebox.showinfo("エラー再解析", "対象行がありません（ユーザ判断が『〇』以外の行）。")
-            self._refresh_error_reanalysis_button_state()
-            return
-
-        # iid -> file_name
+    def _iid_by_file_from_iids(self, iids: list[str]) -> dict[str, str]:
+        """Treeview 行 ID のリストから file_name -> iid の対応を作る。"""
         iid_by_file: dict[str, str] = {}
-        for iid in target_iids:
+        for iid in iids:
             row = self._current_row_dict_from_iid(iid)
             file_name = self._file_name_from_row(row)
-            if not file_name:
-                continue
-            iid_by_file[file_name] = iid
+            if file_name:
+                iid_by_file[file_name] = iid
+        return iid_by_file
 
-        if not iid_by_file:
-            messagebox.showwarning("エラー再解析", "対象行のファイル名を取得できませんでした。")
-            self._refresh_error_reanalysis_button_state()
+    def _run_targeted_reanalysis(
+        self,
+        iid_by_file: dict[str, str],
+        *,
+        label: str,
+        complete_message: str,
+    ) -> None:
+        """指定行（ファイル名）のみ再解析する。"""
+        if self._busy or self._data_dir is None or not iid_by_file:
             return
 
         file_names = set(iid_by_file.keys())
         total = len(file_names)
+        target_iids = list(iid_by_file.values())
 
         td = self._data_dir.resolve()
         client = self._client
@@ -1084,19 +1111,15 @@ class KintaiApp(tk.Frame):
         self._cancel_event = threading.Event()
         self._new_btn.configure(state=tk.DISABLED)
         self._cont_btn.configure(state=tk.DISABLED)
+        self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
-        self._progress_var.set(f"エラー再解析中 0 / {total}")
-        self._status_var.set(
-            f"エラー再解析しています… {total} 件（並列 {parallel}）"
-        )
+        self._progress_var.set(f"{label}中 0 / {total}")
+        self._status_var.set(f"{label}しています… {total} 件（並列 {parallel}）")
 
-        # 念のため、前回の異常終了等で反転が残っていた場合に備えて全解除してから開始する。
         self._set_rows_reanalysis_highlight(target_iids, False)
-
-        # 起動時に選んだ並列数（ワーカー）分、同時に処理中の行を反転表示する。
         active_rids: set[str] = set()
 
         def log_line(message: str) -> None:
@@ -1108,13 +1131,11 @@ class KintaiApp(tk.Frame):
             self.after(0, apply_log)
 
         def on_progress(done: int, t: int) -> None:
-            self.after(0, lambda d=done, tt=t: self._progress_var.set(f"エラー再解析中 {d} / {tt}"))
+            self.after(
+                0, lambda d=done, tt=t: self._progress_var.set(f"{label}中 {d} / {tt}")
+            )
 
         def on_file_started(file_name: str) -> None:
-            """core側が「このファイルの処理を開始した」タイミングで呼ばれる。
-
-            GUI側では、今処理中の1行のみ反転表示する。
-            """
             fn = (file_name or "").strip()
             if not fn:
                 return
@@ -1136,21 +1157,22 @@ class KintaiApp(tk.Frame):
             fn = (row.get("file_name") or "").strip()
             if not fn:
                 return
-            # 再解析時は自動判断でユーザ判断を上書きする
             row["user_judgment_company"] = auto_judgment_symbol(row)
-
             rid = iid_by_file.get(fn)
             if not rid:
                 return
 
             def apply_row() -> None:
-                self._replace_row_with_result(rid, row)
+                self._replace_row_with_result(
+                    rid, row, sync_user_judgment_to_auto=True
+                )
                 self._set_row_reanalysis_highlight(rid, False)
                 active_rids.discard(rid)
-                # 途中経過でも割合等を更新
                 current_rows = self._current_grid_rows()
-                ratio_text = self._company_match_ratio_text(current_rows, total_target_count=len(current_rows))
-                self._status_var.set(f"エラー再解析中… / {ratio_text}")
+                ratio_text = self._company_match_ratio_text(
+                    current_rows, total_target_count=len(current_rows)
+                )
+                self._status_var.set(f"{label}中… / {ratio_text}")
 
             self.after(0, apply_row)
 
@@ -1183,39 +1205,92 @@ class KintaiApp(tk.Frame):
                 cancelled = self._cancel_event is not None and self._cancel_event.is_set()
                 self._cancel_event = None
 
-                # 反転表示を解除（成功/エラー/中断いずれも）
                 for ar in list(active_rids):
                     self._set_row_reanalysis_highlight(ar, False)
                 active_rids.clear()
                 self._set_rows_reanalysis_highlight(target_iids, False)
 
                 self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
-                self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and (self._loaded_rows or self._tree.get_children())) else tk.DISABLED))
-                self._save_btn.configure(state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED))
+                self._cont_btn.configure(
+                    state=(
+                        tk.NORMAL
+                        if (
+                            self._data_dir
+                            and (self._loaded_rows or self._tree.get_children())
+                        )
+                        else tk.DISABLED
+                    )
+                )
+                self._save_btn.configure(
+                    state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED)
+                )
                 self._load_btn.configure(state=tk.NORMAL)
 
-                # 確定: 現在グリッドの内容を loaded_rows に反映
                 self._loaded_rows = self._current_grid_rows()
-                self._progress_var.set(f"エラー再解析完了 {total} / {total}")
+                self._progress_var.set(f"{label}完了 {total} / {total}")
                 ratio_text = self._company_match_ratio_text(self._loaded_rows)
-
-                # ボタン状態更新
-                self._refresh_error_reanalysis_button_state()
+                self._refresh_reanalysis_buttons_state()
 
                 if err is not None:
-                    messagebox.showerror("エラー再解析エラー", str(err))
-                    self._status_var.set(f"エラー再解析エラー（途中結果は保持） / {ratio_text}")
+                    messagebox.showerror(f"{label}エラー", str(err))
+                    self._status_var.set(f"{label}エラー（途中結果は保持） / {ratio_text}")
                     return
                 if cancelled:
-                    self._status_var.set(f"エラー再解析を中断しました（途中結果は保持） / {ratio_text}")
+                    self._status_var.set(f"{label}を中断しました（途中結果は保持） / {ratio_text}")
                     return
 
-                self._status_var.set(f"エラー再解析完了: {total} 件 / {ratio_text}")
-                messagebox.showinfo("エラー再解析完了", f"ユーザ判断が〇以外の行を再解析しました。\n対象: {total} 件")
+                self._status_var.set(f"{label}完了: {total} 件 / {ratio_text}")
+                messagebox.showinfo(f"{label}完了", complete_message)
 
             self.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _start_selected_rows_reanalysis(self) -> None:
+        """グリッドで選択した行だけを再解析する。"""
+        if self._busy or self._data_dir is None:
+            return
+        iids = self._selected_tree_iids()
+        if not iids:
+            return
+        iid_by_file = self._iid_by_file_from_iids(iids)
+        if not iid_by_file:
+            messagebox.showwarning(
+                "選択行解析", "選択行のファイル名を取得できませんでした。"
+            )
+            self._refresh_selected_rows_reanalysis_button_state()
+            return
+        total = len(iid_by_file)
+        self._run_targeted_reanalysis(
+            iid_by_file,
+            label="選択行解析",
+            complete_message=f"選択した行を再解析しました。\n対象: {total} 件",
+        )
+
+    def _start_error_reanalysis(self) -> None:
+        """ユーザ判断が「〇」以外の行だけをまとめて再解析する。"""
+        if self._busy or self._data_dir is None:
+            return
+
+        target_iids = self._eligible_error_reanalysis_iids()
+        if not target_iids:
+            messagebox.showinfo(
+                "エラー再解析", "対象行がありません（ユーザ判断が『〇』以外の行）。"
+            )
+            self._refresh_reanalysis_buttons_state()
+            return
+
+        iid_by_file = self._iid_by_file_from_iids(target_iids)
+        if not iid_by_file:
+            messagebox.showwarning("エラー再解析", "対象行のファイル名を取得できませんでした。")
+            self._refresh_reanalysis_buttons_state()
+            return
+        total = len(iid_by_file)
+        self._run_targeted_reanalysis(
+            iid_by_file,
+            label="エラー再解析",
+            complete_message=f"ユーザ判断が〇以外の行を再解析しました。\n対象: {total} 件",
+        )
 
     def _set_user_judgment_cell(self, rid: str, value: str) -> None:
         value = normalize_judgment_symbol(value)
@@ -1605,7 +1680,7 @@ class KintaiApp(tk.Frame):
         self._save_btn.configure(state=(tk.NORMAL if self._loaded_rows else tk.DISABLED))
         if not self._busy and not dd:
             self._update_data_dir_dependent_buttons()
-        self._refresh_error_reanalysis_button_state()
+        self._refresh_reanalysis_buttons_state()
         ratio_text = self._company_match_ratio_text(self._loaded_rows)
         self._status_var.set(f"読み込みました: {self._loaded_json_path} / {ratio_text}")
         self._update_title()
@@ -1689,9 +1764,11 @@ class KintaiApp(tk.Frame):
         self._cancel_event = threading.Event()
         self._new_btn.configure(state=tk.DISABLED)
         self._cont_btn.configure(state=tk.DISABLED)
+        self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
+        self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._progress_var.set("")
         self._status_var.set("解析を準備しています…")
 
@@ -1894,7 +1971,7 @@ class KintaiApp(tk.Frame):
                         f"エラーで停止しました: {n_rows} 件を保持（JSON保存で続きから再開できます） / {ratio_text}"
                     )
                     # 進捗は固定せず、最後に見えていた値を維持（空にはしない）
-                    self._refresh_error_reanalysis_button_state()
+                    self._refresh_reanalysis_buttons_state()
                     return
 
                 if cancelled:
@@ -1906,7 +1983,7 @@ class KintaiApp(tk.Frame):
                         f"完了: {n_rows} 件をグリッド表示（解析結果.md を出力） / {ratio_text}"
                     )
 
-                self._refresh_error_reanalysis_button_state()
+                self._refresh_reanalysis_buttons_state()
 
             self.after(0, finish)
 
