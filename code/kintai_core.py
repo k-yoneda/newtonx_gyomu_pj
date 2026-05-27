@@ -1027,13 +1027,11 @@ def _extract_month_from_document(text: str) -> str:
 
 
 def _year_month_matches_expected(row: dict[str, str]) -> bool:
-    """画像/PDF行の年・月が画面上の期待値（コンボ）と一致するか。"""
-    if _row_is_excel(row):
-        return True
+    """読み取った年・月が画面上の期待値（コンボ）と一致するか。"""
     exp_y = _normalize_year_value(row.get("expected_year") or "")
     exp_m = _normalize_month_value(row.get("expected_month") or "")
     if not exp_y or not exp_m:
-        return True
+        return False
     got_y = _normalize_year_value(
         row.get("year") or row.get(SUMMARY_YEAR_COL) or ""
     )
@@ -1390,11 +1388,11 @@ def _auto_judgment_symbol(row: dict[str, str]) -> str:
     """自動判断（〇/△/✖）を計算する。
 
     仕様:
-      - 画像/PDF: 文書から読み取った年・月が expected_year/month（画面上のコンボ）と一致しない場合は ✖
-      - 〇: 社員番号が有効、合計勤務時間(10進)が整数または小数点以下2桁まで、会社名比較が〇
-      - △: 上記と同様だが会社名比較が△
-      - ✖: それ以外
+      - 画像/PDF: 読み取った年・月とコンボ（expected_year/month）が一致 → 〇、不一致 → ✖
+      - Excel: 年・月が不一致 → ✖。一致時は従来どおり社員番号・合計勤務時間・会社名比較で 〇/△/✖
     """
+    if not _row_is_excel(row):
+        return "〇" if _year_month_matches_expected(row) else "✖"
     if not _year_month_matches_expected(row):
         return "✖"
     emp = (row.get("employee_no") or "").strip()

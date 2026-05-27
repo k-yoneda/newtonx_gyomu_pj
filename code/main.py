@@ -206,6 +206,8 @@ class KintaiApp(tk.Frame):
         self._data_dir: Path | None = None
         self._data_root: Path | None = _guess_data_root()
         self._data_branch: str = ""
+        # 参照ボタンでフォルダ指定後は、コンボの年月変更で data_dir を切り替えない
+        self._data_dir_pinned = False
         default_year, default_month = _today_year_month()
         self._year_var = tk.StringVar(value=str(default_year))
         self._month_var = tk.StringVar(value=str(default_month))
@@ -486,7 +488,8 @@ class KintaiApp(tk.Frame):
 
     def _on_year_month_changed(self, _event: tk.Event | None = None) -> None:
         self._refresh_year_month_combos()
-        self._apply_year_month_to_data_dir()
+        if not self._data_dir_pinned:
+            self._apply_year_month_to_data_dir()
 
     def _set_data_path(self, path: Path) -> None:
         """参照フォルダまたは JSON の data_dir からルート・年月・表示を同期する。"""
@@ -514,6 +517,7 @@ class KintaiApp(tk.Frame):
         if not d:
             return
         self._set_data_path(Path(d))
+        self._data_dir_pinned = True
 
     def _should_ignore_status_log(self, message: str) -> bool:
         """run_analysis(on_log=...) 経由で流れてくるログのうち、
