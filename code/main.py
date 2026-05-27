@@ -206,8 +206,6 @@ class KintaiApp(tk.Frame):
         self._data_dir: Path | None = None
         self._data_root: Path | None = _guess_data_root()
         self._data_branch: str = ""
-        # 参照ボタンでフォルダ指定後は、コンボの年月変更で data_dir を切り替えない
-        self._data_dir_pinned = False
         default_year, default_month = _today_year_month()
         self._year_var = tk.StringVar(value=str(default_year))
         self._month_var = tk.StringVar(value=str(default_month))
@@ -397,10 +395,14 @@ class KintaiApp(tk.Frame):
         min_w = min(960, initial_w)
         self._root.minsize(min_w, 520)
         self._root.geometry(f"{initial_w}x680")
+        self._sync_folder_display()
 
-        # 依存するUI部品（進捗・ボタン等）の生成後に data_dir を確定する
-        if self._data_root is not None:
-            self._apply_year_month_to_data_dir()
+    def _sync_folder_display(self) -> None:
+        """データフォルダ欄を _data_dir の状態に合わせる（未設定時は未選択）。"""
+        if self._data_dir is not None:
+            self._folder_var.set(str(self._data_dir.resolve()))
+        else:
+            self._folder_var.set("（未選択）")
 
     def _discover_years(self) -> list[str]:
         today_y, _ = _today_year_month()
@@ -451,26 +453,6 @@ class KintaiApp(tk.Frame):
         except ValueError:
             return None, None
 
-    def _apply_year_month_to_data_dir(self) -> None:
-        if self._data_root is None:
-            return
-        try:
-            year = int(self._year_var.get().strip())
-            month = int(self._month_var.get().strip())
-        except ValueError:
-            return
-        ym_dir = self._data_root / f"{year}年{month}月"
-        if self._data_branch:
-            branch_dir = ym_dir / self._data_branch
-            self._data_dir = branch_dir if branch_dir.is_dir() else ym_dir
-        else:
-            self._data_dir = ym_dir
-        if self._data_dir.is_dir():
-            self._folder_var.set(str(self._data_dir.resolve()))
-        else:
-            self._folder_var.set(f"{ym_dir}（存在しません）")
-        self._update_data_dir_dependent_buttons()
-
     def _update_data_dir_dependent_buttons(self) -> None:
         has_dir = self._data_dir is not None and self._data_dir.is_dir()
         if self._busy:
@@ -488,11 +470,9 @@ class KintaiApp(tk.Frame):
 
     def _on_year_month_changed(self, _event: tk.Event | None = None) -> None:
         self._refresh_year_month_combos()
-        if not self._data_dir_pinned:
-            self._apply_year_month_to_data_dir()
 
     def _set_data_path(self, path: Path) -> None:
-        """参照フォルダまたは JSON の data_dir からルート・年月・表示を同期する。"""
+        """参照フォルダまたは JSON の data_dir から解析フォルダ・年月表示を同期する。"""
         root, year, month, branch = _parse_data_dir_path(path)
         if root is not None:
             self._data_root = root
@@ -502,7 +482,7 @@ class KintaiApp(tk.Frame):
             self._month_var.set(str(month))
         self._data_branch = branch
         self._data_dir = path.resolve()
-        self._folder_var.set(str(self._data_dir))
+        self._sync_folder_display()
         self._refresh_year_month_combos()
         self._update_data_dir_dependent_buttons()
 
@@ -517,7 +497,6 @@ class KintaiApp(tk.Frame):
         if not d:
             return
         self._set_data_path(Path(d))
-        self._data_dir_pinned = True
 
     def _should_ignore_status_log(self, message: str) -> bool:
         """run_analysis(on_log=...) 経由で流れてくるログのうち、
@@ -1429,9 +1408,11 @@ class KintaiApp(tk.Frame):
         )
 
     def _write_json_file(self, path: Path, rows: list[dict[str, str]]) -> None:
+        folder = str(self._data_dir.resolve()) if self._data_dir else ""
         payload = {
             "version": 1,
-            "data_dir": str(self._data_dir.resolve()) if self._data_dir else "",
+            "data_dir": folder,
+            "data_folder": folder,
             "rows": rows,
         }
         path.write_text(
@@ -1504,10 +1485,13 @@ class KintaiApp(tk.Frame):
         self._loaded_rows = [r for r in rows if isinstance(r, dict)]
         self._last_saved_snapshot = self._compute_snapshot(self._loaded_rows)
 
-        # data_dir は読み込みJSONを優先してセット（空なら維持）
-        dd = (data.get("data_dir") or "").strip()
+        # 保存済みフォルダパスを復元（data_dir / data_folder のいずれか）
+        dd = (data.get("data_dir") or data.get("data_folder") or "").strip()
         if dd:
             self._set_data_path(Path(dd))
+        else:
+            self._data_dir = None
+            self._sync_folder_display()
 
         self._rebuild_grid_from_rows(self._loaded_rows)
         self._save_btn.configure(state=(tk.NORMAL if self._loaded_rows else tk.DISABLED))

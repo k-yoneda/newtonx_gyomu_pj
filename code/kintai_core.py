@@ -1388,11 +1388,11 @@ def _auto_judgment_symbol(row: dict[str, str]) -> str:
     """自動判断（〇/△/✖）を計算する。
 
     仕様:
-      - 画像/PDF: 読み取った年・月とコンボ（expected_year/month）が一致 → 〇、不一致 → ✖
-      - Excel: 年・月が不一致 → ✖。一致時は従来どおり社員番号・合計勤務時間・会社名比較で 〇/△/✖
+      - 読み取った年・月とコンボ（expected_year/month）が不一致 → ✖
+      - 〇: 年・月一致、社員番号が有効、合計勤務時間(10進)が有効、会社名比較が〇
+      - △: 上記と同様だが会社名比較が△（画像/PDF・Excel 共通）
+      - ✖: 年・月不一致、または社員番号・勤務時間・会社名比較のいずれかが不適合
     """
-    if not _row_is_excel(row):
-        return "〇" if _year_month_matches_expected(row) else "✖"
     if not _year_month_matches_expected(row):
         return "✖"
     emp = (row.get("employee_no") or "").strip()
