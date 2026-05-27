@@ -192,17 +192,26 @@ class KintaiApp(tk.Frame):
         master: tk.Tk,
         *,
         client,
-        assistant_uid: str,
-        parallel_workers: int = DEFAULT_PARALLEL_ANALYSIS_CHATS,
+        assistants: list[dict],
     ) -> None:
         super().__init__(master)
         self._root = master
         self._root.title("勤務表解析")
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._client = client
-        self._assistant_uid = assistant_uid
-        nw = int(parallel_workers)
-        self._parallel_workers = max(1, min(nw, PARALLEL_WORKERS_MAX))
+        self._assistants = list(assistants)
+        assistant_names = [
+            str(a.get("name") or "").strip()
+            for a in self._assistants
+            if str(a.get("name") or "").strip()
+        ]
+        default_name = (
+            TARGET_ASSISTANT_NAME
+            if TARGET_ASSISTANT_NAME in assistant_names
+            else (assistant_names[0] if assistant_names else "")
+        )
+        self._assistant_var = tk.StringVar(value=default_name)
+        self._workers_var = tk.StringVar(value=str(DEFAULT_PARALLEL_ANALYSIS_CHATS))
         self._data_dir: Path | None = None
         self._data_root: Path | None = _guess_data_root()
         self._data_branch: str = ""
@@ -252,19 +261,88 @@ class KintaiApp(tk.Frame):
         w = sum(col_px) + scrollbar_w + grid_pad_x + chrome_x
         return min(w, self._root.winfo_screenwidth())
 
+    def _parallel_workers_value(self) -> int:
+        try:
+            nw = int(str(self._workers_var.get()).strip())
+        except (TypeError, ValueError):
+            nw = DEFAULT_PARALLEL_ANALYSIS_CHATS
+        return max(1, min(nw, PARALLEL_WORKERS_MAX))
+
+    def _assistant_uid_for_name(self, name: str) -> str:
+        selected_name = (name or "").strip()
+        if not selected_name:
+            return ""
+        for a in self._assistants:
+            if str(a.get("name") or "").strip() != selected_name:
+                continue
+            raw = a.get("uid")
+            if raw is None or str(raw).strip() == "":
+                raw = a.get("uuid")
+            return str(raw).strip() if raw is not None else ""
+        return ""
+
+    def _require_assistant_uid(self) -> str | None:
+        name = (self._assistant_var.get() or "").strip()
+        if not name:
+            messagebox.showwarning(
+                "アシスタント未選択",
+                "使用するアシスタントを選択してください。",
+                parent=self._root,
+            )
+            return None
+        uid = self._assistant_uid_for_name(name)
+        if not uid:
+            messagebox.showerror(
+                "エラー",
+                f"アシスタント「{name}」の ID を取得できません。",
+                parent=self._root,
+            )
+            return None
+        return uid
+
     def _build_ui(self) -> None:
+        cfg = ttk.Frame(self, padding=(8, 8, 8, 0))
+        cfg.pack(fill=tk.X)
+        ttk.Label(cfg, text="アシスタント:").grid(row=0, column=0, sticky="w")
+        assistant_names = [
+            str(a.get("name") or "").strip()
+            for a in self._assistants
+            if str(a.get("name") or "").strip()
+        ]
+        self._assistant_combo = ttk.Combobox(
+            cfg,
+            textvariable=self._assistant_var,
+            values=assistant_names,
+            state="readonly",
+            width=36,
+        )
+        self._assistant_combo.grid(row=0, column=1, sticky="w", padx=(4, 16))
+        ttk.Label(cfg, text="並列数:").grid(row=0, column=2, sticky="w")
+        tk.Spinbox(
+            cfg,
+            from_=1,
+            to=PARALLEL_WORKERS_MAX,
+            textvariable=self._workers_var,
+            width=6,
+            justify="center",
+        ).grid(row=0, column=3, sticky="w", padx=(4, 8))
+        ttk.Label(
+            cfg,
+            text=f"（1〜{PARALLEL_WORKERS_MAX}、解析時に使用）",
+        ).grid(row=0, column=4, sticky="w")
+
         top = ttk.Frame(self, padding=8)
         top.pack(fill=tk.X)
 
         self._folder_var = tk.StringVar(value="（未選択）")
         ttk.Label(top, text="データフォルダ:").grid(row=0, column=0, sticky="w")
-        ttk.Label(top, textvariable=self._folder_var, anchor="w").grid(
-            row=0, column=1, sticky="ew", padx=(4, 4)
-        )
         ttk.Button(top, text="参照…", command=self._browse_folder).grid(
-            row=0, column=2, sticky="e"
+            row=0, column=1, sticky="w", padx=(4, 4)
         )
-        top.columnconfigure(1, weight=1)
+        ttk.Label(top, textvariable=self._folder_var, anchor="w").grid(
+            row=0, column=2, sticky="ew", padx=(0, 0)
+        )
+        top.columnconfigure(2, weight=1)
 
         ym_row = ttk.Frame(top)
         ym_row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -876,7 +954,9 @@ class KintaiApp(tk.Frame):
 
         td = self._data_dir.resolve()
         client = self._client
-        aid = self._assistant_uid
+        aid = self._require_assistant_uid()
+        if not aid:
+            return
 
         self._busy = True
         self._cancel_event = threading.Event()
@@ -995,7 +1075,10 @@ class KintaiApp(tk.Frame):
 
         td = self._data_dir.resolve()
         client = self._client
-        aid = self._assistant_uid
+        aid = self._require_assistant_uid()
+        if not aid:
+            return
+        parallel = self._parallel_workers_value()
 
         self._busy = True
         self._cancel_event = threading.Event()
@@ -1007,7 +1090,7 @@ class KintaiApp(tk.Frame):
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._progress_var.set(f"エラー再解析中 0 / {total}")
         self._status_var.set(
-            f"エラー再解析しています… {total} 件（並列 {self._parallel_workers}）"
+            f"エラー再解析しています… {total} 件（並列 {parallel}）"
         )
 
         # 念のため、前回の異常終了等で反転が残っていた場合に備えて全解除してから開始する。
@@ -1087,7 +1170,7 @@ class KintaiApp(tk.Frame):
                     on_row_completed=on_row_completed,
                     cancel_event=self._cancel_event,
                     target_file_names=file_names,
-                    parallel_chats=self._parallel_workers,
+                    parallel_chats=parallel,
                     expected_year=exp_y,
                     expected_month=exp_m,
                 )
@@ -1598,6 +1681,10 @@ class KintaiApp(tk.Frame):
     def _start_analysis(self, *, base_rows: list[dict[str, str]] | None) -> None:
         if self._busy or self._data_dir is None:
             return
+        aid = self._require_assistant_uid()
+        if not aid:
+            return
+        parallel = self._parallel_workers_value()
         self._busy = True
         self._cancel_event = threading.Event()
         self._new_btn.configure(state=tk.DISABLED)
@@ -1616,7 +1703,6 @@ class KintaiApp(tk.Frame):
 
         td = self._data_dir.resolve()
         client = self._client
-        aid = self._assistant_uid
 
         # 以降は worker スレッドで解析
 
@@ -1733,7 +1819,7 @@ class KintaiApp(tk.Frame):
                     on_row_completed=on_row_merge,
                     cancel_event=self._cancel_event,
                     skip_file_names=skip_names,
-                    parallel_chats=self._parallel_workers,
+                    parallel_chats=parallel,
                     expected_year=exp_y,
                     expected_month=exp_m,
                 )
@@ -1862,11 +1948,7 @@ def _center_window_on_screen(win: tk.Misc) -> None:
 
 def main() -> None:
     root = tk.Tk()
-    # withdraw() のルートは環境により messagebox / Toplevel が出ず、メインにも進めないことがある。
-    # 画面外の 1x1 として「表示済み」の親にする。
-    root.geometry("1x1+-10000+-10000")
-    root.deiconify()
-    root.update_idletasks()
+    root.title("勤務表解析")
 
     client = create_client()
     if not client.authenticate():
@@ -1878,7 +1960,6 @@ def main() -> None:
         root.destroy()
         sys.exit(1)
 
-    # --- アシスタント選択ダイアログ（コンボボックス） ---
     try:
         assistants = client.get_assistants() or []
     except APIError as e:
@@ -1898,9 +1979,9 @@ def main() -> None:
         root.destroy()
         sys.exit(1)
 
-    assistant_names = [str(a.get("name") or "").strip() for a in assistants]
-    assistant_names = [n for n in assistant_names if n]
-
+    assistant_names = [
+        str(a.get("name") or "").strip() for a in assistants if str(a.get("name") or "").strip()
+    ]
     if not assistant_names:
         messagebox.showerror(
             "エラー",
@@ -1910,122 +1991,7 @@ def main() -> None:
         root.destroy()
         sys.exit(1)
 
-    dlg = tk.Toplevel(root)
-    dlg.title("アシスタント・並列設定")
-    dlg.transient(root)
-    dlg.grab_set()
-
-    ttk.Label(dlg, text="使用するアシスタントを選択してください:").pack(
-        fill=tk.X, padx=12, pady=(12, 6)
-    )
-
-    sel_var = tk.StringVar(value="")
-    cb = ttk.Combobox(dlg, textvariable=sel_var, values=assistant_names, state="readonly")
-    cb.pack(fill=tk.X, padx=12)
-
-    # デフォルト: TARGET_ASSISTANT_NAME があればそれ、なければ先頭
-    default_name = TARGET_ASSISTANT_NAME if TARGET_ASSISTANT_NAME in assistant_names else assistant_names[0]
-    sel_var.set(default_name)
-
-    wf = ttk.Frame(dlg)
-    wf.pack(fill=tk.X, padx=12, pady=(12, 0))
-    ttk.Label(wf, text="ワーカースレッド数（並列チャット数）:").pack(side=tk.LEFT)
-    workers_var = tk.StringVar(value=str(DEFAULT_PARALLEL_ANALYSIS_CHATS))
-    tk.Spinbox(
-        wf,
-        from_=1,
-        to=PARALLEL_WORKERS_MAX,
-        textvariable=workers_var,
-        width=6,
-        justify="center",
-    ).pack(side=tk.LEFT, padx=(8, 0))
-    ttk.Label(wf, text=f"（1〜{PARALLEL_WORKERS_MAX}、既定 {DEFAULT_PARALLEL_ANALYSIS_CHATS}）").pack(
-        side=tk.LEFT, padx=(8, 0)
-    )
-
-    btns = ttk.Frame(dlg)
-    btns.pack(fill=tk.X, padx=12, pady=12)
-
-    chosen_name: dict[str, str | None] = {"value": None}
-    chosen_workers: dict[str, int] = {"value": DEFAULT_PARALLEL_ANALYSIS_CHATS}
-
-    def on_ok() -> None:
-        chosen_name["value"] = (sel_var.get() or "").strip() or default_name
-        try:
-            nw = int(str(workers_var.get()).strip())
-        except (TypeError, ValueError):
-            nw = DEFAULT_PARALLEL_ANALYSIS_CHATS
-        chosen_workers["value"] = max(1, min(nw, PARALLEL_WORKERS_MAX))
-        try:
-            dlg.grab_release()
-        except tk.TclError:
-            pass
-        dlg.destroy()
-
-    def on_cancel() -> None:
-        chosen_name["value"] = None
-        try:
-            dlg.grab_release()
-        except tk.TclError:
-            pass
-        dlg.destroy()
-
-    ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
-    ttk.Button(btns, text="キャンセル", command=on_cancel).pack(side=tk.RIGHT, padx=(0, 8))
-
-    dlg.bind("<Return>", lambda _e: on_ok())
-    dlg.bind("<Escape>", lambda _e: on_cancel())
-    cb.focus_set()
-
-    dlg.update_idletasks()
-    _center_window_on_screen(dlg)
-    dlg.lift()
-    dlg.focus_force()
-
-    root.wait_window(dlg)
-
-    try:
-        root.grab_release()
-    except tk.TclError:
-        pass
-    root.update_idletasks()
-    root.deiconify()
-    root.lift()
-    root.focus_force()
-
-    if not chosen_name["value"]:
-        root.destroy()
-        sys.exit(0)
-
-    selected_name = str(chosen_name["value"])
-    selected = next(
-        (a for a in assistants if str(a.get("name") or "").strip() == selected_name),
-        None,
-    )
-    assistant_uid = ""
-    if selected:
-        raw = selected.get("uid")
-        if raw is None or str(raw).strip() == "":
-            raw = selected.get("uuid")
-        assistant_uid = str(raw).strip() if raw is not None else ""
-
-    if not assistant_uid:
-        messagebox.showerror(
-            "エラー",
-            f"アシスタント「{selected_name}」が見つかりません。",
-            parent=root,
-        )
-        root.destroy()
-        sys.exit(1)
-
-    # Windows では「最初の Tk を destroy したあとに 2 つ目の Tk を作る」と
-    # メインウィンドウが表示されないことがあるため、起動〜本画面まで同一の root を使う。
-    app = KintaiApp(
-        root,
-        client=client,
-        assistant_uid=assistant_uid,
-        parallel_workers=chosen_workers["value"],
-    )
+    app = KintaiApp(root, client=client, assistants=assistants)
     app.pack(fill=tk.BOTH, expand=True)
     root.update_idletasks()
     _center_window_on_screen(root)
