@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import ctypes
 from ctypes import wintypes
+from datetime import date
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -36,6 +38,49 @@ from newtonx_adk.exceptions import APIError
 
 _WIN32 = sys.platform == "win32"
 _STILL_ACTIVE = 259
+_YM_DIR_RE = re.compile(r"^(\d{4})年(\d{1,2})月$")
+
+
+def _today_year_month() -> tuple[int, int]:
+    """本日の年・月（データフォルダ名 YYYY年M月 と同じ暦年）。"""
+    today = date.today()
+    return today.year, today.month
+
+
+def _parse_year_month_dir_name(name: str) -> tuple[int, int] | None:
+    m = _YM_DIR_RE.fullmatch((name or "").strip())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _parse_data_dir_path(
+    path: Path,
+) -> tuple[Path | None, int | None, int | None, str]:
+    """パスから Data ルート・年・月・年月下のサブフォルダ（支社名等）を推定。"""
+    p = path.resolve()
+    parts = p.parts
+    for i, part in enumerate(parts):
+        ym = _parse_year_month_dir_name(part)
+        if ym is None:
+            continue
+        year, month = ym
+        root = Path(*parts[:i]) if i > 0 else None
+        ym_path = Path(*parts[: i + 1])
+        try:
+            rel = p.relative_to(ym_path)
+            branch = "" if str(rel) == "." else str(rel)
+        except ValueError:
+            branch = p.name
+        return root, year, month, branch
+    return None, None, None, ""
+
+
+def _guess_data_root() -> Path | None:
+    for cand in (_ROOT.parent / "Data", _ROOT / "Data"):
+        if cand.is_dir():
+            return cand.resolve()
+    return None
 
 
 class _ShellExecuteInfo(ctypes.Structure):
@@ -117,6 +162,8 @@ class KintaiApp(tk.Frame):
     LEGACY_FILE_NAME_COL = "画像ファイル名"
     USER_JUDGMENT_COL = "ユーザ判断"
     AUTO_JUDGMENT_COL = "自動判断"
+    YEAR_COL = "年"
+    MONTH_COL = "月"
     EMPLOYEE_NO_COL = "社員番号"
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
@@ -129,6 +176,8 @@ class KintaiApp(tk.Frame):
     _SYMBOL_COLUMN_WIDTHS: dict[str, int] = {
         "アップロード": 72,
         "対象シート有無": 88,
+        YEAR_COL: 56,
+        MONTH_COL: 56,
         USER_JUDGMENT_COL: 72,
         AUTO_JUDGMENT_COL: 72,
         MATCH_COMPANY_COL: 72,
@@ -153,6 +202,11 @@ class KintaiApp(tk.Frame):
         nw = int(parallel_workers)
         self._parallel_workers = max(1, min(nw, PARALLEL_WORKERS_MAX))
         self._data_dir: Path | None = None
+        self._data_root: Path | None = _guess_data_root()
+        self._data_branch: str = ""
+        default_year, default_month = _today_year_month()
+        self._year_var = tk.StringVar(value=str(default_year))
+        self._month_var = tk.StringVar(value=str(default_month))
         self._busy = False
         self._item_paths: dict[str, str] = {}
         self._preview_row_iid: str = ""
@@ -209,6 +263,30 @@ class KintaiApp(tk.Frame):
             row=0, column=2, sticky="e"
         )
         top.columnconfigure(1, weight=1)
+
+        ym_row = ttk.Frame(top)
+        ym_row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(ym_row, text="年度:").pack(side=tk.LEFT)
+        self._year_combo = ttk.Combobox(
+            ym_row,
+            textvariable=self._year_var,
+            width=8,
+            state="readonly",
+        )
+        self._year_combo.pack(side=tk.LEFT, padx=(4, 12))
+        self._year_combo.bind("<<ComboboxSelected>>", self._on_year_month_changed)
+
+        ttk.Label(ym_row, text="月:").pack(side=tk.LEFT)
+        self._month_combo = ttk.Combobox(
+            ym_row,
+            textvariable=self._month_var,
+            width=4,
+            state="readonly",
+        )
+        self._month_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self._month_combo.bind("<<ComboboxSelected>>", self._on_year_month_changed)
+
+        self._refresh_year_month_combos()
 
         ctrl = ttk.Frame(self, padding=(8, 0, 8, 8))
         ctrl.pack(fill=tk.X)
@@ -316,25 +394,124 @@ class KintaiApp(tk.Frame):
         self._root.minsize(min_w, 520)
         self._root.geometry(f"{initial_w}x680")
 
+        # 依存するUI部品（進捗・ボタン等）の生成後に data_dir を確定する
+        if self._data_root is not None:
+            self._apply_year_month_to_data_dir()
+
+    def _discover_years(self) -> list[str]:
+        today_y, _ = _today_year_month()
+        years: set[int] = {today_y, today_y - 1, today_y + 1}
+        if self._data_root is not None and self._data_root.is_dir():
+            for child in self._data_root.iterdir():
+                if not child.is_dir():
+                    continue
+                ym = _parse_year_month_dir_name(child.name)
+                if ym is not None:
+                    years.add(ym[0])
+        return [str(y) for y in sorted(years, reverse=True)]
+
+    def _discover_months(self, year: int) -> list[str]:
+        months: set[int] = set(range(1, 13))
+        if self._data_root is not None and self._data_root.is_dir():
+            for child in self._data_root.iterdir():
+                if not child.is_dir():
+                    continue
+                ym = _parse_year_month_dir_name(child.name)
+                if ym is not None and ym[0] == year:
+                    months.add(ym[1])
+        return [str(m) for m in sorted(months)]
+
+    def _refresh_year_month_combos(self) -> None:
+        years = self._discover_years()
+        if years:
+            self._year_combo.configure(values=years)
+            if self._year_var.get() not in years:
+                self._year_var.set(years[0])
+        try:
+            year = int(self._year_var.get().strip())
+        except ValueError:
+            year = _today_year_month()[0]
+        months = self._discover_months(year)
+        if months:
+            self._month_combo.configure(values=months)
+            if self._month_var.get() not in months:
+                self._month_var.set(months[-1])
+
+    def _expected_year_month(self) -> tuple[int | None, int | None]:
+        """画面上の年度・月コンボの値（run_analysis の照合用）。"""
+        try:
+            return (
+                int(self._year_var.get().strip()),
+                int(self._month_var.get().strip()),
+            )
+        except ValueError:
+            return None, None
+
+    def _apply_year_month_to_data_dir(self) -> None:
+        if self._data_root is None:
+            return
+        try:
+            year = int(self._year_var.get().strip())
+            month = int(self._month_var.get().strip())
+        except ValueError:
+            return
+        ym_dir = self._data_root / f"{year}年{month}月"
+        if self._data_branch:
+            branch_dir = ym_dir / self._data_branch
+            self._data_dir = branch_dir if branch_dir.is_dir() else ym_dir
+        else:
+            self._data_dir = ym_dir
+        if self._data_dir.is_dir():
+            self._folder_var.set(str(self._data_dir.resolve()))
+        else:
+            self._folder_var.set(f"{ym_dir}（存在しません）")
+        self._update_data_dir_dependent_buttons()
+
+    def _update_data_dir_dependent_buttons(self) -> None:
+        has_dir = self._data_dir is not None and self._data_dir.is_dir()
+        if self._busy:
+            return
+        self._progress_var.set("")
+        self._new_btn.configure(state=(tk.NORMAL if has_dir else tk.DISABLED))
+        self._cont_btn.configure(
+            state=(tk.NORMAL if (has_dir and self._loaded_rows) else tk.DISABLED)
+        )
+        self._save_btn.configure(
+            state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED)
+        )
+        self._cancel_btn.configure(state=tk.DISABLED)
+        self._refresh_error_reanalysis_button_state()
+
+    def _on_year_month_changed(self, _event: tk.Event | None = None) -> None:
+        self._refresh_year_month_combos()
+        self._apply_year_month_to_data_dir()
+
+    def _set_data_path(self, path: Path) -> None:
+        """参照フォルダまたは JSON の data_dir からルート・年月・表示を同期する。"""
+        root, year, month, branch = _parse_data_dir_path(path)
+        if root is not None:
+            self._data_root = root
+        if year is not None:
+            self._year_var.set(str(year))
+        if month is not None:
+            self._month_var.set(str(month))
+        self._data_branch = branch
+        self._data_dir = path.resolve()
+        self._folder_var.set(str(self._data_dir))
+        self._refresh_year_month_combos()
+        self._update_data_dir_dependent_buttons()
+
     def _browse_folder(self) -> None:
         self._prepare_native_dialog()
+        initial = self._data_dir or self._data_root
         d = filedialog.askdirectory(
             title="データを読み込むフォルダを選択",
             parent=self._root,
+            initialdir=str(initial) if initial else None,
         )
         if not d:
             return
-        self._data_dir = Path(d)
-        self._folder_var.set(str(self._data_dir.resolve()))
-        if not self._busy:
-            self._progress_var.set("")
-            self._new_btn.configure(state=tk.NORMAL)
-            self._cont_btn.configure(
-                state=(tk.NORMAL if self._loaded_rows else tk.DISABLED)
-            )
-            self._save_btn.configure(state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED))
-            self._cancel_btn.configure(state=tk.DISABLED)
-            self._refresh_error_reanalysis_button_state()
+        self._set_data_path(Path(d))
 
     def _should_ignore_status_log(self, message: str) -> bool:
         """run_analysis(on_log=...) 経由で流れてくるログのうち、
@@ -495,6 +672,8 @@ class KintaiApp(tk.Frame):
             ("アップロード", "upload_ok"),
             ("対象シート有無", "target_sheet_exists"),
             (self.USER_JUDGMENT_COL, "user_judgment_company"),
+            (self.YEAR_COL, "year"),
+            (self.MONTH_COL, "month"),
             (self.COMPANY1_COL, "name_company_1"),
             ("氏名", "name_person_from_doc"),
             (self.EMPLOYEE_NO_COL, "employee_no"),
@@ -508,6 +687,10 @@ class KintaiApp(tk.Frame):
                 val = str(row.get(ui_key) or "").strip()
             elif core_key == "file_name":
                 val = self._file_name_from_row(row)
+            elif core_key == "year":
+                val = str(row.get(core_key) or self._year_var.get() or "").strip()
+            elif core_key == "month":
+                val = str(row.get(core_key) or self._month_var.get() or "").strip()
             elif core_key == "match_company":
                 val = str(
                     row.get(core_key)
@@ -520,6 +703,11 @@ class KintaiApp(tk.Frame):
                 out[core_key] = normalize_judgment_symbol(val) if val else ""
             else:
                 out[core_key] = val
+        ey, em = self._expected_year_month()
+        if ey is not None:
+            out["expected_year"] = str(ey)
+        if em is not None:
+            out["expected_month"] = str(em)
         return out
 
     def _grid_values_from_row(self, row: dict[str, str]) -> tuple[str, ...]:
@@ -669,6 +857,7 @@ class KintaiApp(tk.Frame):
             result_rows: list[dict[str, str]] | None = None
             err: BaseException | None = None
             try:
+                exp_y, exp_m = self._expected_year_month()
                 result_rows = run_analysis(
                     client,
                     aid,
@@ -680,6 +869,8 @@ class KintaiApp(tk.Frame):
                     cancel_event=self._cancel_event,
                     target_file_names={file_name},
                     parallel_chats=1,
+                    expected_year=exp_y,
+                    expected_month=exp_m,
                 )
             except BaseException as e:
                 err = e
@@ -834,6 +1025,7 @@ class KintaiApp(tk.Frame):
         def worker() -> None:
             err: BaseException | None = None
             try:
+                exp_y, exp_m = self._expected_year_month()
                 run_analysis(
                     client,
                     aid,
@@ -847,6 +1039,8 @@ class KintaiApp(tk.Frame):
                     cancel_event=self._cancel_event,
                     target_file_names=file_names,
                     parallel_chats=self._parallel_workers,
+                    expected_year=exp_y,
+                    expected_month=exp_m,
                 )
             except BaseException as e:
                 err = e
@@ -1159,14 +1353,12 @@ class KintaiApp(tk.Frame):
         # data_dir は読み込みJSONを優先してセット（空なら維持）
         dd = (data.get("data_dir") or "").strip()
         if dd:
-            self._data_dir = Path(dd)
-            self._folder_var.set(str(self._data_dir.resolve()))
+            self._set_data_path(Path(dd))
 
         self._rebuild_grid_from_rows(self._loaded_rows)
         self._save_btn.configure(state=(tk.NORMAL if self._loaded_rows else tk.DISABLED))
-        if not self._busy:
-            self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
-            self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and self._loaded_rows) else tk.DISABLED))
+        if not self._busy and not dd:
+            self._update_data_dir_dependent_buttons()
         self._refresh_error_reanalysis_button_state()
         ratio_text = self._company_match_ratio_text(self._loaded_rows)
         self._status_var.set(f"読み込みました: {self._loaded_json_path} / {ratio_text}")
@@ -1366,6 +1558,7 @@ class KintaiApp(tk.Frame):
                         if fn:
                             skip_names.add(fn)
 
+                exp_y, exp_m = self._expected_year_month()
                 rows_result = run_analysis(
                     client,
                     aid,
@@ -1378,6 +1571,8 @@ class KintaiApp(tk.Frame):
                     cancel_event=self._cancel_event,
                     skip_file_names=skip_names,
                     parallel_chats=self._parallel_workers,
+                    expected_year=exp_y,
+                    expected_month=exp_m,
                 )
             except BaseException as e:
                 err = e
