@@ -169,6 +169,7 @@ class KintaiApp(tk.Frame):
     EMPLOYEE_NO_COL = "社員番号"
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
+    TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
     MATCH_COMPANY_COL = "会社名比較"
     LEGACY_MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
     COMPANY1_COL = "会社名1"
@@ -215,9 +216,9 @@ class KintaiApp(tk.Frame):
         self._data_dir: Path | None = None
         self._data_root: Path | None = _guess_data_root()
         self._data_branch: str = ""
-        default_year, default_month = _today_year_month()
+        default_year, _ = _today_year_month()
         self._year_var = tk.StringVar(value=str(default_year))
-        self._month_var = tk.StringVar(value=str(default_month))
+        self._month_var = tk.StringVar(value="")
         self._busy = False
         self._item_paths: dict[str, str] = {}
         self._preview_row_iid: str = ""
@@ -538,7 +539,8 @@ class KintaiApp(tk.Frame):
         months = self._discover_months(year)
         if months:
             self._month_combo.configure(values=months)
-            if self._month_var.get() not in months:
+            cur_m = self._month_var.get().strip()
+            if cur_m and cur_m not in months:
                 self._month_var.set(months[-1])
 
     def _expected_year_month(self) -> tuple[int | None, int | None]:
@@ -783,6 +785,7 @@ class KintaiApp(tk.Frame):
             (self.EMPLOYEE_NO_COL, "employee_no"),
             (self.TOTAL_HOURS_DECIMAL_COL, "total_hours_decimal"),
             (self.TOTAL_HOURS_RAW_COL, "total_hours_raw"),
+            (self.TRANSPORT_EXPENSE_COL, "transport_expense_raw"),
             (self.MATCH_COMPANY_COL, "match_company"),
             ("押印有無", "seal_in_doc"),
         )
