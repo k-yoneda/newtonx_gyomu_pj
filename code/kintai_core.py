@@ -43,6 +43,8 @@ PARALLEL_WORKERS_MAX = 32
 # グリッド・集計表の先頭列（〇: リトライ上限内でアップロード成功 / ✖: それ以外）
 SUMMARY_UPLOAD_COL = "アップロード"
 SUMMARY_TARGET_SHEET_COL = "対象シート有無"
+TARGET_FILE_NAME_COL = "対象ファイル名"
+LEGACY_FILE_NAME_COL = "画像ファイル名"
 
 #TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
 TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
@@ -508,7 +510,8 @@ _KINTAI_HEADER_CELLS: frozenset[str] = frozenset(
         "押印有無",
         "押印",
         "有無",
-        "画像ファイル名",
+        TARGET_FILE_NAME_COL,
+        LEGACY_FILE_NAME_COL,
         "ファイル名",
     }
 )
@@ -547,7 +550,10 @@ def _kintai_header_col_roles(cells: list[str]) -> dict[str, int] | None:
             roles["th"] = j
         elif "se" not in roles and (t in ("押印有無",) or ("押印" in t) or t == "有無"):
             roles["se"] = j
-        elif "fn" not in roles and (("画像" in t and "ファイル" in t) or t in ("ファイル名",) or t == "画像ファイル名"):
+        elif "fn" not in roles and (
+            t in (TARGET_FILE_NAME_COL, LEGACY_FILE_NAME_COL, "ファイル名")
+            or (("画像" in t or "対象" in t) and "ファイル" in t)
+        ):
             roles["fn"] = j
     if "co" in roles and "pe" in roles:
         return roles
@@ -1182,7 +1188,7 @@ def _upload_http_error_should_recreate_chat(exc: BaseException) -> bool:
 
 
 SUMMARY_MD_HEADER = (
-    f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | 画像ファイル名 | ユーザ判断 | 自動判断 | "
+    f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | {TARGET_FILE_NAME_COL} | ユーザ判断 | 自動判断 | "
     "会社名1 | 氏名 | 社員番号 | 合計勤務時間（10進） | 合計勤務時間（読取） | "
     "会社名比較 | 押印有無 |"
 )

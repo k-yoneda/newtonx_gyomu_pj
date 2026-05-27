@@ -113,6 +113,8 @@ def _try_close_excel_workbook(path: Path) -> bool:
 
 
 class KintaiApp(tk.Frame):
+    TARGET_FILE_NAME_COL = "対象ファイル名"
+    LEGACY_FILE_NAME_COL = "画像ファイル名"
     USER_JUDGMENT_COL = "ユーザ判断"
     AUTO_JUDGMENT_COL = "自動判断"
     EMPLOYEE_NO_COL = "社員番号"
@@ -306,7 +308,7 @@ class KintaiApp(tk.Frame):
         grid_frame.columnconfigure(0, weight=1)
 
         self._tree.bind("<Button-3>", self._on_tree_right_click)
-        self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self._tree.bind("<Button-1>", self._on_tree_left_click, add="+")
         self._tree.bind("<Double-1>", self._on_row_double_click)
 
         initial_w = self._window_width_for_columns(col_px, y_scroll=y_scroll)
@@ -403,7 +405,7 @@ class KintaiApp(tk.Frame):
         if self._data_dir is None:
             return None
         row = self._current_row_dict_from_iid(rid)
-        fn = (row.get("画像ファイル名") or row.get("file_name") or "").strip()
+        fn = self._file_name_from_row(row)
         if not fn:
             return None
         p = (self._data_dir / fn).resolve()
@@ -440,13 +442,26 @@ class KintaiApp(tk.Frame):
         self._preview_file_path = path
         self._preview_process_handle = handle
 
-    def _on_tree_select(self, _event: tk.Event | None = None) -> None:
-        """行選択時にファイルを開き、別行選択時は前のファイルを閉じる。"""
-        sel = self._tree.selection()
-        if not sel:
-            self._close_row_file()
+    def _column_index_at_event(self, event: tk.Event) -> int:
+        if self._tree.identify_region(event.x, event.y) != "cell":
+            return -1
+        col_w = self._tree.identify_column(event.x)
+        try:
+            return int(col_w.replace("#", "")) - 1
+        except ValueError:
+            return -1
+
+    def _on_tree_left_click(self, event: tk.Event) -> None:
+        """対象ファイル名列の左クリックでファイルを開く（別行なら前のファイルを閉じる）。"""
+        rid = self._tree.identify_row(event.y)
+        if not rid:
             return
-        self._open_row_file(sel[0])
+        cols = list(self._tree["columns"])
+        ci = self._column_index_at_event(event)
+        if not (0 <= ci < len(cols) and cols[ci] == self.TARGET_FILE_NAME_COL):
+            return
+        self._tree.selection_set(rid)
+        self._open_row_file(rid)
 
     def _prepare_native_dialog(self) -> None:
         """Windows/Tk でネイティブダイアログが背面化・ハング見えしないよう状態を整える。"""
@@ -464,11 +479,19 @@ class KintaiApp(tk.Frame):
         except tk.TclError:
             pass
 
+    def _file_name_from_row(self, row: dict[str, str]) -> str:
+        return (
+            row.get(self.TARGET_FILE_NAME_COL)
+            or row.get(self.LEGACY_FILE_NAME_COL)
+            or row.get("file_name")
+            or ""
+        ).strip()
+
     def _row_dict_to_core(self, row: dict[str, str]) -> dict[str, str]:
         """Treeview/JSON 行を kintai_core 互換 dict に変換する。"""
         out = dict(row)
         pairs = (
-            ("画像ファイル名", "file_name"),
+            (self.TARGET_FILE_NAME_COL, "file_name"),
             ("アップロード", "upload_ok"),
             ("対象シート有無", "target_sheet_exists"),
             (self.USER_JUDGMENT_COL, "user_judgment_company"),
@@ -483,6 +506,8 @@ class KintaiApp(tk.Frame):
         for ui_key, core_key in pairs:
             if ui_key in row:
                 val = str(row.get(ui_key) or "").strip()
+            elif core_key == "file_name":
+                val = self._file_name_from_row(row)
             elif core_key == "match_company":
                 val = str(
                     row.get(core_key)
@@ -607,7 +632,7 @@ class KintaiApp(tk.Frame):
         # 選択行の「再解析」は、会社名1の内容に関わらず実行可能とする。
         # （不明/（存在しない）のみ一括で再解析したい場合は「エラー再解析」ボタンを使用。）
 
-        file_name = (current_row.get("画像ファイル名") or current_row.get("file_name") or "").strip()
+        file_name = self._file_name_from_row(current_row)
         if not file_name:
             messagebox.showinfo("再解析", "選択行のファイル名を取得できません。")
             return
@@ -715,7 +740,7 @@ class KintaiApp(tk.Frame):
         iid_by_file: dict[str, str] = {}
         for iid in target_iids:
             row = self._current_row_dict_from_iid(iid)
-            file_name = (row.get("画像ファイル名") or row.get("file_name") or "").strip()
+            file_name = self._file_name_from_row(row)
             if not file_name:
                 continue
             iid_by_file[file_name] = iid
@@ -1292,7 +1317,7 @@ class KintaiApp(tk.Frame):
             # 継続解析時に既存行の情報を落とさないよう、UI行をできるだけ保持したまま
             # kintai_core が参照するキーへ寄せる。
             out: dict[str, str] = dict(r)
-            out["file_name"] = (r.get("画像ファイル名") or r.get("file_name") or "").strip()
+            out["file_name"] = self._file_name_from_row(r)
             out["resolved_path"] = (r.get("resolved_path") or "").strip()
             uj = (r.get(self.USER_JUDGMENT_COL) or r.get("user_judgment_company") or "").strip()
             if uj:
@@ -1337,7 +1362,7 @@ class KintaiApp(tk.Frame):
                     for br in base_rows:
                         if not isinstance(br, dict):
                             continue
-                        fn = (br.get("画像ファイル名") or br.get("file_name") or "").strip()
+                        fn = self._file_name_from_row(br)
                         if fn:
                             skip_names.add(fn)
 
@@ -1444,15 +1469,12 @@ class KintaiApp(tk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_row_double_click(self, event: tk.Event) -> None:
-        if self._tree.identify_region(event.x, event.y) == "cell":
-            col_w = self._tree.identify_column(event.x)
-            try:
-                ci = int(col_w.replace("#", "")) - 1
-            except ValueError:
-                ci = -1
-            cols = list(self._tree["columns"])
-            if 0 <= ci < len(cols) and cols[ci] == self.USER_JUDGMENT_COL:
-                return
+        cols = list(self._tree["columns"])
+        ci = self._column_index_at_event(event)
+        if 0 <= ci < len(cols) and cols[ci] == self.USER_JUDGMENT_COL:
+            return
+        if not (0 <= ci < len(cols) and cols[ci] == self.TARGET_FILE_NAME_COL):
+            return
         rid = self._tree.identify_row(event.y)
         if not rid:
             return

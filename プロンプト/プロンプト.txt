@@ -1,12 +1,12 @@
 SUMMARY_MD_HEADER = (
-    f"| {SUMMARY_UPLOAD_COL} | 画像ファイル名 | {SUMMARY_TARGET_SHEET_COL} | 会社名1 | 氏名 | 社員番号 | "
+    f"| {SUMMARY_UPLOAD_COL} | 対象ファイル名 | {SUMMARY_TARGET_SHEET_COL} | 会社名1 | 氏名 | 社員番号 | "
     "合計勤務時間（10進） | 合計勤務時間（読取） | 押印有無 | "
     "会社名比較（ファイル名✖文書） | ユーザ判断 |"
 )
 の並びを以下のように変更してください。
 行単位の値の編集機能などは、元の列の名前の通り動作させてください。
 SUMMARY_MD_HEADER = (
-    f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | 画像ファイル名 | ユーザ判断 |  会社名1 | 氏名 | 社員番号 | "
+    f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | 対象ファイル名 | ユーザ判断 |  会社名1 | 氏名 | 社員番号 | "
     "合計勤務時間（10進） | 合計勤務時間（読取） | 会社名比較（ファイル名✖文書） | 押印有無 | "
 )
 
