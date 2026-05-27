@@ -228,6 +228,7 @@ class KintaiApp(tk.Frame):
         self._loaded_rows: list[dict[str, str]] = []
         self._loaded_json_path: Path | None = None
         self._last_saved_snapshot: str = ""
+        self._chain_error_reanalysis_after_new = False
 
         self._build_ui()
 
@@ -376,10 +377,18 @@ class KintaiApp(tk.Frame):
         )
         self._new_btn.grid(row=0, column=0, sticky="w")
 
+        self._new_plus_error_btn = ttk.Button(
+            ctrl,
+            text="新規解析＋エラー再解析",
+            command=self._start_new_analysis_then_error_reanalysis,
+            state=tk.DISABLED,
+        )
+        self._new_plus_error_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
         self._cont_btn = ttk.Button(
             ctrl, text="継続解析", command=self._start_continue_analysis, state=tk.DISABLED
         )
-        self._cont_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self._cont_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         self._selected_reanalysis_btn = ttk.Button(
             ctrl,
@@ -387,22 +396,22 @@ class KintaiApp(tk.Frame):
             command=self._start_selected_rows_reanalysis,
             state=tk.DISABLED,
         )
-        self._selected_reanalysis_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self._selected_reanalysis_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
 
         self._save_btn = ttk.Button(
             ctrl, text="保存", command=self._save_json, state=tk.DISABLED
         )
-        self._save_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self._save_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
 
         self._load_btn = ttk.Button(
             ctrl, text="読み込み", command=self._load_json, state=tk.NORMAL
         )
-        self._load_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
+        self._load_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
 
         self._cancel_btn = ttk.Button(
             ctrl, text="中断", command=self._cancel_analysis, state=tk.DISABLED
         )
-        self._cancel_btn.grid(row=0, column=5, sticky="w", padx=(16, 0))
+        self._cancel_btn.grid(row=0, column=6, sticky="w", padx=(16, 0))
 
         # 中断の右: エラー再解析（ユーザ判断が「〇」以外の行のみを対象に再解析）
         self._error_reanalysis_btn = ttk.Button(
@@ -411,7 +420,7 @@ class KintaiApp(tk.Frame):
             command=self._start_error_reanalysis,
             state=tk.DISABLED,
         )
-        self._error_reanalysis_btn.grid(row=0, column=6, sticky="w", padx=(8, 0))
+        self._error_reanalysis_btn.grid(row=0, column=7, sticky="w", padx=(8, 0))
 
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
@@ -419,10 +428,10 @@ class KintaiApp(tk.Frame):
         # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
         # （環境によってフォントが少し太く、26文字だと末尾が欠けるケースがあったため更に増やす）
         ttk.Label(ctrl, textvariable=self._progress_var, width=30).grid(
-            row=0, column=7, sticky="w", padx=(16, 0)
+            row=0, column=8, sticky="w", padx=(16, 0)
         )
         # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
-        ctrl.columnconfigure(7, minsize=240)
+        ctrl.columnconfigure(8, minsize=240)
 
         self._status_label = ttk.Label(
             ctrl,
@@ -432,8 +441,8 @@ class KintaiApp(tk.Frame):
             wraplength=900,
             justify="left",
         )
-        self._status_label.grid(row=0, column=8, sticky="ew", padx=(12, 0))
-        ctrl.columnconfigure(8, weight=1)
+        self._status_label.grid(row=0, column=9, sticky="ew", padx=(12, 0))
+        ctrl.columnconfigure(9, weight=1)
 
         grid_frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         grid_frame.pack(fill=tk.BOTH, expand=True)
@@ -548,6 +557,7 @@ class KintaiApp(tk.Frame):
             return
         self._progress_var.set("")
         self._new_btn.configure(state=(tk.NORMAL if has_dir else tk.DISABLED))
+        self._new_plus_error_btn.configure(state=(tk.NORMAL if has_dir else tk.DISABLED))
         self._cont_btn.configure(
             state=(tk.NORMAL if (has_dir and self._loaded_rows) else tk.DISABLED)
         )
@@ -989,6 +999,7 @@ class KintaiApp(tk.Frame):
         self._busy = True
         self._cancel_event = threading.Event()
         self._new_btn.configure(state=tk.DISABLED)
+        self._new_plus_error_btn.configure(state=tk.DISABLED)
         self._cont_btn.configure(state=tk.DISABLED)
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
@@ -1044,6 +1055,9 @@ class KintaiApp(tk.Frame):
                 self._set_row_reanalysis_highlight(rid, False)
 
                 self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
+                self._new_plus_error_btn.configure(
+                    state=(tk.NORMAL if self._data_dir else tk.DISABLED)
+                )
                 self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and (self._loaded_rows or self._tree.get_children())) else tk.DISABLED))
                 self._save_btn.configure(state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED))
                 self._load_btn.configure(state=tk.NORMAL)
@@ -1110,6 +1124,7 @@ class KintaiApp(tk.Frame):
         self._busy = True
         self._cancel_event = threading.Event()
         self._new_btn.configure(state=tk.DISABLED)
+        self._new_plus_error_btn.configure(state=tk.DISABLED)
         self._cont_btn.configure(state=tk.DISABLED)
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
@@ -1211,6 +1226,9 @@ class KintaiApp(tk.Frame):
                 self._set_rows_reanalysis_highlight(target_iids, False)
 
                 self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
+                self._new_plus_error_btn.configure(
+                    state=(tk.NORMAL if self._data_dir else tk.DISABLED)
+                )
                 self._cont_btn.configure(
                     state=(
                         tk.NORMAL
@@ -1742,11 +1760,17 @@ class KintaiApp(tk.Frame):
 
     def _start_new_analysis(self) -> None:
         # 新規解析: グリッドをクリアして最初から
+        self._chain_error_reanalysis_after_new = False
         self._loaded_rows = []
         self._loaded_json_path = None
         self._last_saved_snapshot = ""
         self._update_title()
         self._start_analysis(base_rows=None)
+
+    def _start_new_analysis_then_error_reanalysis(self) -> None:
+        """新規解析の正常完了後に、エラー再解析を続けて実行する（中断時は行わない）。"""
+        self._chain_error_reanalysis_after_new = True
+        self._start_new_analysis()
 
     def _start_continue_analysis(self) -> None:
         # 継続解析: 読み込み済み（または現在表示）の状態を起点
@@ -1763,6 +1787,7 @@ class KintaiApp(tk.Frame):
         self._busy = True
         self._cancel_event = threading.Event()
         self._new_btn.configure(state=tk.DISABLED)
+        self._new_plus_error_btn.configure(state=tk.DISABLED)
         self._cont_btn.configure(state=tk.DISABLED)
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
@@ -1923,6 +1948,8 @@ class KintaiApp(tk.Frame):
                 self._cancel_btn.configure(state=tk.DISABLED)
                 cancelled = self._cancel_event is not None and self._cancel_event.is_set()
                 self._cancel_event = None
+                chain_error = self._chain_error_reanalysis_after_new
+                self._chain_error_reanalysis_after_new = False
 
                 # --- 途中結果の確定（エラー時も含む） ---
                 # エラー発生時は worker で rows_result が None になりやすい。
@@ -1949,8 +1976,10 @@ class KintaiApp(tk.Frame):
                 # --- UIボタン復帰 ---
                 if self._data_dir is not None:
                     self._new_btn.configure(state=tk.NORMAL)
+                    self._new_plus_error_btn.configure(state=tk.NORMAL)
                 else:
                     self._new_btn.configure(state=tk.DISABLED)
+                    self._new_plus_error_btn.configure(state=tk.DISABLED)
 
                 # 継続解析は「途中結果がある」ならエラー/中断でも有効
                 self._cont_btn.configure(state=(tk.NORMAL if self._loaded_rows else tk.DISABLED))
@@ -1978,12 +2007,20 @@ class KintaiApp(tk.Frame):
                     self._status_var.set(
                         f"中断しました: {n_rows} 件を保持（JSON保存で続きから再開できます） / {ratio_text}"
                     )
-                else:
-                    self._status_var.set(
-                        f"完了: {n_rows} 件をグリッド表示（解析結果.md を出力） / {ratio_text}"
-                    )
+                    self._refresh_reanalysis_buttons_state()
+                    return
 
+                self._status_var.set(
+                    f"完了: {n_rows} 件をグリッド表示（解析結果.md を出力） / {ratio_text}"
+                )
                 self._refresh_reanalysis_buttons_state()
+
+                if chain_error:
+                    self._status_var.set(
+                        f"新規解析が完了しました。エラー再解析を開始します… / {ratio_text}"
+                    )
+                    self.after(0, self._start_error_reanalysis)
+                    return
 
             self.after(0, finish)
 
