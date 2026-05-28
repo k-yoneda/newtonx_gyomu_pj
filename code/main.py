@@ -2080,9 +2080,24 @@ class KintaiApp(tk.Frame):
         self._close_row_file()
         self._root.destroy()
 
-    def _start_new_analysis(self) -> None:
+    def _confirm_clear_grid_for_new_analysis(self) -> bool:
+        """グリッドに行があるとき、新規解析でデータが消える旨を確認する。"""
+        if not self._tree.get_children():
+            return True
+        return messagebox.askokcancel(
+            "新規解析",
+            "グリッドに表示されているデータは、新規解析を開始するとすべて消えます。\n\n"
+            "続行しますか？",
+            parent=self._root,
+        )
+
+    def _start_new_analysis(self, *, chain_error_reanalysis_after: bool = False) -> None:
+        if self._busy:
+            return
+        if not self._confirm_clear_grid_for_new_analysis():
+            return
         # 新規解析: グリッドをクリアして最初から
-        self._chain_error_reanalysis_after_new = False
+        self._chain_error_reanalysis_after_new = chain_error_reanalysis_after
         self._loaded_rows = []
         self._loaded_json_path = None
         self._last_saved_snapshot = ""
@@ -2091,8 +2106,7 @@ class KintaiApp(tk.Frame):
 
     def _start_new_analysis_then_error_reanalysis(self) -> None:
         """新規解析の正常完了後に、エラー再解析を続けて実行する（中断時は行わない）。"""
-        self._chain_error_reanalysis_after_new = True
-        self._start_new_analysis()
+        self._start_new_analysis(chain_error_reanalysis_after=True)
 
     def _start_continue_analysis(self) -> None:
         # 継続解析: 読み込み済み（または現在表示）の状態を起点
