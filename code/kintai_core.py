@@ -28,7 +28,9 @@ PDF_SUFFIX = ".pdf"
 EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 TARGET_EXCEL_SHEET_NAME = "タイムシート兼作業報告書_お客様先用"
 TRANSPORT_EXPENSE_EXCEL_SHEET_NAME = "交通宿泊費清算書お客様先用"
-TRANSPORT_EXPENSE_EXCEL_CELL = "G44"
+TRANSPORT_EXPENSE_LABEL_COL = 6  # F列: 「合計」ラベル
+TRANSPORT_EXPENSE_VALUE_COL = 7  # G列: 交通費合計の値
+TRANSPORT_EXPENSE_LABEL_TEXT = "合計"
 SUMMARY_TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
 
 # アップロード: 初回試行後、最大 UPLOAD_MAX_RETRIES 回まで再試行（合計で最大 1 + UPLOAD_MAX_RETRIES 回）
@@ -339,8 +341,23 @@ def _employee_no_from_file_name(file_name: str) -> str:
     return "社員番号エラー"
 
 
+def _excel_transport_expense_from_sheet(ws) -> str:
+    """交通宿泊費清算書シートで F列を下から走査し、「合計」行の G列を返す。"""
+    max_row = ws.max_row or 0
+    for row_idx in range(max_row, 0, -1):
+        label = _excel_cell_value_to_raw_text(
+            ws.cell(row=row_idx, column=TRANSPORT_EXPENSE_LABEL_COL).value
+        )
+        if label != TRANSPORT_EXPENSE_LABEL_TEXT:
+            continue
+        return _excel_cell_value_to_raw_text(
+            ws.cell(row=row_idx, column=TRANSPORT_EXPENSE_VALUE_COL).value
+        ).strip()
+    return ""
+
+
 def _attach_excel_transport_expense(row: dict[str, str], file_path: Path) -> None:
-    """交通宿泊費清算書お客様先用 シートの G44 を交通費合計（読取）に設定する。"""
+    """交通宿泊費清算書お客様先用 シートから交通費合計（読取）を設定する。"""
     if _filename_has_transport_expense_marker(file_path.name):
         # ファイル名に「交通費」があるのに取得できないケースは（不明）にする
         row.setdefault("transport_expense_raw", "（不明）")
@@ -354,10 +371,7 @@ def _attach_excel_transport_expense(row: dict[str, str], file_path: Path) -> Non
     try:
         wb = load_workbook(file_path, data_only=True, read_only=True)
         ws = wb[TRANSPORT_EXPENSE_EXCEL_SHEET_NAME]
-        v = _excel_cell_value_to_raw_text(
-            ws[TRANSPORT_EXPENSE_EXCEL_CELL].value
-        )
-        row["transport_expense_raw"] = v.strip() if v is not None else ""
+        row["transport_expense_raw"] = _excel_transport_expense_from_sheet(ws)
     except Exception:
         pass
     finally:
