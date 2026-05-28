@@ -53,6 +53,7 @@ from kintai_core import (
     row_display_values,
     run_analysis,
     summary_header_cells,
+    update_billing_engineer_ts_sheet,
 )
 from newtonx_adk.exceptions import APIError
 
@@ -707,6 +708,27 @@ class KintaiApp(tk.Frame):
         self._sync_billing_file_display()
         self._refresh_billing_update_button_state()
 
+    def _final_judgment_symbol_from_row(self, row: dict[str, str]) -> str:
+        return normalize_judgment_symbol(
+            (
+                row.get(self.FINAL_JUDGMENT_COL)
+                or row.get(self.LEGACY_USER_JUDGMENT_COL)
+                or row.get("user_judgment_company")
+                or ""
+            ).strip()
+        )
+
+    def _set_billing_update_result_cell(self, rid: str, symbol: str) -> None:
+        try:
+            ci = list(self._tree["columns"]).index(self.BILLING_UPDATE_RESULT_COL)
+        except ValueError:
+            return
+        vals = list(self._tree.item(rid, "values") or [])
+        while len(vals) <= ci:
+            vals.append("")
+        vals[ci] = symbol
+        self._tree.item(rid, values=tuple(vals))
+
     def _update_billing_file(self) -> None:
         if self._busy:
             return
@@ -717,19 +739,60 @@ class KintaiApp(tk.Frame):
                 parent=self._root,
             )
             return
-        rows = self._current_grid_rows()
-        if not rows:
+        targets: list[tuple[str, dict[str, str]]] = []
+        for iid in self._tree.get_children():
+            ui_row = self._current_row_dict_from_iid(iid)
+            if self._final_judgment_symbol_from_row(ui_row) != "〇":
+                continue
+            targets.append((iid, self._row_dict_to_core(ui_row)))
+        if not targets:
             messagebox.showinfo(
                 "請求ファイル更新",
-                "グリッドに反映するデータがありません。",
+                "最終判断が「〇」の行がありません。",
                 parent=self._root,
             )
             return
+        if not messagebox.askokcancel(
+            "請求ファイル更新",
+            "最終判断列が〇のレコードについて、請求用ファイルを更新します。",
+            parent=self._root,
+        ):
+            return
+        try:
+            results = update_billing_engineer_ts_sheet(
+                self._billing_file_path,
+                [core_row for _, core_row in targets],
+            )
+        except OSError as e:
+            messagebox.showerror(
+                "請求ファイル更新",
+                f"請求用ファイルを保存できませんでした。\n\n{e}",
+                parent=self._root,
+            )
+            return
+        except Exception as e:
+            messagebox.showerror(
+                "請求ファイル更新",
+                f"請求用ファイルの更新に失敗しました。\n\n{e}",
+                parent=self._root,
+            )
+            return
+        ok_count = 0
+        for (iid, _), symbol in zip(targets, results, strict=True):
+            self._set_billing_update_result_cell(iid, symbol)
+            if symbol == "〇":
+                ok_count += 1
+        fail_count = len(targets) - ok_count
+        self._loaded_rows = self._current_grid_rows()
+        self._status_var.set(
+            f"請求ファイル更新完了: 成功 {ok_count} 件 / 失敗 {fail_count} 件 "
+            f"（対象 {len(targets)} 件）"
+        )
         messagebox.showinfo(
             "請求ファイル更新",
             (
                 f"請求用ファイル:\n{self._billing_file_path.name}\n\n"
-                "請求ファイルへの反映処理は未実装です。"
+                f"成功: {ok_count} 件\n失敗: {fail_count} 件"
             ),
             parent=self._root,
         )

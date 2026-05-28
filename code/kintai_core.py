@@ -61,6 +61,10 @@ LEGACY_EMPLOYEE_NO_COL = "社員番号"
 SUMMARY_FINAL_JUDGMENT_COL = "最終判断"
 LEGACY_USER_JUDGMENT_COL = "ユーザ判断"
 SUMMARY_BILLING_UPDATE_RESULT_COL = "請求量ファイル更新結果"
+BILLING_ENGINEER_TS_SHEET_NAME = "エンジニアTS一覧"
+BILLING_TS_COL_EMPLOYEE_NO = 1  # A列
+BILLING_TS_COL_NORMAL_HOURS = 8  # H列: 通常請求時間
+BILLING_TS_COL_TRANSPORT_AMOUNT = 15  # O列: 旅費交通費請求金額
 
 #TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
 TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
@@ -1656,6 +1660,146 @@ def _billing_file_update_result_display(row: dict[str, str]) -> str:
         or row.get(SUMMARY_BILLING_UPDATE_RESULT_COL)
         or ""
     ).strip()
+
+
+def _row_employee_no(row: dict[str, str]) -> str:
+    return (
+        row.get("employee_no")
+        or row.get(SUMMARY_EMPLOYEE_NO_COL)
+        or row.get(LEGACY_EMPLOYEE_NO_COL)
+        or ""
+    ).strip()
+
+
+def _row_total_hours_decimal(row: dict[str, str]) -> str:
+    return (
+        row.get("total_hours_decimal")
+        or row.get("合計勤務時間（10進）")
+        or ""
+    ).strip()
+
+
+def _row_transport_expense_raw(row: dict[str, str]) -> str:
+    return (
+        row.get("transport_expense_raw")
+        or row.get(SUMMARY_TRANSPORT_EXPENSE_COL)
+        or ""
+    ).strip()
+
+
+def _normalize_employee_no_cell_value(value: object) -> str:
+    """Excel A列などの社員番号セルを照合用キーに正規化する。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        if value == int(value):
+            n = int(value)
+            if 0 < n < 10_000_000:
+                s = str(n)
+                if s.isdigit() and len(s) == 7:
+                    return s
+                if len(s) <= 7 and s.isdigit():
+                    return s.zfill(7)
+    t = unicodedata.normalize("NFKC", str(value).strip())
+    if not t or t == "社員番号エラー":
+        return ""
+    if t.isdigit() and len(t) == 7:
+        return t
+    if re.fullmatch(r"BP\d{5}", t, re.IGNORECASE):
+        return t[:2].upper() + t[2:]
+    return ""
+
+
+def _hours_decimal_for_excel(value: str) -> float | None:
+    t = (value or "").strip()
+    if not t or not _is_valid_total_hours_decimal(t):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _transport_amount_for_excel(value: str) -> tuple[float | None, bool]:
+    """旅費交通費請求金額（O列）用。空欄は 0 として扱う。(金額, 解析成功)"""
+    t = (value or "").strip()
+    if not t or t in ("（なし）", "不明", "（不明）"):
+        return 0.0, True
+    nfkc = unicodedata.normalize("NFKC", t)
+    nfkc = nfkc.replace("，", "").replace(",", "").replace("、", "").replace("円", "")
+    m = re.search(r"(\d+(?:\.\d+)?)", nfkc)
+    if not m:
+        return None, False
+    try:
+        return float(m.group(1)), True
+    except ValueError:
+        return None, False
+
+
+def _build_employee_no_row_index(ws) -> dict[str, list[int]]:
+    """シート A列の社員番号 → 行番号リスト（1始まり）。"""
+    index: dict[str, list[int]] = {}
+    max_row = ws.max_row or 0
+    for row_idx in range(1, max_row + 1):
+        key = _normalize_employee_no_cell_value(ws.cell(row=row_idx, column=BILLING_TS_COL_EMPLOYEE_NO).value)
+        if not key:
+            continue
+        index.setdefault(key, []).append(row_idx)
+    return index
+
+
+def update_billing_engineer_ts_sheet(
+    billing_path: Path,
+    rows: list[dict[str, str]],
+) -> list[str]:
+    """最終判断〇行分のデータを請求用 Excel「エンジニアTS一覧」に反映する。
+
+    各行について「〇」（更新成功）または「✖」（失敗）を返す（rows と同順）。
+    """
+    if not rows:
+        return []
+    path = billing_path.resolve()
+    suffix = path.suffix.lower()
+    keep_vba = suffix in (".xlsm", ".xltm")
+    wb = load_workbook(path, keep_vba=keep_vba)
+    try:
+        if BILLING_ENGINEER_TS_SHEET_NAME not in wb.sheetnames:
+            return ["✖"] * len(rows)
+        ws = wb[BILLING_ENGINEER_TS_SHEET_NAME]
+        emp_rows = _build_employee_no_row_index(ws)
+        results: list[str] = []
+        for row in rows:
+            emp = _normalize_employee_no_cell_value(_row_employee_no(row))
+            if not _is_valid_employee_no(emp):
+                results.append("✖")
+                continue
+            targets = emp_rows.get(emp)
+            if not targets:
+                results.append("✖")
+                continue
+            hours = _hours_decimal_for_excel(_row_total_hours_decimal(row))
+            if hours is None:
+                results.append("✖")
+                continue
+            transport, transport_ok = _transport_amount_for_excel(
+                _row_transport_expense_raw(row)
+            )
+            if not transport_ok or transport is None:
+                results.append("✖")
+                continue
+            try:
+                for row_idx in targets:
+                    ws.cell(row=row_idx, column=BILLING_TS_COL_NORMAL_HOURS).value = hours
+                    ws.cell(row=row_idx, column=BILLING_TS_COL_TRANSPORT_AMOUNT).value = transport
+                results.append("〇")
+            except Exception:
+                results.append("✖")
+        wb.save(path)
+        return results
+    finally:
+        wb.close()
 
 
 def _auto_judgment_symbol(row: dict[str, str]) -> str:
