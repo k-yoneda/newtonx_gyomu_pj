@@ -22,8 +22,13 @@ if str(_ROOT) not in sys.path:
 from kintai_core import (
     DEFAULT_PARALLEL_ANALYSIS_CHATS,
     EXCEL_SUFFIXES,
+    LEGACY_COMPANY_COL,
+    LEGACY_FILE_NAME_COL,
+    LEGACY_TARGET_FILE_NAME_COL,
     PARALLEL_WORKERS_MAX,
+    SUMMARY_COMPANY_COL,
     TARGET_ASSISTANT_NAME,
+    TARGET_FILE_NAME_COL,
     _decimal_for_table_display,
     _normalize_month_value,
     _normalize_year_value,
@@ -160,8 +165,9 @@ def _try_close_excel_workbook(path: Path) -> bool:
 
 
 class KintaiApp(tk.Frame):
-    TARGET_FILE_NAME_COL = "対象ファイル名"
-    LEGACY_FILE_NAME_COL = "画像ファイル名"
+    TARGET_FILE_NAME_COL = TARGET_FILE_NAME_COL
+    LEGACY_TARGET_FILE_NAME_COL = LEGACY_TARGET_FILE_NAME_COL
+    LEGACY_FILE_NAME_COL = LEGACY_FILE_NAME_COL
     USER_JUDGMENT_COL = "ユーザ判断"
     AUTO_JUDGMENT_COL = "自動判断"
     YEAR_COL = "年"
@@ -172,7 +178,8 @@ class KintaiApp(tk.Frame):
     TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
     MATCH_COMPANY_COL = "会社名比較"
     LEGACY_MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
-    COMPANY1_COL = "会社名1"
+    COMPANY_COL = SUMMARY_COMPANY_COL
+    LEGACY_COMPANY_COL = LEGACY_COMPANY_COL
     # 「エラー再解析」対象: ユーザ判断が「〇」以外の行
     _ERROR_REANALYSIS_OK_VALUES = ("〇",)
     # 記号列（〇/△/✖ 等）の列幅（px）
@@ -330,7 +337,7 @@ class KintaiApp(tk.Frame):
         ).grid(row=0, column=3, sticky="w", padx=(4, 8))
         ttk.Label(
             cfg,
-            text=f"（1〜{PARALLEL_WORKERS_MAX}、解析時に使用）",
+            text="（1～4推奨、少ないほうが安定）",
         ).grid(row=0, column=4, sticky="w")
 
         top = ttk.Frame(self, padding=8)
@@ -765,6 +772,7 @@ class KintaiApp(tk.Frame):
     def _file_name_from_row(self, row: dict[str, str]) -> str:
         return (
             row.get(self.TARGET_FILE_NAME_COL)
+            or row.get(self.LEGACY_TARGET_FILE_NAME_COL)
             or row.get(self.LEGACY_FILE_NAME_COL)
             or row.get("file_name")
             or ""
@@ -780,7 +788,7 @@ class KintaiApp(tk.Frame):
             (self.USER_JUDGMENT_COL, "user_judgment_company"),
             (self.YEAR_COL, "year"),
             (self.MONTH_COL, "month"),
-            (self.COMPANY1_COL, "name_company_1"),
+            (self.COMPANY_COL, "name_company_1"),
             ("氏名", "name_person_from_doc"),
             (self.EMPLOYEE_NO_COL, "employee_no"),
             (self.TOTAL_HOURS_DECIMAL_COL, "total_hours_decimal"),
@@ -812,6 +820,13 @@ class KintaiApp(tk.Frame):
                 val = str(
                     row.get(core_key)
                     or row.get(self.LEGACY_MATCH_COMPANY_COL)
+                    or ""
+                ).strip()
+            elif core_key == "name_company_1":
+                val = str(
+                    row.get(self.COMPANY_COL)
+                    or row.get(self.LEGACY_COMPANY_COL)
+                    or row.get(core_key)
                     or ""
                 ).strip()
             else:
@@ -985,7 +1000,7 @@ class KintaiApp(tk.Frame):
 
         current_row = self._current_row_dict_from_iid(rid)
 
-        # 選択行の「再解析」は、会社名1の内容に関わらず実行可能とする。
+        # 選択行の「再解析」は、会社名の内容に関わらず実行可能とする。
         # （不明/（存在しない）のみ一括で再解析したい場合は「エラー再解析」ボタンを使用。）
 
         file_name = self._file_name_from_row(current_row)
