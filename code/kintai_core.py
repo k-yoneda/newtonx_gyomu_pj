@@ -341,6 +341,9 @@ def _employee_no_from_file_name(file_name: str) -> str:
 
 def _attach_excel_transport_expense(row: dict[str, str], file_path: Path) -> None:
     """交通宿泊費清算書お客様先用 シートの G44 を交通費合計（読取）に設定する。"""
+    if _filename_has_transport_expense_marker(file_path.name):
+        # ファイル名に「交通費」があるのに取得できないケースは（不明）にする
+        row.setdefault("transport_expense_raw", "（不明）")
     sheet_symbol, _ = _excel_target_sheet_symbol(
         file_path,
         target_sheet_name=TRANSPORT_EXPENSE_EXCEL_SHEET_NAME,
@@ -351,9 +354,10 @@ def _attach_excel_transport_expense(row: dict[str, str], file_path: Path) -> Non
     try:
         wb = load_workbook(file_path, data_only=True, read_only=True)
         ws = wb[TRANSPORT_EXPENSE_EXCEL_SHEET_NAME]
-        row["transport_expense_raw"] = _excel_cell_value_to_raw_text(
+        v = _excel_cell_value_to_raw_text(
             ws[TRANSPORT_EXPENSE_EXCEL_CELL].value
         )
+        row["transport_expense_raw"] = v.strip() if v is not None else ""
     except Exception:
         pass
     finally:
@@ -1378,6 +1382,7 @@ def _enrich_with_match_scores(
         text_for_extraction
     )
     if _filename_has_transport_expense_marker(fn):
+        row.setdefault("transport_expense_raw", "（不明）")
         te_src = analysis if prefer_kintai_section else text_for_extraction
         te_raw = (ktab.get("transport") or "").strip() or _extract_transport_expense_from_document(
             te_src
