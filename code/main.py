@@ -50,6 +50,7 @@ from kintai_core import (
     create_client,
     is_manual_user_judgment,
     normalize_judgment_symbol,
+    prepare_analysis_filenames_in_data_dir,
     row_display_values,
     run_analysis,
     summary_header_cells,
@@ -611,15 +612,30 @@ class KintaiApp(tk.Frame):
         except ValueError:
             return None, None
 
+    def _analysis_prerequisites_met(self) -> bool:
+        """データフォルダと請求用ファイルの両方が選択済みか。"""
+        return (
+            self._data_dir is not None
+            and self._data_dir.is_dir()
+            and self._billing_file_path is not None
+            and self._billing_file_path.is_file()
+        )
+
     def _update_data_dir_dependent_buttons(self) -> None:
-        has_dir = self._data_dir is not None and self._data_dir.is_dir()
+        can_analyze = self._analysis_prerequisites_met()
         if self._busy:
             return
         self._progress_var.set("")
-        self._new_btn.configure(state=(tk.NORMAL if has_dir else tk.DISABLED))
-        self._new_plus_error_btn.configure(state=(tk.NORMAL if has_dir else tk.DISABLED))
+        self._new_btn.configure(state=(tk.NORMAL if can_analyze else tk.DISABLED))
+        self._new_plus_error_btn.configure(
+            state=(tk.NORMAL if can_analyze else tk.DISABLED)
+        )
         self._cont_btn.configure(
-            state=(tk.NORMAL if (has_dir and self._loaded_rows) else tk.DISABLED)
+            state=(
+                tk.NORMAL
+                if (can_analyze and self._loaded_rows)
+                else tk.DISABLED
+            )
         )
         self._save_btn.configure(
             state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED)
@@ -706,7 +722,7 @@ class KintaiApp(tk.Frame):
             return
         self._billing_file_path = path.resolve()
         self._sync_billing_file_display()
-        self._refresh_billing_update_button_state()
+        self._update_data_dir_dependent_buttons()
 
     def _final_judgment_symbol_from_row(self, row: dict[str, str]) -> str:
         return normalize_judgment_symbol(
@@ -846,14 +862,14 @@ class KintaiApp(tk.Frame):
         return list(self._tree.selection())
 
     def _refresh_selected_rows_reanalysis_button_state(self) -> None:
-        if self._busy or self._data_dir is None:
+        if self._busy or not self._analysis_prerequisites_met():
             self._selected_reanalysis_btn.configure(state=tk.DISABLED)
             return
         enabled = bool(self._selected_tree_iids())
         self._selected_reanalysis_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
 
     def _refresh_error_reanalysis_button_state(self) -> None:
-        if self._busy or self._data_dir is None:
+        if self._busy or not self._analysis_prerequisites_met():
             self._error_reanalysis_btn.configure(state=tk.DISABLED)
             return
         # 対象行が1件でもあれば有効
@@ -1219,7 +1235,14 @@ class KintaiApp(tk.Frame):
             self._set_row_reanalysis_highlight(rid, active)
 
     def _start_row_reanalysis(self, rid: str) -> None:
-        if self._busy or self._data_dir is None:
+        if self._busy:
+            return
+        if not self._analysis_prerequisites_met():
+            messagebox.showwarning(
+                "再解析",
+                "再解析を実行するには、データフォルダと請求用ファイルの両方を選択してください。",
+                parent=self._root,
+            )
             return
 
         current_row = self._current_row_dict_from_iid(rid)
@@ -1284,6 +1307,7 @@ class KintaiApp(tk.Frame):
                     parallel_chats=1,
                     expected_year=exp_y,
                     expected_month=exp_m,
+                    billing_path=self._billing_file_path,
                 )
             except BaseException as e:
                 err = e
@@ -1297,13 +1321,7 @@ class KintaiApp(tk.Frame):
                 # 反転表示を解除
                 self._set_row_reanalysis_highlight(rid, False)
 
-                self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
-                self._new_plus_error_btn.configure(
-                    state=(tk.NORMAL if self._data_dir else tk.DISABLED)
-                )
-                self._cont_btn.configure(state=(tk.NORMAL if (self._data_dir and (self._loaded_rows or self._tree.get_children())) else tk.DISABLED))
-                self._save_btn.configure(state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED))
-                self._load_btn.configure(state=tk.NORMAL)
+                self._update_data_dir_dependent_buttons()
 
                 if err is not None:
                     messagebox.showerror("再解析エラー", str(err))
@@ -1350,7 +1368,14 @@ class KintaiApp(tk.Frame):
         complete_message: str,
     ) -> None:
         """指定行（ファイル名）のみ再解析する。"""
-        if self._busy or self._data_dir is None or not iid_by_file:
+        if self._busy or not iid_by_file:
+            return
+        if not self._analysis_prerequisites_met():
+            messagebox.showwarning(
+                label,
+                f"{label}を実行するには、データフォルダと請求用ファイルの両方を選択してください。",
+                parent=self._root,
+            )
             return
 
         file_names = set(iid_by_file.keys())
@@ -1438,6 +1463,21 @@ class KintaiApp(tk.Frame):
         def worker() -> None:
             err: BaseException | None = None
             try:
+                billing_path = self._billing_file_path
+                if billing_path is not None and billing_path.is_file():
+                    rename_map = prepare_analysis_filenames_in_data_dir(
+                        td,
+                        billing_path,
+                        target_file_names=set(file_names),
+                        on_log=log_line,
+                    )
+                    for old, new in rename_map.items():
+                        rid = iid_by_file.pop(old, None)
+                        if rid:
+                            iid_by_file[new] = rid
+                    file_names.clear()
+                    file_names.update(iid_by_file.keys())
+
                 exp_y, exp_m = self._expected_year_month()
                 run_analysis(
                     client,
@@ -1454,6 +1494,7 @@ class KintaiApp(tk.Frame):
                     parallel_chats=parallel,
                     expected_year=exp_y,
                     expected_month=exp_m,
+                    billing_path=billing_path,
                 )
             except BaseException as e:
                 err = e
@@ -1469,29 +1510,11 @@ class KintaiApp(tk.Frame):
                 active_rids.clear()
                 self._set_rows_reanalysis_highlight(target_iids, False)
 
-                self._new_btn.configure(state=(tk.NORMAL if self._data_dir else tk.DISABLED))
-                self._new_plus_error_btn.configure(
-                    state=(tk.NORMAL if self._data_dir else tk.DISABLED)
-                )
-                self._cont_btn.configure(
-                    state=(
-                        tk.NORMAL
-                        if (
-                            self._data_dir
-                            and (self._loaded_rows or self._tree.get_children())
-                        )
-                        else tk.DISABLED
-                    )
-                )
-                self._save_btn.configure(
-                    state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED)
-                )
-                self._load_btn.configure(state=tk.NORMAL)
+                self._update_data_dir_dependent_buttons()
 
                 self._loaded_rows = self._current_grid_rows()
                 self._progress_var.set(f"{label}完了 {total} / {total}")
                 ratio_text = self._company_match_ratio_text(self._loaded_rows)
-                self._refresh_reanalysis_buttons_state()
 
                 if err is not None:
                     messagebox.showerror(f"{label}エラー", str(err))
@@ -1510,7 +1533,7 @@ class KintaiApp(tk.Frame):
 
     def _start_selected_rows_reanalysis(self) -> None:
         """グリッドで選択した行だけを再解析する。"""
-        if self._busy or self._data_dir is None:
+        if self._busy:
             return
         iids = self._selected_tree_iids()
         if not iids:
@@ -1531,7 +1554,7 @@ class KintaiApp(tk.Frame):
 
     def _start_error_reanalysis(self) -> None:
         """ユーザ判断が「〇」以外の行だけをまとめて再解析する。"""
-        if self._busy or self._data_dir is None:
+        if self._busy:
             return
 
         target_iids = self._eligible_error_reanalysis_iids()
@@ -2022,7 +2045,14 @@ class KintaiApp(tk.Frame):
         self._start_analysis(base_rows=base)
 
     def _start_analysis(self, *, base_rows: list[dict[str, str]] | None) -> None:
-        if self._busy or self._data_dir is None:
+        if self._busy:
+            return
+        if not self._analysis_prerequisites_met():
+            messagebox.showwarning(
+                "解析",
+                "解析を実行するには、データフォルダと請求用ファイルの両方を選択してください。",
+                parent=self._root,
+            )
             return
         aid = self._require_assistant_uid()
         if not aid:
@@ -2160,6 +2190,41 @@ class KintaiApp(tk.Frame):
                         if fn:
                             skip_names.add(fn)
 
+                billing_path = self._billing_file_path
+                if billing_path is not None and billing_path.is_file():
+                    rename_map = prepare_analysis_filenames_in_data_dir(
+                        td,
+                        billing_path,
+                        skip_file_names=skip_names,
+                        on_log=log_line,
+                    )
+                    if rename_map:
+                        if skip_names:
+                            skip_names = {rename_map.get(n, n) for n in skip_names}
+                        for old, new in rename_map.items():
+                            if old not in base_map:
+                                continue
+                            row = dict(base_map.pop(old))
+                            row["file_name"] = new
+                            resolved = (row.get("resolved_path") or "").strip()
+                            if resolved:
+                                try:
+                                    rp = Path(resolved)
+                                    if rp.name == old:
+                                        row["resolved_path"] = str(rp.with_name(new))
+                                except OSError:
+                                    pass
+                            base_map[new] = row
+                        sync_done = threading.Event()
+
+                        def sync_grid() -> None:
+                            if base_map:
+                                self._rebuild_grid_from_rows(list(base_map.values()))
+                            sync_done.set()
+
+                        self.after(0, sync_grid)
+                        sync_done.wait(timeout=10.0)
+
                 exp_y, exp_m = self._expected_year_month()
                 rows_result = run_analysis(
                     client,
@@ -2175,6 +2240,7 @@ class KintaiApp(tk.Frame):
                     parallel_chats=parallel,
                     expected_year=exp_y,
                     expected_month=exp_m,
+                    billing_path=billing_path,
                 )
             except BaseException as e:
                 err = e
@@ -2225,18 +2291,10 @@ class KintaiApp(tk.Frame):
                     self._last_saved_snapshot = ""
 
                 # --- UIボタン復帰 ---
-                if self._data_dir is not None:
-                    self._new_btn.configure(state=tk.NORMAL)
-                    self._new_plus_error_btn.configure(state=tk.NORMAL)
-                else:
-                    self._new_btn.configure(state=tk.DISABLED)
-                    self._new_plus_error_btn.configure(state=tk.DISABLED)
-
-                # 継続解析は「途中結果がある」ならエラー/中断でも有効
-                self._cont_btn.configure(state=(tk.NORMAL if self._loaded_rows else tk.DISABLED))
-                # 保存も同様に有効
-                self._save_btn.configure(state=(tk.NORMAL if self._loaded_rows else tk.DISABLED))
+                self._update_data_dir_dependent_buttons()
                 self._load_btn.configure(state=tk.NORMAL)
+                if self._loaded_rows:
+                    self._save_btn.configure(state=tk.NORMAL)
 
                 # --- ステータス表示 ---
                 n_rows = len(self._loaded_rows or [])
