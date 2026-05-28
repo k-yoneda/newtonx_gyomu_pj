@@ -23,10 +23,19 @@ from kintai_core import (
     DEFAULT_PARALLEL_ANALYSIS_CHATS,
     EXCEL_SUFFIXES,
     LEGACY_COMPANY_COL,
+    LEGACY_COMPANY_NAME_COL,
     LEGACY_FILE_NAME_COL,
+    LEGACY_EMPLOYEE_NO_COL,
+    LEGACY_MONTH_COL,
+    LEGACY_PERSON_COL,
     LEGACY_TARGET_FILE_NAME_COL,
+    LEGACY_YEAR_COL,
     PARALLEL_WORKERS_MAX,
     SUMMARY_COMPANY_COL,
+    SUMMARY_EMPLOYEE_NO_COL,
+    SUMMARY_MONTH_COL,
+    SUMMARY_PERSON_COL,
+    SUMMARY_YEAR_COL,
     TARGET_ASSISTANT_NAME,
     TARGET_FILE_NAME_COL,
     _decimal_for_table_display,
@@ -170,9 +179,10 @@ class KintaiApp(tk.Frame):
     LEGACY_FILE_NAME_COL = LEGACY_FILE_NAME_COL
     USER_JUDGMENT_COL = "ユーザ判断"
     AUTO_JUDGMENT_COL = "自動判断"
-    YEAR_COL = "年"
-    MONTH_COL = "月"
-    EMPLOYEE_NO_COL = "社員番号"
+    YEAR_COL = SUMMARY_YEAR_COL
+    MONTH_COL = SUMMARY_MONTH_COL
+    EMPLOYEE_NO_COL = SUMMARY_EMPLOYEE_NO_COL
+    PERSON_COL = SUMMARY_PERSON_COL
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
     TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
@@ -180,6 +190,11 @@ class KintaiApp(tk.Frame):
     LEGACY_MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
     COMPANY_COL = SUMMARY_COMPANY_COL
     LEGACY_COMPANY_COL = LEGACY_COMPANY_COL
+    LEGACY_COMPANY_NAME_COL = LEGACY_COMPANY_NAME_COL
+    LEGACY_YEAR_COL = LEGACY_YEAR_COL
+    LEGACY_MONTH_COL = LEGACY_MONTH_COL
+    LEGACY_PERSON_COL = LEGACY_PERSON_COL
+    LEGACY_EMPLOYEE_NO_COL = LEGACY_EMPLOYEE_NO_COL
     # 「エラー再解析」対象: ユーザ判断が「〇」以外の行
     _ERROR_REANALYSIS_OK_VALUES = ("〇",)
     # 記号列（〇/△/✖ 等）の列幅（px）
@@ -221,6 +236,7 @@ class KintaiApp(tk.Frame):
         self._assistant_var = tk.StringVar(value=default_name)
         self._workers_var = tk.StringVar(value=str(DEFAULT_PARALLEL_ANALYSIS_CHATS))
         self._data_dir: Path | None = None
+        self._billing_file_path: Path | None = None
         self._data_root: Path | None = _guess_data_root()
         self._data_branch: str = ""
         default_year, _ = _today_year_month()
@@ -353,8 +369,19 @@ class KintaiApp(tk.Frame):
         )
         top.columnconfigure(2, weight=1)
 
+        self._billing_file_var = tk.StringVar(value="（未選択）")
+        ttk.Label(top, text="請求用ファイル:").grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Button(
+            top, text="参照…", command=self._browse_billing_file
+        ).grid(row=1, column=1, sticky="w", padx=(4, 4), pady=(6, 0))
+        ttk.Label(top, textvariable=self._billing_file_var, anchor="w").grid(
+            row=1, column=2, sticky="ew", pady=(6, 0)
+        )
+
         ym_row = ttk.Frame(top)
-        ym_row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ym_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(ym_row, text="年度:").pack(side=tk.LEFT)
         self._year_combo = ttk.Combobox(
             ym_row,
@@ -406,29 +433,36 @@ class KintaiApp(tk.Frame):
         )
         self._selected_reanalysis_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
 
-        self._save_btn = ttk.Button(
-            ctrl, text="保存", command=self._save_json, state=tk.DISABLED
-        )
-        self._save_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
-
-        self._load_btn = ttk.Button(
-            ctrl, text="読み込み", command=self._load_json, state=tk.NORMAL
-        )
-        self._load_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
-
-        self._cancel_btn = ttk.Button(
-            ctrl, text="中断", command=self._cancel_analysis, state=tk.DISABLED
-        )
-        self._cancel_btn.grid(row=0, column=6, sticky="w", padx=(16, 0))
-
-        # 中断の右: エラー再解析（ユーザ判断が「〇」以外の行のみを対象に再解析）
         self._error_reanalysis_btn = ttk.Button(
             ctrl,
             text="エラー再解析",
             command=self._start_error_reanalysis,
             state=tk.DISABLED,
         )
-        self._error_reanalysis_btn.grid(row=0, column=7, sticky="w", padx=(8, 0))
+        self._error_reanalysis_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
+
+        self._billing_update_btn = ttk.Button(
+            ctrl,
+            text="請求ファイル更新",
+            command=self._update_billing_file,
+            state=tk.DISABLED,
+        )
+        self._billing_update_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
+
+        self._save_btn = ttk.Button(
+            ctrl, text="保存", command=self._save_json, state=tk.DISABLED
+        )
+        self._save_btn.grid(row=0, column=6, sticky="w", padx=(8, 0))
+
+        self._load_btn = ttk.Button(
+            ctrl, text="読み込み", command=self._load_json, state=tk.NORMAL
+        )
+        self._load_btn.grid(row=0, column=7, sticky="w", padx=(8, 0))
+
+        self._cancel_btn = ttk.Button(
+            ctrl, text="中断", command=self._cancel_analysis, state=tk.DISABLED
+        )
+        self._cancel_btn.grid(row=0, column=8, sticky="w", padx=(16, 0))
 
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
@@ -436,10 +470,10 @@ class KintaiApp(tk.Frame):
         # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
         # （環境によってフォントが少し太く、26文字だと末尾が欠けるケースがあったため更に増やす）
         ttk.Label(ctrl, textvariable=self._progress_var, width=30).grid(
-            row=0, column=8, sticky="w", padx=(16, 0)
+            row=0, column=9, sticky="w", padx=(16, 0)
         )
         # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
-        ctrl.columnconfigure(8, minsize=240)
+        ctrl.columnconfigure(9, minsize=240)
 
         self._status_label = ttk.Label(
             ctrl,
@@ -449,8 +483,8 @@ class KintaiApp(tk.Frame):
             wraplength=900,
             justify="left",
         )
-        self._status_label.grid(row=0, column=9, sticky="ew", padx=(12, 0))
-        ctrl.columnconfigure(9, weight=1)
+        self._status_label.grid(row=0, column=10, sticky="ew", padx=(12, 0))
+        ctrl.columnconfigure(10, weight=1)
 
         grid_frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         grid_frame.pack(fill=tk.BOTH, expand=True)
@@ -501,6 +535,7 @@ class KintaiApp(tk.Frame):
         self._root.minsize(min_w, 520)
         self._root.geometry(f"{initial_w}x680")
         self._sync_folder_display()
+        self._sync_billing_file_display()
         self._refresh_reanalysis_buttons_state()
 
     def _sync_folder_display(self) -> None:
@@ -509,6 +544,13 @@ class KintaiApp(tk.Frame):
             self._folder_var.set(str(self._data_dir.resolve()))
         else:
             self._folder_var.set("（未選択）")
+
+    def _sync_billing_file_display(self) -> None:
+        """請求用ファイル欄を _billing_file_path の状態に合わせる。"""
+        if self._billing_file_path is not None and self._billing_file_path.is_file():
+            self._billing_file_var.set(self._billing_file_path.name)
+        else:
+            self._billing_file_var.set("（未選択）")
 
     def _discover_years(self) -> list[str]:
         today_y, _ = _today_year_month()
@@ -576,6 +618,16 @@ class KintaiApp(tk.Frame):
         self._cancel_btn.configure(state=tk.DISABLED)
         self._refresh_reanalysis_buttons_state()
 
+    def _refresh_billing_update_button_state(self) -> None:
+        if self._busy:
+            self._billing_update_btn.configure(state=tk.DISABLED)
+            return
+        enabled = (
+            self._billing_file_path is not None
+            and self._billing_file_path.is_file()
+        )
+        self._billing_update_btn.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+
     def _on_tree_selection_changed(self, _event: tk.Event | None = None) -> None:
         self._refresh_selected_rows_reanalysis_button_state()
 
@@ -611,6 +663,68 @@ class KintaiApp(tk.Frame):
         if not d:
             return
         self._set_data_path(Path(d), sync_year_month_from_path=False)
+
+    def _browse_billing_file(self) -> None:
+        self._prepare_native_dialog()
+        initial = self._billing_file_path or self._data_dir or self._data_root
+        initialdir: str | None = None
+        initialfile: str | None = None
+        if initial is not None:
+            if initial.is_file():
+                initialdir = str(initial.parent)
+                initialfile = initial.name
+            elif initial.is_dir():
+                initialdir = str(initial)
+        fp = filedialog.askopenfilename(
+            title="請求用ファイルを選択",
+            filetypes=[
+                ("Excel", "*.xlsx *.xlsm *.xltx *.xltm"),
+                ("すべて", "*.*"),
+            ],
+            parent=self._root,
+            initialdir=initialdir,
+            initialfile=initialfile,
+        )
+        if not fp:
+            return
+        path = Path(fp)
+        if not path.is_file():
+            messagebox.showerror(
+                "請求用ファイル",
+                f"ファイルが見つかりません:\n{path}",
+                parent=self._root,
+            )
+            return
+        self._billing_file_path = path.resolve()
+        self._sync_billing_file_display()
+        self._refresh_billing_update_button_state()
+
+    def _update_billing_file(self) -> None:
+        if self._busy:
+            return
+        if self._billing_file_path is None or not self._billing_file_path.is_file():
+            messagebox.showwarning(
+                "請求ファイル更新",
+                "請求用ファイルを選択してください。",
+                parent=self._root,
+            )
+            return
+        rows = self._current_grid_rows()
+        if not rows:
+            messagebox.showinfo(
+                "請求ファイル更新",
+                "グリッドに反映するデータがありません。",
+                parent=self._root,
+            )
+            return
+        messagebox.showinfo(
+            "請求ファイル更新",
+            (
+                f"請求用ファイル:\n{self._billing_file_path.name}\n\n"
+                "請求ファイルへの反映処理は未実装です。"
+            ),
+            parent=self._root,
+        )
 
     def _should_ignore_status_log(self, message: str) -> bool:
         """run_analysis(on_log=...) 経由で流れてくるログのうち、
@@ -677,6 +791,7 @@ class KintaiApp(tk.Frame):
     def _refresh_reanalysis_buttons_state(self) -> None:
         self._refresh_error_reanalysis_button_state()
         self._refresh_selected_rows_reanalysis_button_state()
+        self._refresh_billing_update_button_state()
 
     def _clear_grid(self) -> None:
         self._close_row_file()
@@ -789,7 +904,7 @@ class KintaiApp(tk.Frame):
             (self.YEAR_COL, "year"),
             (self.MONTH_COL, "month"),
             (self.COMPANY_COL, "name_company_1"),
-            ("氏名", "name_person_from_doc"),
+            (self.PERSON_COL, "name_person_from_doc"),
             (self.EMPLOYEE_NO_COL, "employee_no"),
             (self.TOTAL_HOURS_DECIMAL_COL, "total_hours_decimal"),
             (self.TOTAL_HOURS_RAW_COL, "total_hours_raw"),
@@ -807,14 +922,20 @@ class KintaiApp(tk.Frame):
                     val = str(row.get(core_key) or "").strip()
                 else:
                     val = str(
-                        row.get(self.YEAR_COL) or self._year_var.get() or ""
+                        row.get(self.YEAR_COL)
+                        or row.get(self.LEGACY_YEAR_COL)
+                        or self._year_var.get()
+                        or ""
                     ).strip()
             elif core_key == "month":
                 if core_key in row:
                     val = str(row.get(core_key) or "").strip()
                 else:
                     val = str(
-                        row.get(self.MONTH_COL) or self._month_var.get() or ""
+                        row.get(self.MONTH_COL)
+                        or row.get(self.LEGACY_MONTH_COL)
+                        or self._month_var.get()
+                        or ""
                     ).strip()
             elif core_key == "match_company":
                 val = str(
@@ -825,7 +946,22 @@ class KintaiApp(tk.Frame):
             elif core_key == "name_company_1":
                 val = str(
                     row.get(self.COMPANY_COL)
+                    or row.get(self.LEGACY_COMPANY_NAME_COL)
                     or row.get(self.LEGACY_COMPANY_COL)
+                    or row.get(core_key)
+                    or ""
+                ).strip()
+            elif core_key == "name_person_from_doc":
+                val = str(
+                    row.get(self.PERSON_COL)
+                    or row.get(self.LEGACY_PERSON_COL)
+                    or row.get(core_key)
+                    or ""
+                ).strip()
+            elif core_key == "employee_no":
+                val = str(
+                    row.get(self.EMPLOYEE_NO_COL)
+                    or row.get(self.LEGACY_EMPLOYEE_NO_COL)
                     or row.get(core_key)
                     or ""
                 ).strip()
@@ -1024,6 +1160,7 @@ class KintaiApp(tk.Frame):
         self._load_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
+        self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set("再解析中 0 / 1")
         self._status_var.set(f"再解析しています… {file_name}")
 
@@ -1149,6 +1286,7 @@ class KintaiApp(tk.Frame):
         self._load_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
+        self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set(f"{label}中 0 / {total}")
         self._status_var.set(f"{label}しています… {total} 件（並列 {parallel}）")
 
@@ -1812,6 +1950,7 @@ class KintaiApp(tk.Frame):
         self._load_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
+        self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set("")
         self._status_var.set("解析を準備しています…")
 

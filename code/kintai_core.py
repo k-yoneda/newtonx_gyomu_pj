@@ -46,10 +46,17 @@ SUMMARY_TARGET_SHEET_COL = "対象シート有無"
 TARGET_FILE_NAME_COL = "対象ファイル名（左クリックで表示）"
 LEGACY_TARGET_FILE_NAME_COL = "対象ファイル名"
 LEGACY_FILE_NAME_COL = "画像ファイル名"
-SUMMARY_COMPANY_COL = "会社名"
+SUMMARY_COMPANY_COL = "会社名（読み取）"
 LEGACY_COMPANY_COL = "会社名1"
-SUMMARY_YEAR_COL = "年"
-SUMMARY_MONTH_COL = "月"
+LEGACY_COMPANY_NAME_COL = "会社名"
+SUMMARY_YEAR_COL = "年（読取）"
+SUMMARY_MONTH_COL = "月（読取）"
+LEGACY_YEAR_COL = "年"
+LEGACY_MONTH_COL = "月"
+SUMMARY_PERSON_COL = "氏名（読取）"
+LEGACY_PERSON_COL = "氏名"
+SUMMARY_EMPLOYEE_NO_COL = "社員番号（ファイル名より）"
+LEGACY_EMPLOYEE_NO_COL = "社員番号"
 
 #TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
 TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
@@ -605,7 +612,12 @@ _KINTAI_HEADER_CELLS: frozenset[str] = frozenset(
     {
         "会社名",
         "勤務先",
+        SUMMARY_PERSON_COL,
+        LEGACY_PERSON_COL,
         "氏名",
+        SUMMARY_EMPLOYEE_NO_COL,
+        LEGACY_EMPLOYEE_NO_COL,
+        "社員番号",
         "合計勤務時間",
         "合計",
         "押印有無",
@@ -616,8 +628,13 @@ _KINTAI_HEADER_CELLS: frozenset[str] = frozenset(
         LEGACY_FILE_NAME_COL,
         SUMMARY_COMPANY_COL,
         LEGACY_COMPANY_COL,
+        LEGACY_COMPANY_NAME_COL,
         "ファイル名",
         "年度",
+        SUMMARY_YEAR_COL,
+        SUMMARY_MONTH_COL,
+        LEGACY_YEAR_COL,
+        LEGACY_MONTH_COL,
         "年",
         "月",
         "交通費合計",
@@ -1229,10 +1246,16 @@ def _year_month_matches_expected(row: dict[str, str]) -> bool:
     if not exp_y or not exp_m:
         return False
     got_y = _normalize_year_value(
-        row.get("year") or row.get(SUMMARY_YEAR_COL) or ""
+        row.get("year")
+        or row.get(SUMMARY_YEAR_COL)
+        or row.get(LEGACY_YEAR_COL)
+        or ""
     )
     got_m = _normalize_month_value(
-        row.get("month") or row.get(SUMMARY_MONTH_COL) or ""
+        row.get("month")
+        or row.get(SUMMARY_MONTH_COL)
+        or row.get(LEGACY_MONTH_COL)
+        or ""
     )
     if not got_y or not got_m:
         return False
@@ -1483,7 +1506,8 @@ def _upload_http_error_should_recreate_chat(exc: BaseException) -> bool:
 SUMMARY_MD_HEADER = (
     f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | {TARGET_FILE_NAME_COL} | ユーザ判断 | 自動判断 | "
     f"{SUMMARY_YEAR_COL} | {SUMMARY_MONTH_COL} | "
-    f"{SUMMARY_COMPANY_COL} | 氏名 | 社員番号 | 合計勤務時間（10進） | 合計勤務時間（読取） | "
+    f"{SUMMARY_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
+    "合計勤務時間（10進） | 合計勤務時間（読取） | "
     f"{SUMMARY_TRANSPORT_EXPENSE_COL} | "
     "会社名比較 | 押印有無 |"
 )
@@ -1520,7 +1544,12 @@ def normalize_judgment_symbol(value: str) -> str:
 
 def auto_judgment_symbol(row: dict[str, str]) -> str:
     """自動判断（〇/△/✖）を計算する（UI列名・内部キー両対応）。"""
-    emp = (row.get("employee_no") or row.get("社員番号") or "").strip()
+    emp = (
+        row.get("employee_no")
+        or row.get(SUMMARY_EMPLOYEE_NO_COL)
+        or row.get(LEGACY_EMPLOYEE_NO_COL)
+        or ""
+    ).strip()
     th = (row.get("total_hours_decimal") or row.get("合計勤務時間（10進）") or "").strip()
     mc = (
         row.get("match_company")
@@ -1541,8 +1570,18 @@ def auto_judgment_symbol(row: dict[str, str]) -> str:
                 or ""
             ).strip(),
             "source_kind": (row.get("source_kind") or "").strip(),
-            "year": (row.get("year") or row.get(SUMMARY_YEAR_COL) or "").strip(),
-            "month": (row.get("month") or row.get(SUMMARY_MONTH_COL) or "").strip(),
+            "year": (
+                row.get("year")
+                or row.get(SUMMARY_YEAR_COL)
+                or row.get(LEGACY_YEAR_COL)
+                or ""
+            ).strip(),
+            "month": (
+                row.get("month")
+                or row.get(SUMMARY_MONTH_COL)
+                or row.get(LEGACY_MONTH_COL)
+                or ""
+            ).strip(),
             "expected_year": (row.get("expected_year") or "").strip(),
             "expected_month": (row.get("expected_month") or "").strip(),
         }
