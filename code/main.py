@@ -1875,12 +1875,65 @@ class KintaiApp(tk.Frame):
             f"（〇扱い {ok_count}件 / 実行済 {processed_count}件 / 対象 {target_count}件）"
         )
 
-    def _write_json_file(self, path: Path, rows: list[dict[str, str]]) -> None:
-        folder = str(self._data_dir.resolve()) if self._data_dir else ""
-        payload = {
-            "version": 1,
+    def _json_paths_payload(self) -> dict[str, str]:
+        """保存用 JSON に含めるデータフォルダ・請求用ファイルのパス。"""
+        folder = (
+            str(self._data_dir.resolve())
+            if self._data_dir is not None and self._data_dir.is_dir()
+            else ""
+        )
+        billing = (
+            str(self._billing_file_path.resolve())
+            if self._billing_file_path is not None
+            and self._billing_file_path.is_file()
+            else ""
+        )
+        return {
             "data_dir": folder,
             "data_folder": folder,
+            "billing_file_path": billing,
+            "billing_file": billing,
+        }
+
+    def _restore_paths_from_json(self, data: dict) -> list[str]:
+        """JSON からデータフォルダ・請求用ファイルを復元する。警告メッセージのリストを返す。"""
+        warnings: list[str] = []
+
+        dd = (data.get("data_dir") or data.get("data_folder") or "").strip()
+        if dd:
+            data_path = Path(dd)
+            if data_path.is_dir():
+                self._set_data_path(data_path, sync_year_month_from_path=True)
+            else:
+                self._data_dir = None
+                self._data_branch = ""
+                self._sync_folder_display()
+                self._refresh_year_month_combos()
+                warnings.append(f"データフォルダが見つかりません:\n{dd}")
+        else:
+            self._data_dir = None
+            self._data_branch = ""
+            self._sync_folder_display()
+            self._refresh_year_month_combos()
+
+        bf = (data.get("billing_file_path") or data.get("billing_file") or "").strip()
+        if bf:
+            billing_path = Path(bf)
+            if billing_path.is_file():
+                self._billing_file_path = billing_path.resolve()
+            else:
+                self._billing_file_path = None
+                warnings.append(f"請求用ファイルが見つかりません:\n{bf}")
+        else:
+            self._billing_file_path = None
+
+        self._sync_billing_file_display()
+        return warnings
+
+    def _write_json_file(self, path: Path, rows: list[dict[str, str]]) -> None:
+        payload = {
+            "version": 2,
+            **self._json_paths_payload(),
             "rows": rows,
         }
         path.write_text(
@@ -1953,21 +2006,23 @@ class KintaiApp(tk.Frame):
         self._loaded_rows = [r for r in rows if isinstance(r, dict)]
         self._last_saved_snapshot = self._compute_snapshot(self._loaded_rows)
 
-        # 保存済みフォルダパスを復元（data_dir / data_folder のいずれか）
-        dd = (data.get("data_dir") or data.get("data_folder") or "").strip()
-        if dd:
-            self._set_data_path(Path(dd), sync_year_month_from_path=True)
-        else:
-            self._data_dir = None
-            self._sync_folder_display()
+        path_warnings = self._restore_paths_from_json(data)
 
         self._rebuild_grid_from_rows(self._loaded_rows)
-        self._save_btn.configure(state=(tk.NORMAL if self._loaded_rows else tk.DISABLED))
-        if not self._busy and not dd:
+        if not self._busy:
             self._update_data_dir_dependent_buttons()
-        self._refresh_reanalysis_buttons_state()
         ratio_text = self._company_match_ratio_text(self._loaded_rows)
-        self._status_var.set(f"読み込みました: {self._loaded_json_path} / {ratio_text}")
+        status = f"読み込みました: {self._loaded_json_path} / {ratio_text}"
+        if self._analysis_prerequisites_met():
+            status += "（データフォルダ・請求用ファイルを復元）"
+        self._status_var.set(status)
+        if path_warnings:
+            messagebox.showwarning(
+                "パス復元",
+                "一部のパスを復元できませんでした。\n\n"
+                + "\n\n".join(path_warnings),
+                parent=self._root,
+            )
         self._update_title()
 
     def _rebuild_grid_from_rows(self, rows: list[dict[str, str]]) -> None:
