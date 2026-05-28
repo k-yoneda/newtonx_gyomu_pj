@@ -46,7 +46,8 @@ SUMMARY_TARGET_SHEET_COL = "対象シート有無"
 TARGET_FILE_NAME_COL = "対象ファイル名（左クリックで表示）"
 LEGACY_TARGET_FILE_NAME_COL = "対象ファイル名"
 LEGACY_FILE_NAME_COL = "画像ファイル名"
-SUMMARY_COMPANY_COL = "会社名（読み取）"
+SUMMARY_COMPANY_COL = "会社名（読取）"
+LEGACY_COMPANY_READ_LONG_COL = "会社名（読み取）"
 LEGACY_COMPANY_COL = "会社名1"
 LEGACY_COMPANY_NAME_COL = "会社名"
 SUMMARY_YEAR_COL = "年（読取）"
@@ -57,6 +58,9 @@ SUMMARY_PERSON_COL = "氏名（読取）"
 LEGACY_PERSON_COL = "氏名"
 SUMMARY_EMPLOYEE_NO_COL = "社員番号（ファイル名より）"
 LEGACY_EMPLOYEE_NO_COL = "社員番号"
+SUMMARY_FINAL_JUDGMENT_COL = "最終判断"
+LEGACY_USER_JUDGMENT_COL = "ユーザ判断"
+SUMMARY_BILLING_UPDATE_RESULT_COL = "請求量ファイル更新結果"
 
 #TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
 TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
@@ -627,6 +631,7 @@ _KINTAI_HEADER_CELLS: frozenset[str] = frozenset(
         LEGACY_TARGET_FILE_NAME_COL,
         LEGACY_FILE_NAME_COL,
         SUMMARY_COMPANY_COL,
+        LEGACY_COMPANY_READ_LONG_COL,
         LEGACY_COMPANY_COL,
         LEGACY_COMPANY_NAME_COL,
         "ファイル名",
@@ -1504,7 +1509,8 @@ def _upload_http_error_should_recreate_chat(exc: BaseException) -> bool:
 
 
 SUMMARY_MD_HEADER = (
-    f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | {TARGET_FILE_NAME_COL} | ユーザ判断 | 自動判断 | "
+    f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | {TARGET_FILE_NAME_COL} | "
+    f"{SUMMARY_FINAL_JUDGMENT_COL} | {SUMMARY_BILLING_UPDATE_RESULT_COL} | 自動判断 | "
     f"{SUMMARY_YEAR_COL} | {SUMMARY_MONTH_COL} | "
     f"{SUMMARY_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
     "合計勤務時間（10進） | 合計勤務時間（読取） | "
@@ -1592,7 +1598,12 @@ def _effective_user_judgment(row: dict[str, str], auto: str | None = None) -> st
     """表示用ユーザ判断。未設定・解析時自動判断・旧仕様（会社名比較のみ）の場合は auto を返す。"""
     aj = auto if auto is not None else auto_judgment_symbol(row)
     uj_raw = normalize_judgment_symbol(
-        (row.get("user_judgment_company") or row.get("ユーザ判断") or "").strip()
+        (
+            row.get("user_judgment_company")
+            or row.get(SUMMARY_FINAL_JUDGMENT_COL)
+            or row.get(LEGACY_USER_JUDGMENT_COL)
+            or ""
+        ).strip()
     )
     if not uj_raw:
         return aj
@@ -1611,9 +1622,14 @@ def _effective_user_judgment(row: dict[str, str], auto: str | None = None) -> st
 
 
 def is_manual_user_judgment(row: dict[str, str]) -> bool:
-    """ユーザ判断が自動判断と異なる＝手動変更済み。"""
+    """最終判断が自動判断と異なる＝手動変更済み。"""
     uj_raw = normalize_judgment_symbol(
-        (row.get("user_judgment_company") or row.get("ユーザ判断") or "").strip()
+        (
+            row.get("user_judgment_company")
+            or row.get(SUMMARY_FINAL_JUDGMENT_COL)
+            or row.get(LEGACY_USER_JUDGMENT_COL)
+            or ""
+        ).strip()
     )
     if not uj_raw:
         return False
@@ -1632,6 +1648,14 @@ def is_manual_user_judgment(row: dict[str, str]) -> bool:
     if mc and uj_raw == mc:
         return False
     return True
+
+
+def _billing_file_update_result_display(row: dict[str, str]) -> str:
+    return (
+        row.get("billing_file_update_result")
+        or row.get(SUMMARY_BILLING_UPDATE_RESULT_COL)
+        or ""
+    ).strip()
 
 
 def _auto_judgment_symbol(row: dict[str, str]) -> str:
@@ -1773,7 +1797,7 @@ def _year_month_from_data_dir(data_dir: Path) -> tuple[str, str]:
 
 
 def _one_summary_data_line(r: dict[str, str]) -> str:
-    """15列1行分（集計用）。Excel 行は対象シート有無のみを埋め、AI読取列は空欄にする。"""
+    """16列1行分（集計用）。Excel 行は対象シート有無のみを埋め、AI読取列は空欄にする。"""
     is_excel = _row_is_excel(r)
     u_sym = _escape_md_table_cell(_upload_ok_symbol(r))
     ts = _escape_md_table_cell(_target_sheet_ok_symbol(r))
@@ -1784,6 +1808,7 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     uj = _effective_user_judgment(r, aj)
     r["user_judgment_company"] = uj
     uj = _escape_md_table_cell(uj)
+    bur = _escape_md_table_cell(_billing_file_update_result_display(r))
     aj = _escape_md_table_cell(aj)
     yy = _escape_md_table_cell((r.get("year") or "").strip())
     mm = _escape_md_table_cell((r.get("month") or "").strip())
@@ -1811,7 +1836,7 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
         "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
     )
     return (
-        f"| {u_sym} | {ts} | {fn} | {uj} | {aj} | {yy} | {mm} | {co1} | {pe} | {emp} | {th} | {lr} | {te} | {mc} | {se} |"
+        f"| {u_sym} | {ts} | {fn} | {uj} | {bur} | {aj} | {yy} | {mm} | {co1} | {pe} | {emp} | {th} | {lr} | {te} | {mc} | {se} |"
     )
 
 
@@ -1899,6 +1924,7 @@ def row_display_values(
     else:
         uj = _effective_user_judgment(r, aj)
     r["user_judgment_company"] = uj
+    bur = _billing_file_update_result_display(r)
 
     fn = r.get("file_name", "") or ""
     yy = (r.get("year") or "").strip()
@@ -1915,7 +1941,7 @@ def row_display_values(
     te = (r.get("transport_expense_raw") or "").strip()
     mc = (r.get("match_company") or ("" if is_excel else "✖"))
     se = "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
-    return (up_sym, ts, fn, uj, aj, yy, mm, co1, pe, emp, th, lr, te, mc, se)
+    return (up_sym, ts, fn, uj, bur, aj, yy, mm, co1, pe, emp, th, lr, te, mc, se)
 
 
 def run_analysis(

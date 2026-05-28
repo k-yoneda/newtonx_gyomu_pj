@@ -24,6 +24,7 @@ from kintai_core import (
     EXCEL_SUFFIXES,
     LEGACY_COMPANY_COL,
     LEGACY_COMPANY_NAME_COL,
+    LEGACY_COMPANY_READ_LONG_COL,
     LEGACY_FILE_NAME_COL,
     LEGACY_EMPLOYEE_NO_COL,
     LEGACY_MONTH_COL,
@@ -31,8 +32,11 @@ from kintai_core import (
     LEGACY_TARGET_FILE_NAME_COL,
     LEGACY_YEAR_COL,
     PARALLEL_WORKERS_MAX,
+    LEGACY_USER_JUDGMENT_COL,
+    SUMMARY_BILLING_UPDATE_RESULT_COL,
     SUMMARY_COMPANY_COL,
     SUMMARY_EMPLOYEE_NO_COL,
+    SUMMARY_FINAL_JUDGMENT_COL,
     SUMMARY_MONTH_COL,
     SUMMARY_PERSON_COL,
     SUMMARY_YEAR_COL,
@@ -177,7 +181,9 @@ class KintaiApp(tk.Frame):
     TARGET_FILE_NAME_COL = TARGET_FILE_NAME_COL
     LEGACY_TARGET_FILE_NAME_COL = LEGACY_TARGET_FILE_NAME_COL
     LEGACY_FILE_NAME_COL = LEGACY_FILE_NAME_COL
-    USER_JUDGMENT_COL = "ユーザ判断"
+    FINAL_JUDGMENT_COL = SUMMARY_FINAL_JUDGMENT_COL
+    LEGACY_USER_JUDGMENT_COL = LEGACY_USER_JUDGMENT_COL
+    BILLING_UPDATE_RESULT_COL = SUMMARY_BILLING_UPDATE_RESULT_COL
     AUTO_JUDGMENT_COL = "自動判断"
     YEAR_COL = SUMMARY_YEAR_COL
     MONTH_COL = SUMMARY_MONTH_COL
@@ -191,11 +197,12 @@ class KintaiApp(tk.Frame):
     COMPANY_COL = SUMMARY_COMPANY_COL
     LEGACY_COMPANY_COL = LEGACY_COMPANY_COL
     LEGACY_COMPANY_NAME_COL = LEGACY_COMPANY_NAME_COL
+    LEGACY_COMPANY_READ_LONG_COL = LEGACY_COMPANY_READ_LONG_COL
     LEGACY_YEAR_COL = LEGACY_YEAR_COL
     LEGACY_MONTH_COL = LEGACY_MONTH_COL
     LEGACY_PERSON_COL = LEGACY_PERSON_COL
     LEGACY_EMPLOYEE_NO_COL = LEGACY_EMPLOYEE_NO_COL
-    # 「エラー再解析」対象: ユーザ判断が「〇」以外の行
+    # 「エラー再解析」対象: 最終判断が「〇」以外の行
     _ERROR_REANALYSIS_OK_VALUES = ("〇",)
     # 記号列（〇/△/✖ 等）の列幅（px）
     _SYMBOL_COLUMN_WIDTHS: dict[str, int] = {
@@ -203,7 +210,8 @@ class KintaiApp(tk.Frame):
         "対象シート有無": 88,
         YEAR_COL: 56,
         MONTH_COL: 56,
-        USER_JUDGMENT_COL: 72,
+        FINAL_JUDGMENT_COL: 72,
+        BILLING_UPDATE_RESULT_COL: 88,
         AUTO_JUDGMENT_COL: 72,
         MATCH_COMPANY_COL: 72,
         "押印有無": 72,
@@ -754,7 +762,8 @@ class KintaiApp(tk.Frame):
     def _is_error_reanalysis_target_row(self, row: dict[str, str]) -> bool:
         symbol = normalize_judgment_symbol(
             (
-                row.get(self.USER_JUDGMENT_COL)
+                row.get(self.FINAL_JUDGMENT_COL)
+                or row.get(self.LEGACY_USER_JUDGMENT_COL)
                 or row.get("user_judgment_company")
                 or ""
             ).strip()
@@ -900,7 +909,8 @@ class KintaiApp(tk.Frame):
             (self.TARGET_FILE_NAME_COL, "file_name"),
             ("アップロード", "upload_ok"),
             ("対象シート有無", "target_sheet_exists"),
-            (self.USER_JUDGMENT_COL, "user_judgment_company"),
+            (self.FINAL_JUDGMENT_COL, "user_judgment_company"),
+            (self.BILLING_UPDATE_RESULT_COL, "billing_file_update_result"),
             (self.YEAR_COL, "year"),
             (self.MONTH_COL, "month"),
             (self.COMPANY_COL, "name_company_1"),
@@ -946,6 +956,7 @@ class KintaiApp(tk.Frame):
             elif core_key == "name_company_1":
                 val = str(
                     row.get(self.COMPANY_COL)
+                    or row.get(self.LEGACY_COMPANY_READ_LONG_COL)
                     or row.get(self.LEGACY_COMPANY_NAME_COL)
                     or row.get(self.LEGACY_COMPANY_COL)
                     or row.get(core_key)
@@ -962,6 +973,20 @@ class KintaiApp(tk.Frame):
                 val = str(
                     row.get(self.EMPLOYEE_NO_COL)
                     or row.get(self.LEGACY_EMPLOYEE_NO_COL)
+                    or row.get(core_key)
+                    or ""
+                ).strip()
+            elif core_key == "user_judgment_company":
+                val = str(
+                    row.get(self.FINAL_JUDGMENT_COL)
+                    or row.get(self.LEGACY_USER_JUDGMENT_COL)
+                    or row.get(core_key)
+                    or ""
+                ).strip()
+                val = normalize_judgment_symbol(val) if val else ""
+            elif core_key == "billing_file_update_result":
+                val = str(
+                    row.get(self.BILLING_UPDATE_RESULT_COL)
                     or row.get(core_key)
                     or ""
                 ).strip()
@@ -988,7 +1013,7 @@ class KintaiApp(tk.Frame):
         )
 
     def _user_judgment_column_index(self) -> int:
-        return list(self._tree["columns"]).index(self.USER_JUDGMENT_COL)
+        return list(self._tree["columns"]).index(self.FINAL_JUDGMENT_COL)
 
     def _employee_no_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.EMPLOYEE_NO_COL)
@@ -1015,7 +1040,7 @@ class KintaiApp(tk.Frame):
         aj = auto_judgment_symbol(core)
         core["auto_judgment"] = aj
         core["user_judgment_company"] = aj
-        core[self.USER_JUDGMENT_COL] = aj
+        core[self.FINAL_JUDGMENT_COL] = aj
         self._replace_row_with_result(
             rid, core, sync_user_judgment_to_auto=True
         )
@@ -1040,8 +1065,8 @@ class KintaiApp(tk.Frame):
         self._tree.selection_set(rid)
         menu = tk.Menu(self, tearoff=0)
 
-        # ユーザ判断列: 右クリックで 〇/△/✖ を選択
-        if cols[ci] == self.USER_JUDGMENT_COL:
+        # 最終判断列: 右クリックで 〇/△/✖ を選択
+        if cols[ci] == self.FINAL_JUDGMENT_COL:
             opts = (
                 ("〇", "〇"),
                 ("△", "△"),
@@ -1449,7 +1474,7 @@ class KintaiApp(tk.Frame):
         target_iids = self._eligible_error_reanalysis_iids()
         if not target_iids:
             messagebox.showinfo(
-                "エラー再解析", "対象行がありません（ユーザ判断が『〇』以外の行）。"
+                "エラー再解析", "対象行がありません（最終判断が『〇』以外の行）。"
             )
             self._refresh_reanalysis_buttons_state()
             return
@@ -1463,7 +1488,7 @@ class KintaiApp(tk.Frame):
         self._run_targeted_reanalysis(
             iid_by_file,
             label="エラー再解析",
-            complete_message=f"ユーザ判断が〇以外の行を再解析しました。\n対象: {total} 件",
+            complete_message=f"最終判断が〇以外の行を再解析しました。\n対象: {total} 件",
         )
 
     def _set_user_judgment_cell(self, rid: str, value: str) -> None:
@@ -2019,7 +2044,12 @@ class KintaiApp(tk.Frame):
             out: dict[str, str] = dict(r)
             out["file_name"] = self._file_name_from_row(r)
             out["resolved_path"] = (r.get("resolved_path") or "").strip()
-            uj = (r.get(self.USER_JUDGMENT_COL) or r.get("user_judgment_company") or "").strip()
+            uj = (
+                r.get(self.FINAL_JUDGMENT_COL)
+                or r.get(self.LEGACY_USER_JUDGMENT_COL)
+                or r.get("user_judgment_company")
+                or ""
+            ).strip()
             if uj:
                 out["user_judgment_company"] = normalize_judgment_symbol(uj)
             ts = (r.get("対象シート有無") or r.get("target_sheet_exists") or "").strip()
@@ -2047,7 +2077,8 @@ class KintaiApp(tk.Frame):
                     uj = normalize_judgment_symbol(
                         (
                             base_map[fn].get("user_judgment_company")
-                            or base_map[fn].get(self.USER_JUDGMENT_COL)
+                            or base_map[fn].get(self.FINAL_JUDGMENT_COL)
+                            or base_map[fn].get(self.LEGACY_USER_JUDGMENT_COL)
                             or ""
                         ).strip()
                     )
@@ -2186,7 +2217,7 @@ class KintaiApp(tk.Frame):
     def _on_row_double_click(self, event: tk.Event) -> None:
         cols = list(self._tree["columns"])
         ci = self._column_index_at_event(event)
-        if 0 <= ci < len(cols) and cols[ci] == self.USER_JUDGMENT_COL:
+        if 0 <= ci < len(cols) and cols[ci] == self.FINAL_JUDGMENT_COL:
             return
         if not (0 <= ci < len(cols) and cols[ci] == self.TARGET_FILE_NAME_COL):
             return
