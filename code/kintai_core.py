@@ -100,14 +100,6 @@ def create_client() -> NewtonXClient:
     return client
 
 
-def resolve_assistant_uid(
-    client: NewtonXClient, name: str = TARGET_ASSISTANT_NAME
-) -> str | None:
-    assistants = client.get_assistants()
-    selected = next((a for a in assistants if a.get("name") == name), None)
-    return str(selected["uid"]) if selected else None
-
-
 def _compress_image_under_1mib(src: Path) -> Path:
     """元ファイルは変更しない。1MiB未満のJPEGを tempfile に書き、そのパスを返す。"""
     img = Image.open(src)
@@ -175,113 +167,355 @@ def _transport_expense_prompt_block(display_file_name: str) -> str:
 """
 
 
+# NewtonX 解析応答 JSON のキー名（仕様固定）
+ANALYSIS_JSON_FIELD_TARGET_FILE = "対象ファイル"
+ANALYSIS_JSON_FIELD_COMPANY = "会社名"
+ANALYSIS_JSON_FIELD_PERSON = "氏名"
+ANALYSIS_JSON_FIELD_YEAR = "年度"
+ANALYSIS_JSON_FIELD_MONTH = "月"
+ANALYSIS_JSON_FIELD_TOTAL_HOURS = "合計勤務時間"
+ANALYSIS_JSON_FIELD_SEAL = "押印有無"
+ANALYSIS_JSON_FIELD_TRANSPORT = "交通費合計"
+
+ANALYSIS_JSON_CANONICAL_KEYS: frozenset[str] = frozenset(
+    {
+        ANALYSIS_JSON_FIELD_TARGET_FILE,
+        ANALYSIS_JSON_FIELD_COMPANY,
+        ANALYSIS_JSON_FIELD_PERSON,
+        ANALYSIS_JSON_FIELD_YEAR,
+        ANALYSIS_JSON_FIELD_MONTH,
+        ANALYSIS_JSON_FIELD_TOTAL_HOURS,
+        ANALYSIS_JSON_FIELD_SEAL,
+        ANALYSIS_JSON_FIELD_TRANSPORT,
+    }
+)
+
+_ANALYSIS_JSON_KEY_ALIASES: dict[str, str] = {
+    "対象ファイル": ANALYSIS_JSON_FIELD_TARGET_FILE,
+    "対象ファイル名": ANALYSIS_JSON_FIELD_TARGET_FILE,
+    TARGET_FILE_NAME_COL: ANALYSIS_JSON_FIELD_TARGET_FILE,
+    LEGACY_TARGET_FILE_NAME_COL: ANALYSIS_JSON_FIELD_TARGET_FILE,
+    LEGACY_FILE_NAME_COL: ANALYSIS_JSON_FIELD_TARGET_FILE,
+    "ファイル名": ANALYSIS_JSON_FIELD_TARGET_FILE,
+    "file_name": ANALYSIS_JSON_FIELD_TARGET_FILE,
+    "会社名": ANALYSIS_JSON_FIELD_COMPANY,
+    "company": ANALYSIS_JSON_FIELD_COMPANY,
+    "氏名": ANALYSIS_JSON_FIELD_PERSON,
+    "person": ANALYSIS_JSON_FIELD_PERSON,
+    "年度": ANALYSIS_JSON_FIELD_YEAR,
+    "年": ANALYSIS_JSON_FIELD_YEAR,
+    "year": ANALYSIS_JSON_FIELD_YEAR,
+    "月": ANALYSIS_JSON_FIELD_MONTH,
+    "month": ANALYSIS_JSON_FIELD_MONTH,
+    "合計勤務時間": ANALYSIS_JSON_FIELD_TOTAL_HOURS,
+    "total_hours": ANALYSIS_JSON_FIELD_TOTAL_HOURS,
+    "押印有無": ANALYSIS_JSON_FIELD_SEAL,
+    "押印": ANALYSIS_JSON_FIELD_SEAL,
+    "seal": ANALYSIS_JSON_FIELD_SEAL,
+    "交通費合計": ANALYSIS_JSON_FIELD_TRANSPORT,
+    "交通費": ANALYSIS_JSON_FIELD_TRANSPORT,
+    "transport": ANALYSIS_JSON_FIELD_TRANSPORT,
+}
+
+
+def _normalize_analysis_json_object(obj: object) -> dict[str, str] | None:
+    """解析応答 JSON オブジェクトを正規化した辞書に変換する。"""
+    if not isinstance(obj, dict):
+        return None
+    out: dict[str, str] = {k: "" for k in ANALYSIS_JSON_CANONICAL_KEYS}
+    for raw_key, raw_val in obj.items():
+        key = unicodedata.normalize("NFKC", str(raw_key or "").strip())
+        if not key:
+            continue
+        canon = _ANALYSIS_JSON_KEY_ALIASES.get(key, key)
+        if canon not in ANALYSIS_JSON_CANONICAL_KEYS:
+            continue
+        if raw_val is None:
+            out[canon] = ""
+        else:
+            out[canon] = str(raw_val).strip()
+    if not any(out.values()):
+        return None
+    return out
+
+
+def _parse_analysis_json_response(text: str) -> dict[str, str] | None:
+    """LLM 応答文字列から解析結果 JSON を抽出する。"""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    candidates: list[str] = [raw]
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw, re.IGNORECASE)
+    if fence:
+        candidates.insert(0, fence.group(1).strip())
+    brace = re.search(r"\{[\s\S]*\}", raw)
+    if brace:
+        candidates.append(brace.group(0))
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        normalized = _normalize_analysis_json_object(obj)
+        if normalized:
+            return normalized
+    return None
+
+
+def _analysis_json_to_kintai_tab(analysis_json: dict[str, str]) -> dict[str, str]:
+    """解析 JSON を _enrich_with_match_scores 用の内部キー辞書に変換する。"""
+    return {
+        "company": (analysis_json.get(ANALYSIS_JSON_FIELD_COMPANY) or "").strip(),
+        "person": (analysis_json.get(ANALYSIS_JSON_FIELD_PERSON) or "").strip(),
+        "year": (analysis_json.get(ANALYSIS_JSON_FIELD_YEAR) or "").strip(),
+        "month": (analysis_json.get(ANALYSIS_JSON_FIELD_MONTH) or "").strip(),
+        "total": (analysis_json.get(ANALYSIS_JSON_FIELD_TOTAL_HOURS) or "").strip(),
+        "seal": (analysis_json.get(ANALYSIS_JSON_FIELD_SEAL) or "").strip(),
+        "transport": (analysis_json.get(ANALYSIS_JSON_FIELD_TRANSPORT) or "").strip(),
+    }
+
+
+def _build_json_response_instruction(display_file_name: str) -> str:
+    """画像・PDF 共通: JSON 出力形式の指示ブロック。"""
+    transport_note = ""
+    if _filename_has_transport_expense_marker(display_file_name):
+        transport_note = (
+            f'  "{ANALYSIS_JSON_FIELD_TRANSPORT}": "税込み優先。読取不可は（なし）",\n'
+        )
+    else:
+        transport_note = f'  "{ANALYSIS_JSON_FIELD_TRANSPORT}": "",\n'
+    return f"""
+７）出力形式
+必ず次のキー名を持つ JSON オブジェクト1つのみを返してください。
+説明文・Markdown 表・コードフェンス（```）は付けないでください。値はすべて文字列にしてください。
+
+{{
+  "{ANALYSIS_JSON_FIELD_TARGET_FILE}": "{display_file_name}",
+  "{ANALYSIS_JSON_FIELD_COMPANY}": "",
+  "{ANALYSIS_JSON_FIELD_PERSON}": "",
+  "{ANALYSIS_JSON_FIELD_YEAR}": "",
+  "{ANALYSIS_JSON_FIELD_MONTH}": "",
+  "{ANALYSIS_JSON_FIELD_TOTAL_HOURS}": "",
+  "{ANALYSIS_JSON_FIELD_SEAL}": "〇 または ✖",
+{transport_note}}}
+"""
+
+
+def _apply_analysis_response_to_row(
+    row: dict[str, str],
+    analysis_json: dict[str, str] | None,
+    raw_response: str,
+    *,
+    prefer_kintai_section: bool = False,
+) -> None:
+    """analyze_image_once / analyze_pdf_once の戻り値を行データに反映する。"""
+    if analysis_json:
+        row["analysis"] = json.dumps(analysis_json, ensure_ascii=False, indent=2)
+    else:
+        row["analysis"] = (
+            raw_response if raw_response else "（解析結果を取得できませんでした）"
+        )
+    _enrich_with_match_scores(
+        row,
+        row["analysis"],
+        prefer_kintai_section=prefer_kintai_section,
+        analysis_json=analysis_json,
+    )
+
+
 def _build_check_message(display_file_name: str) -> str:
-    """解析結果に出すファイル名をローカルの実名に固定する。"""
-    transport_block = _transport_expense_prompt_block(display_file_name)
-    transport_line = (
-        "\n交通費合計：（税抜・税込両方ある場合は税込みの金額。表記のまま）\n"
-        if transport_block
-        else ""
-    )
     return f"""
-勤務表の画像を解析し、１画像１行で以下の内容にあたるものをmd形式で表で出力してください。
-１）会社名の抽出について
-画像ファイル名の会社名は会社名として出力しないこと。
-会社名は、{display_file_name}から、先頭に[]でくくられた部分がある場合はそれ以降から次の'_’までの文字列を正規会社名としする。
-会社名は、{display_file_name}から、先頭に[]でくくられた部分がない場合は先頭から最初の'_’までの文字列を正規会社名としする。
-画像内から、正規会社名の全部または一部をさがしてください。それを会社名として表示してください。存在しない場合は、'（存在しない）'と出力してください。
-正規会社名と読み取った会社名のアルファベット、カタカナの全角、半角、大文字小文字の違いは、同じものとみなしてください。
-読み取った会社名にスペースを含んでいる場合もあるが、スペースは無視して、抽出してください。
-ーと-など、画像解析で読み取った文字がおおよそ類似している場合は、同一とみなして出力してください。
-正規会社名には様な度の敬称がついている場合は敬称を除外して正規会社名としてください。
-読み取った会社名がセラクという名称を含むものは、当社の会社名なので、除外してください。
-読み取った会社名の後ろに、支社や事業所名がある場合は、それを除いて出力してください。
-２）氏名の抽出
-ファイル名の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。その前の_から次の_までの文字列が氏名である。
-上記の文字列を氏名として類似した文字列を画像内から氏名として抜き出してください。スペースなどがはいってる場合もあるので、無視してください。
-３）押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
-  ・実際の印鑑の陰影がある：〇
-  ・印鑑の陰影の印刷がある：〇
-  ・サインの筆跡がある：〇
-  ・抽出できない場合：✖
-  ・上記以外の場合：✖
-４）交通費合計の抽出について
-{transport_block}
-５）対象ファイル名について
-画像ファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
-{display_file_name}
+    	アップロードした画像ファイルから以下の情報を抽出してJSON形式でデータのみ返信してください。
+    	
+    	・対象ファイル
+		・会社名
+		・氏名
+		・年度
+		・月
+		・合計勤務時間
+		・押印有無
+		・交通費合計
+    	
+    	各項目の説明
+    	1)対象ファイル
+    		{display_file_name}を値として返す。
+    	2)会社名
+    		アップロードした画像ファイル内の文字を検索し会社名を返します。
+            会社検索キーワードというものを以下に設定するがこれは返却値ではない。
+    		{display_file_name}の先頭に[]でくくられた文字列がある場合、それ以降から次の'_’までの文字列を会社検索キーワードとする（最後の様などの継承は除く）。
+    		{display_file_name}の先頭に[]でくくられた部分がない場合は、先頭から最初の'_’までの文字列を会社検索キーワードとする（最後の様などの継承は除く）。
+    		アップロードした画像ファイル内の文字列から、会社検索キーワードとして記載されている文字列を抽出してください。
+    		ただし、会社検索キーワードとアルファベット、カタカナの全角、半角、大文字小文字の違い、スペースの有無は同じものとみなす。
+    		読み取った会社名の後ろに、支社や事業所名がある場合は、それを除いて出力してください。
+            会社検索キーワードを返すのではなく、画像から抽出した会社名を返すこと。
+            読み取れない場合は、”（データなし）”を返す
+		3)氏名
+            アップロードした画像ファイル内の文字を検索し氏名を返します。
+            氏名検索キーワードを定義するが、これは検索結果ではない。
+			{display_file_name}の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。社員番号の前の"_"から、その前の"_"までの文字列が氏名検索キーワードである。
+			アップロードした画像ファイルから氏名検索キーワードと類似した文字列を画像内から氏名として抜き出してください。
+			氏名検索キーワード、画像内の氏名の比較の際、スペースなどはパックして比較して同じかどうか判断してください。
+            氏名検索キーワードを返すのではなく、画像から抽出した氏名を返すこと。
+            読み取れない場合は、”（データなし）”を返す
+		4)年度
+			年度はアップロードした画像ファイル内の勤務表から読み取れる西暦年度（4桁）を出力してください。読み取れない場合は、”（データなし）”を返す
+		5)月
+			月はアップロードした画像ファイル内の勤務表から読み取れる月（1〜12）を出力してください。読み取れない場合は、”（データなし）”を返す
+		6)合計勤務時間
+			アップロードした画像ファイルから、総労働時間と思える文字列をそのまま抽出してください。
+			例）（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
+		7)押印有無
+			押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
+			アップロードした画像ファイルの中に
+  				・実際の印鑑の陰影がある：〇
+  				・印鑑の陰影の印刷がある：〇
+  				・サインの筆跡がある：〇
+  				・抽出できない場合：✖
+  				・上記以外の場合：✖
+		8)交通費合計
+			{display_file_name}に"交通費"という文字がある場合
+				アップロードした画像ファイルの中で
+				交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
+				税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
+				金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
+			{display_file_name}に"交通費"という文字がある場合は""（空文字）を返す	
+     
+    """
 
-６）出力項目は以下の通り
-対象ファイル：{display_file_name}
-会社名：
-氏名：
-年度：
-月：
-合計勤務時間：（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
-押印有無：〇/✖
-{transport_line}
-"""
+# def _build_check_message(display_file_name: str) -> str:
+#     """解析結果に出すファイル名をローカルの実名に固定する。"""
+#     transport_block = _transport_expense_prompt_block(display_file_name)
+#     transport_line = (
+#         "\n交通費合計：（税抜・税込両方ある場合は税込みの金額。表記のまま）\n"
+#         if transport_block
+#         else ""
+#     )
+#     return f"""
+# 勤務表の画像を解析し、１画像１行で以下の内容にあたるものをmd形式で表で出力してください。
+# １）会社名の抽出について
+# 画像ファイル名の会社名は会社名として出力しないこと。
+# 会社名は、{display_file_name}から、先頭に[]でくくられた部分がある場合はそれ以降から次の'_’までの文字列を会社検索キーワードとしする。
+# 会社名は、{display_file_name}から、先頭に[]でくくられた部分がない場合は先頭から最初の'_’までの文字列を会社検索キーワードとしする。
+# 画像内から、会社検索キーワードの全部または一部をさがしてください。それを会社名として表示してください。存在しない場合は、'（存在しない）'と出力してください。
+# 会社検索キーワードと読み取った会社名のアルファベット、カタカナの全角、半角、大文字小文字の違いは、同じものとみなしてください。
+# 読み取った会社名にスペースを含んでいる場合もあるが、スペースは無視して、抽出してください。
+# ーと-など、画像解析で読み取った文字がおおよそ類似している場合は、同一とみなして出力してください。
+# 会社検索キーワードには様な度の敬称がついている場合は敬称を除外して会社検索キーワードとしてください。
+# 読み取った会社名がセラクという名称を含むものは、当社の会社名なので、除外してください。
+# 読み取った会社名の後ろに、支社や事業所名がある場合は、それを除いて出力してください。
+# ２）氏名の抽出
+# ファイル名の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。その前の_から次の_までの文字列が氏名である。
+# 上記の文字列を氏名として類似した文字列を画像内から氏名として抜き出してください。スペースなどがはいってる場合もあるので、無視してください。
+# ３）押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
+#   ・実際の印鑑の陰影がある：〇
+#   ・印鑑の陰影の印刷がある：〇
+#   ・サインの筆跡がある：〇
+#   ・抽出できない場合：✖
+#   ・上記以外の場合：✖
+# ４）交通費合計の抽出について
+# {transport_block}
+# ５）対象ファイル名について
+# 画像ファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
+# {display_file_name}
 
-
+# ６）出力項目は以下の通り
+# 対象ファイル：{display_file_name}
+# 会社名：
+# 氏名：
+# 年度：
+# 月：
+# 合計勤務時間：（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
+# 押印有無：〇/✖
+# {transport_line}
+# """
 def _build_pdf_check_message(display_file_name: str) -> str:
-    """PDF用。アップロード直後は send_message にドキュメントIDを渡さなくても参照できる想定。"""
-    transport_block = _transport_expense_prompt_block(display_file_name)
-    transport_line = (
-        "\n交通費合計：（税抜・税込両方ある場合は税込みの金額。表記のまま）\n"
-        if transport_block
-        else ""
-    )
-    transport_pdf_note = (
-        "ファイル名に「交通費」を含むため、交通費合計は経費精算・交通費の記載から抽出してください（勤怠と経費が混在する場合、交通費合計のみ経費側を参照してよい）。\n"
-        if transport_block
-        else ""
-    )
     return f"""
-{transport_pdf_note}
-同じPDFに勤怠（出退勤・打刻・勤務時間等）の情報と経費精算（領収書・立替等）の情報の両方が含まれている場合は、経費精算は無視し、必ず勤怠（勤務表）の情報だけを根拠に回答してください。経費側の社名・氏名・金額は採用しないでください。
-PDFファイル名の会社名は会社名として抽出しないこと。
-勤務表（勤怠）のPDFを解析し、１ファイルあたり適切な行数で以下の内容にあたるものをmd形式で表で出力してください。出力する勤務先・氏名・合計勤務時間・押印はすべて勤怠部分の記載に基づきます。
-１）会社名の抽出について
-画像ファイル名の会社名は会社名として出力しないこと。
-会社名は、{display_file_name}から、先頭に[]でくくられた部分がある場合はそれ以降から次の'_’までの文字列を正規会社名としする。
-会社名は、{display_file_name}から、先頭に[]でくくられた部分がない場合は先頭から最初の'_’までの文字列を正規会社名としする。
-PDF内から、正規会社名の全部または一部をさがしてください。それを会社名として表示してください。存在しない場合は、'（存在しない）'と出力してください。
-正規会社名と読み取った会社名のアルファベット、カタカナの全角、半角、大文字小文字の違いは、同じものとみなしてください。
-読み取った会社名にスペースを含んでいる場合もあるが、スペースは無視して、抽出してください。
-ーと-など、画像解析で読み取った文字がおおよそ類似している場合は、同一とみなして出力してください。
-正規会社名には様な度の敬称がついている場合は敬称を除外して正規会社名としてください。
-読み取った会社名がセラクという名称を含むものは、当社の会社名なので、除外してください。
-読み取った会社名の後ろに、支社や事業所名がある場合は、それを除いて出力してください。
-２）氏名の抽出
-ファイル名の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。その前の_から次の_までの文字列が氏名である。
-上記の文字列を氏名として類似した文字列をＰＤＦ内から氏名として抜き出してください。スペースなどがはいってる場合もあるので、無視してください
-３）押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
-  ・実際の印鑑の陰影がある：〇
-  ・印鑑の陰影の印刷がある：〇
-  ・サインの筆跡がある：〇
-  ・抽出できない場合：✖
-  ・上記以外の場合：✖
-３）押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
-  ・実際の印鑑の陰影がある：〇
-  ・印鑑の陰影の印刷がある：〇
-  ・サインの筆跡がある：〇
-  ・抽出できない場合：✖
-  ・上記以外の場合：✖
-４）交通費合計の抽出について
-{transport_block}
-５）対象ファイル名について
-ＰＤＦファイル名（アップロードファイル名）として、次の名前のみを記載してください（サーバー側のIDや別名は使わないこと）:
+    	アップロードしたPDFファイルから以下の情報を抽出してJSON形式でデータのみ返信してください。
+    	
+    	・対象ファイル
+		・会社名
+		・氏名
+		・年度
+		・月
+		・合計勤務時間
+		・押印有無
+		・交通費合計
+    	
+    	各項目の説明
+    	1)対象ファイル
+    		{display_file_name}を値として返す。
+    	2)会社名
+    		アップロードしたPDFファイル内の文字を検索し会社名を返します。
+            会社検索キーワードというものを以下に設定するがこれは返却値ではない。
+    		{display_file_name}の先頭に[]でくくられた文字列がある場合、それ以降から次の'_’までの文字列を会社検索キーワードとする（最後の様などの継承は除く）。
+    		{display_file_name}の先頭に[]でくくられた部分がない場合は、先頭から最初の'_’までの文字列を会社検索キーワードとする（最後の様などの継承は除く）。
+    		アップロードしたPDFファイル内の文字列から、会社検索キーワードとして記載されている文字列を抽出してください。
+    		ただし、会社検索キーワードとアルファベット、カタカナの全角、半角、大文字小文字の違い、スペースの有無は同じものとみなす。
+    		読み取った会社名の後ろに、支社や事業所名がある場合は、それを除いて出力してください。
+            会社検索キーワードを返すのではなく、PDFから抽出した会社名を返すこと。
+            読み取れない場合は、”（データなし）”を返す
 
-６）出力項目は以下の通り
-対象ファイル：{display_file_name}
-会社名：
-氏名：
-年度：
-月：
-合計勤務時間：（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
-押印有無：〇/✖
-{transport_line}
-"""
+		3)氏名
+            アップロードしたPDFファイル内の文字を検索し氏名を返します。
+            氏名検索キーワードを定義するが、これは検索結果ではない。
+			{display_file_name}の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。社員番号の前の"_"から、その前の"_"までの文字列が氏名検索キーワードである。
+			アップロードしたPDFファイルから氏名検索キーワードと類似した文字列を画像内から氏名として抜き出してください。
+			氏名検索キーワード、画像内の氏名の比較の際、スペースなどはパックして比較して同じかどうか判断してください。
+            氏名検索キーワードを返すのではなく、PDFから抽出した氏名を返すこと。
+            読み取れない場合は、”（データなし）”を返す
+		4)年度
+			年度はアップロードしたPDFファイル内の勤務表から読み取れる西暦年度（4桁）を出力してください。読み取れない場合は、”（データなし）”を返す
+		5)月
+			月はアップロードしたPDFファイル内の勤務表から読み取れる月（1〜12）を出力してください。読み取れない場合は、”（データなし）”を返す
+		6)合計勤務時間
+			アップロードしたPDFファイルから、総労働時間と思える文字列をそのまま抽出してください。
+			例）（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
+		7)押印有無
+			押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
+			アップロードしたPDFファイルの中に
+  				・実際の印鑑の陰影がある：〇
+  				・印鑑の陰影の印刷がある：〇
+  				・サインの筆跡がある：〇
+  				・抽出できない場合：✖
+  				・上記以外の場合：✖
+		8)交通費合計
+			{display_file_name}に"交通費"という文字がある場合
+				アップロードしたPDFファイルの中で
+				交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
+				税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
+				金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
+			{display_file_name}に"交通費"という文字がある場合は""（空文字）を返す	
+     
+    """
+# def _build_pdf_check_message(display_file_name: str) -> str:
+#     """PDF用。アップロード直後は send_message にドキュメントIDを渡さなくても参照できる想定。"""
+#     transport_block = _transport_expense_prompt_block(display_file_name)
+#     transport_pdf_note = (
+#         "ファイル名に「交通費」を含むため、交通費合計は経費精算・交通費の記載から抽出してください（勤怠と経費が混在する場合、交通費合計のみ経費側を参照してよい）。\n"
+#         if transport_block
+#         else ""
+#     )
+#     return f"""
+# {transport_pdf_note}
+# 同じPDFに勤怠（出退勤・打刻・勤務時間等）の情報と経費精算（領収書・立替等）の情報の両方が含まれている場合は、経費精算は無視し、必ず勤怠（勤務表）の情報だけを根拠に回答してください。経費側の社名・氏名・金額は採用しないでください。
+# PDFファイル名の会社名は会社名として抽出しないこと。
+# 勤務表（勤怠）のPDFを解析してください。出力する勤務先・氏名・合計勤務時間・押印はすべて勤怠部分の記載に基づきます。
+# １）会社名の抽出について
+# 会社名は、{display_file_name}から、先頭に[]でくくられた部分がある場合はそれ以降から次の'_'までの文字列を会社検索キーワードとする。
+# 会社名は、{display_file_name}から、先頭に[]でくくられた部分がない場合は先頭から最初の'_'までの文字列を会社検索キーワードとする。
+# PDF内から、会社検索キーワードの全部または一部をさがしてください。存在しない場合は、'（存在しない）'と出力してください。
+# ２）氏名の抽出
+# ファイル名の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。その前の_から次の_までの文字列が氏名である。
+# 上記の文字列を氏名として類似した文字列をPDF内から氏名として抜き出してください。
+# ３）押印有無については、〇、✖以外の結果は返さないでください。
+# ４）交通費合計の抽出について
+# {transport_block}
+# ５）年度・月は勤怠表から読み取れる西暦年度（4桁）と月（1〜12）を出力してください。
+# ６）合計勤務時間は勤怠部分の合計・総労働時間等を表記のまま出力してください。
+# {_build_json_response_instruction(display_file_name)}
+# """
 
 
 def _excel_target_sheet_symbol(
@@ -1573,21 +1807,29 @@ def _enrich_with_match_scores(
     analysis: str,
     *,
     prefer_kintai_section: bool = False,
+    analysis_json: dict[str, str] | None = None,
 ) -> None:
     """比較記号（会社名・氏名）と参照文字列を row に追加。
 
     追加仕様:
       - 画像ファイル名の「拡張子の前にある7桁」を社員番号として扱い、氏名の右（別列）に表示する。
       - 末尾7文字が存在するのに数字7桁ではない場合、「社員番号エラー」と表示する。
+      - analysis_json 指定時は Markdown 表ではなく JSON 応答を優先する。
     """
 
-    text_for_extraction = (
-        _prefer_kintai_text_for_extraction(analysis) if prefer_kintai_section else analysis
-    )
     fn = row.get("file_name", "")
+    if analysis_json:
+        ktab = _analysis_json_to_kintai_tab(analysis_json)
+        text_for_extraction = analysis
+    else:
+        text_for_extraction = (
+            _prefer_kintai_text_for_extraction(analysis)
+            if prefer_kintai_section
+            else analysis
+        )
+        ktab = _extract_kintai_from_markdown_table(text_for_extraction, fn) or {}
     fp_co, fp_pe = _parse_filename_company_and_person(fn)
     row["employee_no"] = _employee_no_from_file_name(fn)
-    ktab = _extract_kintai_from_markdown_table(text_for_extraction, fn) or {}
     k_co = (ktab.get("company") or "").strip()
     name_company_1 = _document_company_for_display(k_co)
     doc_co_match = _document_company_for_match(k_co)
@@ -2627,12 +2869,14 @@ def run_analysis(
                                         "中断: 画像の解析要求前にキャンセルされました"
                                     )
                                     break
-                                def analyze_image_once() -> str:
-                                    return wc.send_message(
+                                def analyze_image_once() -> tuple[dict[str, str] | None, str]:
+                                    raw = wc.send_message(
                                         chat_uid=chat_holder["chat_uid"],
                                         message=_build_check_message(file_path.name),
                                         image_ids=[image_id],
                                     )
+                                    text = raw or ""
+                                    return _parse_analysis_json_response(text), text
 
                                 if is_cancelled():
                                     log(
@@ -2646,11 +2890,10 @@ def run_analysis(
                                     "analysis": "",
                                 }
                                 attach_year_month(row)
-                                response = analyze_image_once()
-                                row["analysis"] = (
-                                    response if response else "（解析結果を取得できませんでした）"
+                                analysis_json, raw_response = analyze_image_once()
+                                _apply_analysis_response_to_row(
+                                    row, analysis_json, raw_response
                                 )
-                                _enrich_with_match_scores(row, row["analysis"])
                                 bucket_results[worker_idx].append(row)
                                 emit_summary_row_md(row)
                                 emit_company_match_ratio_progress(row)
@@ -2698,11 +2941,13 @@ def run_analysis(
                                     "中断: PDFの解析要求前にキャンセルされました"
                                 )
                                 break
-                            def analyze_pdf_once() -> str:
-                                return wc.send_message(
+                            def analyze_pdf_once() -> tuple[dict[str, str] | None, str]:
+                                raw = wc.send_message(
                                     chat_uid=chat_holder["chat_uid"],
                                     message=_build_pdf_check_message(file_path.name),
                                 )
+                                text = raw or ""
+                                return _parse_analysis_json_response(text), text
 
                             if is_cancelled():
                                 log(
@@ -2716,13 +2961,11 @@ def run_analysis(
                                 "analysis": "",
                             }
                             attach_year_month(row2)
-                            response = analyze_pdf_once()
-                            row2["analysis"] = (
-                                response if response else "（解析結果を取得できませんでした）"
-                            )
-                            _enrich_with_match_scores(
+                            analysis_json, raw_response = analyze_pdf_once()
+                            _apply_analysis_response_to_row(
                                 row2,
-                                row2["analysis"],
+                                analysis_json,
+                                raw_response,
                                 prefer_kintai_section=True,
                             )
                             bucket_results[worker_idx].append(row2)

@@ -1103,12 +1103,6 @@ class KintaiApp(tk.Frame):
     def _total_hours_raw_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.TOTAL_HOURS_RAW_COL)
 
-    def _year_column_index(self) -> int:
-        return list(self._tree["columns"]).index(self.YEAR_COL)
-
-    def _month_column_index(self) -> int:
-        return list(self._tree["columns"]).index(self.MONTH_COL)
-
     def _recalculate_auto_judgment_for_row(
         self, rid: str, row: dict[str, str] | None = None
     ) -> None:
@@ -2045,18 +2039,6 @@ class KintaiApp(tk.Frame):
             return False
         cur = self._compute_snapshot(rows)
         return cur != (self._last_saved_snapshot or "")
-
-    def _auto_save_on_exit(self) -> None:
-        rows = self._current_grid_rows()
-        if not rows:
-            return
-        # 終了時の自動保存は常に日時付きの新規ファイル
-        out_name = self._suggest_timestamped_name()
-        out_path = Path.cwd() / out_name
-        self._write_json_file(out_path, rows)
-        self._loaded_json_path = out_path
-        self._loaded_rows = rows
-        self._last_saved_snapshot = self._compute_snapshot(rows)
 
     def _on_close(self) -> None:
         if self._busy:
