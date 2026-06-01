@@ -50,7 +50,6 @@ from kintai_core import (
     create_client,
     is_manual_user_judgment,
     normalize_judgment_symbol,
-    prepare_analysis_filenames_in_data_dir,
     row_display_values,
     run_analysis,
     summary_header_cells,
@@ -213,7 +212,7 @@ class KintaiApp(tk.Frame):
         YEAR_COL: 56,
         MONTH_COL: 56,
         FINAL_JUDGMENT_COL: 72,
-        BILLING_UPDATE_RESULT_COL: 88,
+        BILLING_UPDATE_RESULT_COL: 120,
         AUTO_JUDGMENT_COL: 72,
         MATCH_COMPANY_COL: 72,
         "押印有無": 72,
@@ -1066,6 +1065,7 @@ class KintaiApp(tk.Frame):
             elif core_key == "billing_file_update_result":
                 val = str(
                     row.get(self.BILLING_UPDATE_RESULT_COL)
+                    or row.get("請求量ファイル更新結果")
                     or row.get(core_key)
                     or ""
                 ).strip()
@@ -1301,7 +1301,6 @@ class KintaiApp(tk.Frame):
                     parallel_chats=1,
                     expected_year=exp_y,
                     expected_month=exp_m,
-                    billing_path=self._billing_file_path,
                 )
             except BaseException as e:
                 err = e
@@ -1457,21 +1456,6 @@ class KintaiApp(tk.Frame):
         def worker() -> None:
             err: BaseException | None = None
             try:
-                billing_path = self._billing_file_path
-                if billing_path is not None and billing_path.is_file():
-                    rename_map = prepare_analysis_filenames_in_data_dir(
-                        td,
-                        billing_path,
-                        target_file_names=set(file_names),
-                        on_log=log_line,
-                    )
-                    for old, new in rename_map.items():
-                        rid = iid_by_file.pop(old, None)
-                        if rid:
-                            iid_by_file[new] = rid
-                    file_names.clear()
-                    file_names.update(iid_by_file.keys())
-
                 exp_y, exp_m = self._expected_year_month()
                 run_analysis(
                     client,
@@ -1488,7 +1472,6 @@ class KintaiApp(tk.Frame):
                     parallel_chats=parallel,
                     expected_year=exp_y,
                     expected_month=exp_m,
-                    billing_path=billing_path,
                 )
             except BaseException as e:
                 err = e
@@ -2241,41 +2224,6 @@ class KintaiApp(tk.Frame):
                         if fn:
                             skip_names.add(fn)
 
-                billing_path = self._billing_file_path
-                if billing_path is not None and billing_path.is_file():
-                    rename_map = prepare_analysis_filenames_in_data_dir(
-                        td,
-                        billing_path,
-                        skip_file_names=skip_names,
-                        on_log=log_line,
-                    )
-                    if rename_map:
-                        if skip_names:
-                            skip_names = {rename_map.get(n, n) for n in skip_names}
-                        for old, new in rename_map.items():
-                            if old not in base_map:
-                                continue
-                            row = dict(base_map.pop(old))
-                            row["file_name"] = new
-                            resolved = (row.get("resolved_path") or "").strip()
-                            if resolved:
-                                try:
-                                    rp = Path(resolved)
-                                    if rp.name == old:
-                                        row["resolved_path"] = str(rp.with_name(new))
-                                except OSError:
-                                    pass
-                            base_map[new] = row
-                        sync_done = threading.Event()
-
-                        def sync_grid() -> None:
-                            if base_map:
-                                self._rebuild_grid_from_rows(list(base_map.values()))
-                            sync_done.set()
-
-                        self.after(0, sync_grid)
-                        sync_done.wait(timeout=10.0)
-
                 exp_y, exp_m = self._expected_year_month()
                 rows_result = run_analysis(
                     client,
@@ -2291,7 +2239,6 @@ class KintaiApp(tk.Frame):
                     parallel_chats=parallel,
                     expected_year=exp_y,
                     expected_month=exp_m,
-                    billing_path=billing_path,
                 )
             except BaseException as e:
                 err = e

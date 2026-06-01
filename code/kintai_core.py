@@ -60,7 +60,9 @@ SUMMARY_EMPLOYEE_NO_COL = "社員番号（ファイル名より）"
 LEGACY_EMPLOYEE_NO_COL = "社員番号"
 SUMMARY_FINAL_JUDGMENT_COL = "最終判断"
 LEGACY_USER_JUDGMENT_COL = "ユーザ判断"
-SUMMARY_BILLING_UPDATE_RESULT_COL = "請求量ファイル更新結果"
+SUMMARY_BILLING_UPDATE_RESULT_COL = "請求用ファイル更新"
+LEGACY_BILLING_UPDATE_RESULT_COL = "請求量ファイル更新結果"
+BILLING_UPDATE_NO_TARGET_RECORD = "（対象レコードなし）"
 BILLING_ENGINEER_TS_SHEET_NAME = "エンジニアTS一覧"
 BILLING_TS_COL_EMPLOYEE_NO = 1  # A列
 BILLING_TS_COL_CLIENT_NAME = 4  # D列: 取引先名
@@ -646,11 +648,6 @@ def _employee_no_from_file_name(file_name: str) -> str:
     return "社員番号エラー"
 
 
-def has_valid_employee_no_in_file_name(file_name: str) -> bool:
-    """ファイル名末尾に有効な社員番号（7桁 or BP+5桁）があるか。"""
-    return _is_valid_employee_no(_employee_no_from_file_name(file_name))
-
-
 def _filename_person_for_billing_lookup(person_segment: str) -> str:
     """ファイル名の会社名以降セグメントから、請求シート照合用の氏名を抽出する。"""
     skip_tokens = frozenset(
@@ -751,68 +748,6 @@ def lookup_employee_no_in_billing_file(
         if _billing_sheet_row_matches_filename(file_co, file_pe_seg, client, person):
             return emp
     return ""
-
-
-def _rename_file_with_employee_no(file_path: Path, employee_no: str) -> Path:
-    """拡張子の直前に _社員番号 を付けてリネーム。成功時は新パスを返す。"""
-    emp = (employee_no or "").strip()
-    if not emp or not file_path.is_file():
-        return file_path
-    new_path = file_path.with_name(f"{file_path.stem}_{emp}{file_path.suffix}")
-    if new_path.exists() and new_path.resolve() != file_path.resolve():
-        return file_path
-    file_path.rename(new_path)
-    return new_path
-
-
-def prepare_analysis_filenames_in_data_dir(
-    data_dir: Path,
-    billing_path: Path,
-    *,
-    target_file_names: set[str] | None = None,
-    skip_file_names: set[str] | None = None,
-    on_log: Callable[[str], None] | None = None,
-) -> dict[str, str]:
-    """社員番号のないファイル名を請求シート照合でリネームする。旧名→新名の辞書を返す。"""
-    log = on_log if on_log is not None else (lambda _m: None)
-    rename_map: dict[str, str] = {}
-    if not data_dir.is_dir() or not billing_path.is_file():
-        return rename_map
-
-    skip = {str(x).strip() for x in (skip_file_names or set()) if str(x).strip()}
-    targets = {str(x).strip() for x in (target_file_names or set()) if str(x).strip()}
-    all_suffixes = set(IMAGE_SUFFIXES) | {PDF_SUFFIX} | set(EXCEL_SUFFIXES)
-
-    try:
-        sheet_rows = _load_billing_engineer_ts_rows(billing_path)
-    except Exception as e:
-        log(f"請求用ファイルの読み込みに失敗したためリネームをスキップします: {e}")
-        return rename_map
-
-    if not sheet_rows:
-        log("エンジニアTS一覧に照合可能な行がないため、リネームは行いません。")
-        return rename_map
-
-    for p in sorted(data_dir.iterdir(), key=lambda x: x.name):
-        if not p.is_file() or p.suffix.lower() not in all_suffixes:
-            continue
-        if p.name in skip:
-            continue
-        if targets and p.name not in targets:
-            continue
-        if has_valid_employee_no_in_file_name(p.name):
-            continue
-        emp = lookup_employee_no_in_billing_file(
-            billing_path, p.name, sheet_rows=sheet_rows
-        )
-        if not emp:
-            log(f"請求シートに一致なし（リネームなし）: {p.name}")
-            continue
-        new_path = _rename_file_with_employee_no(p, emp)
-        if new_path.name != p.name:
-            rename_map[p.name] = new_path.name
-            log(f"ファイル名を更新: {p.name} → {new_path.name}")
-    return rename_map
 
 
 def _excel_transport_expense_from_sheet(ws) -> str:
@@ -2100,6 +2035,7 @@ def _billing_file_update_result_display(row: dict[str, str]) -> str:
     return (
         row.get("billing_file_update_result")
         or row.get(SUMMARY_BILLING_UPDATE_RESULT_COL)
+        or row.get(LEGACY_BILLING_UPDATE_RESULT_COL)
         or ""
     ).strip()
 
@@ -2199,10 +2135,17 @@ def update_billing_engineer_ts_sheet(
     """最終判断〇行分のデータを請求用 Excel「エンジニアTS一覧」に反映する。
 
     各行について「〇」（更新成功）または「✖」（失敗）を返す（rows と同順）。
+    更新前にファイル名の会社・氏名と請求シート（D/E列）の一致を確認する。
     """
     if not rows:
         return []
     path = billing_path.resolve()
+    try:
+        sheet_rows = _load_billing_engineer_ts_rows(path)
+    except Exception:
+        return ["✖"] * len(rows)
+    if not sheet_rows:
+        return ["✖"] * len(rows)
     suffix = path.suffix.lower()
     keep_vba = suffix in (".xlsm", ".xltm")
     wb = load_workbook(path, keep_vba=keep_vba)
@@ -2213,13 +2156,23 @@ def update_billing_engineer_ts_sheet(
         emp_rows = _build_employee_no_row_index(ws)
         results: list[str] = []
         for row in rows:
-            emp = _normalize_employee_no_cell_value(_row_employee_no(row))
-            if not _is_valid_employee_no(emp):
+            file_name = (row.get("file_name") or "").strip()
+            if not file_name:
                 results.append("✖")
+                continue
+            billing_emp = lookup_employee_no_in_billing_file(
+                path, file_name, sheet_rows=sheet_rows
+            )
+            if not billing_emp:
+                results.append(BILLING_UPDATE_NO_TARGET_RECORD)
+                continue
+            emp = _normalize_employee_no_cell_value(billing_emp)
+            if not _is_valid_employee_no(emp):
+                results.append(BILLING_UPDATE_NO_TARGET_RECORD)
                 continue
             targets = emp_rows.get(emp)
             if not targets:
-                results.append("✖")
+                results.append(BILLING_UPDATE_NO_TARGET_RECORD)
                 continue
             hours = _hours_decimal_for_excel(_row_total_hours_decimal(row))
             if hours is None:
@@ -2547,7 +2500,6 @@ def run_analysis(
     parallel_chats: int = DEFAULT_PARALLEL_ANALYSIS_CHATS,
     expected_year: int | str | None = None,
     expected_month: int | str | None = None,
-    billing_path: Path | None = None,
 ) -> list[dict[str, str]]:
     """
     指定フォルダ直下の画像・PDF・Excel を名前順で処理し、結果行のリストを返す。
@@ -2566,7 +2518,6 @@ def run_analysis(
     cancel_event: threading.Event 互換。set() されたら以降の解析を中断する（処理中の1ファイルは止まらず、次の境界で止まる）。
     skip_file_names: ここに含まれるファイル名は解析処理自体をスキップする（progress は進める）。
     target_file_names: ここに含まれるファイル名だけを解析対象にする。None の場合は全対象ファイル。
-    billing_path: 請求用 Excel。指定時、解析前に社員番号のないファイル名をシート照合でリネームする。
     """
     log = on_log if on_log is not None else print
     row_year, row_month = _year_month_from_data_dir(data_dir)
@@ -2586,18 +2537,6 @@ def run_analysis(
 
     skip_names = {str(x).strip() for x in (skip_file_names or set()) if str(x).strip()}
     target_names = {str(x).strip() for x in (target_file_names or set()) if str(x).strip()}
-
-    if billing_path is not None and billing_path.is_file():
-        rename_map = prepare_analysis_filenames_in_data_dir(
-            data_dir,
-            billing_path,
-            target_file_names=target_names or None,
-            skip_file_names=skip_names or None,
-            on_log=log,
-        )
-        if rename_map:
-            skip_names = {rename_map.get(n, n) for n in skip_names}
-            target_names = {rename_map.get(n, n) for n in target_names}
 
     def _is_target_name(p: Path) -> bool:
         return (not target_names) or p.name in target_names
