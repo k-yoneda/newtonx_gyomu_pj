@@ -22,6 +22,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 # バイナリ換算の 1MiB。「未満」なのでこれ未満のサイズになるよう調整する
 MIB = 1024 * 1024
+# PDF をラスタ化する際の解像度（dpi）
+PDF_RENDER_DPI = 150
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 PDF_SUFFIX = ".pdf"
@@ -146,12 +148,105 @@ def _compress_image_under_1mib(src: Path) -> Path:
     raise RuntimeError(f"1MiB未満に収められませんでした: {src}")
 
 
+def _otsu_threshold(gray: Image.Image) -> int:
+    """グレースケール画像のヒストグラムから大津の二値化閾値を求める。"""
+    hist = gray.histogram()
+    total = sum(hist)
+    if total == 0:
+        return 128
+    sum_total = sum(i * h for i, h in enumerate(hist))
+    sum_b = 0
+    w_b = 0
+    max_var = 0.0
+    threshold = 128
+    for t in range(256):
+        w_b += hist[t]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += t * hist[t]
+        m_b = sum_b / w_b
+        m_f = (sum_total - sum_b) / w_f
+        var_between = w_b * w_f * (m_b - m_f) ** 2
+        if var_between > max_var:
+            max_var = var_between
+            threshold = t
+    return threshold
+
+
+def _binarize_image_monochrome(img: Image.Image) -> Image.Image:
+    """RGB/グレースケール画像をモノクロ2値（白黒のみ）にする。"""
+    gray = img.convert("L")
+    threshold = _otsu_threshold(gray)
+    return gray.point(lambda p: 255 if p > threshold else 0, mode="L")
+
+
 def _resolve_upload_path(original: Path) -> tuple[str, Path | None]:
     """アップロード用パスと、削除すべき一時ファイル（あれば）を返す。元ファイルは書き換えない。"""
     if original.stat().st_size < MIB:
         return str(original), None
     tmp = _compress_image_under_1mib(original)
     return str(tmp), tmp
+
+
+def _pdf_to_png_for_upload(pdf_path: Path) -> tuple[str, list[Path]]:
+    """PDFをPNGに変換し、1MiB未満のアップロード用パスを返す。
+
+    各ページはモノクロ2値化（大津の方法）後、複数ページは縦に結合する。
+    1MiB以上のPNGは既存の画像圧縮でJPEG化する。
+    戻り値: (upload_path, 削除すべき一時ファイル一覧)
+    """
+    try:
+        import fitz
+    except ImportError as e:
+        raise RuntimeError(
+            "PDFを画像に変換するには pymupdf が必要です（pip install pymupdf）"
+        ) from e
+
+    temps: list[Path] = []
+    doc = fitz.open(pdf_path)
+    try:
+        page_count = doc.page_count
+        if page_count < 1:
+            raise ValueError(f"ページがありません: {pdf_path.name}")
+
+        zoom = PDF_RENDER_DPI / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+        page_images: list[Image.Image] = []
+        for page_idx in range(page_count):
+            pix = doc[page_idx].get_pixmap(matrix=mat, alpha=False)
+            page_img = Image.frombytes(
+                "RGB", (pix.width, pix.height), pix.samples
+            )
+            page_images.append(_binarize_image_monochrome(page_img))
+
+        if len(page_images) == 1:
+            combined = page_images[0]
+        else:
+            width = max(im.width for im in page_images)
+            height = sum(im.height for im in page_images)
+            combined = Image.new("L", (width, height), 255)
+            y_off = 0
+            for im in page_images:
+                combined.paste(im, (0, y_off))
+                y_off += im.height
+
+        png_tmp = tempfile.NamedTemporaryFile(
+            prefix="nx_pdf_", suffix=".png", delete=False
+        )
+        png_tmp.close()
+        png_path = Path(png_tmp.name)
+        temps.append(png_path)
+        combined.save(png_path, format="PNG", optimize=True)
+
+        upload_src, compressed_tmp = _resolve_upload_path(png_path)
+        if compressed_tmp is not None:
+            temps.append(compressed_tmp)
+        return upload_src, temps
+    finally:
+        doc.close()
 
 
 def _filename_has_transport_expense_marker(file_name: str) -> bool:
@@ -2873,81 +2968,114 @@ def run_analysis(
                                 tmp_upload_path.unlink(missing_ok=True)
                 else:
                     try:
-                        if is_cancelled():
-                            log("中断: PDFアップロード前にキャンセルされました")
-                            break
-                        chat_uid = create_file_chat(f"#{worker_idx + 1} {file_path.name}")
-                        if not chat_uid:
-                            raise RuntimeError(f"NewtonX 上でチャットの作成に失敗しました — {file_path.name}")
-                        chat_holder["chat_uid"] = chat_uid
-                        success, upload_succeeded = _upload_document_with_retries(
-                            wc,
-                            chat_uid_holder=chat_holder,
-                            file_path=str(file_path),
-                            file_name=file_path.name,
-                            recreate_chat_fn=None,
-                            log_emit=log,
+                        upload_src, tmp_upload_paths = _pdf_to_png_for_upload(
+                            file_path
                         )
-                        if not success:
-                            log(
-                                f"スキップ: PDFのアップロードに失敗しました（最大 "
-                                f"{UPLOAD_MAX_RETRIES} 回までリトライ）— "
-                                f"{file_path.name}"
-                            )
-                            append_upload_failure_row(
-                                worker_idx,
-                                file_path,
-                                prefer_pdf_section=True,
-                                message=(
-                                    f"（PDFアップロード失敗／{UPLOAD_MAX_RETRIES}回リトライまで）"
-                                ),
-                            )
-                        else:
-                            log(f"PDFがアップロードされました: {file_path.name}")
-                            if is_cancelled():
-                                log(
-                                    "中断: PDFの解析要求前にキャンセルされました"
-                                )
-                                break
-                            def analyze_pdf_once() -> tuple[dict[str, str] | None, str]:
-                                raw = wc.send_message(
-                                    chat_uid=chat_holder["chat_uid"],
-                                    message=_build_pdf_check_message(file_path.name),
-                                )
-                                text = raw or ""
-                                return _parse_analysis_json_response(text), text
-
-                            if is_cancelled():
-                                log(
-                                    "中断: PDFの解析応答待ち後にキャンセルされました"
-                                )
-                                break
-                            row2 = {
-                                "upload_ok": "〇" if upload_succeeded else "✖",
-                                "file_name": file_path.name,
-                                "resolved_path": str(file_path.resolve()),
-                                "analysis": "",
-                            }
-                            attach_year_month(row2)
-                            analysis_json, raw_response = analyze_pdf_once()
-                            _apply_analysis_response_to_row(
-                                row2,
-                                analysis_json,
-                                raw_response,
-                                prefer_kintai_section=True,
-                            )
-                            bucket_results[worker_idx].append(row2)
-                            emit_summary_row_md(row2)
-                            emit_company_match_ratio_progress(row2)
-                            if on_row_completed is not None:
-                                on_row_completed(row2)
-                    except Exception as e:
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                    ) as e:
                         log(
-                            f"スキップ: PDFの処理に失敗しました — "
+                            f"スキップ: PDFの画像変換に失敗しました — "
                             f"{file_path.name}: {e}"
                         )
-                    finally:
-                        delete_file_chat(chat_holder.get("chat_uid") or None)
+                        append_upload_failure_row(
+                            worker_idx,
+                            file_path,
+                            prefer_pdf_section=True,
+                            message="（PDFの画像変換に失敗しました）",
+                        )
+                    else:
+                        if is_cancelled():
+                            log("中断: PDFの画像アップロード前にキャンセルされました")
+                            break
+                        try:
+                            chat_uid = create_file_chat(
+                                f"#{worker_idx + 1} {file_path.name}"
+                            )
+                            if not chat_uid:
+                                raise RuntimeError(
+                                    f"NewtonX 上でチャットの作成に失敗しました — "
+                                    f"{file_path.name}"
+                                )
+                            chat_holder["chat_uid"] = chat_uid
+                            upload_file_name = Path(upload_src).name
+                            png_kb = Path(upload_src).stat().st_size / 1024
+                            log(
+                                f"PDF→PNG変換完了: {file_path.name} → "
+                                f"{upload_file_name} ({png_kb:.0f} KB)"
+                            )
+                            image_id, upload_succeeded = _upload_image_with_retries(
+                                wc,
+                                chat_uid_holder=chat_holder,
+                                upload_src=upload_src,
+                                file_name=upload_file_name,
+                                recreate_chat_fn=None,
+                                log_emit=log,
+                            )
+                            if not image_id:
+                                log(
+                                    f"スキップ: PDF（画像変換）のアップロードに失敗しました（最大 "
+                                    f"{UPLOAD_MAX_RETRIES} 回までリトライ）— "
+                                    f"{file_path.name}"
+                                )
+                                append_upload_failure_row(
+                                    worker_idx,
+                                    file_path,
+                                    prefer_pdf_section=True,
+                                    message=(
+                                        f"（PDF画像アップロード失敗／"
+                                        f"{UPLOAD_MAX_RETRIES}回リトライまで）"
+                                    ),
+                                )
+                            else:
+                                if is_cancelled():
+                                    log(
+                                        "中断: PDF（画像変換）の解析要求前に"
+                                        "キャンセルされました"
+                                    )
+                                    break
+
+                                def analyze_pdf_as_image_once() -> (
+                                    tuple[dict[str, str] | None, str]
+                                ):
+                                    raw = wc.send_message(
+                                        chat_uid=chat_holder["chat_uid"],
+                                        message=_build_check_message(file_path.name),
+                                        image_ids=[image_id],
+                                    )
+                                    text = raw or ""
+                                    return _parse_analysis_json_response(text), text
+
+                                if is_cancelled():
+                                    log(
+                                        "中断: PDF（画像変換）の解析応答待ち後に"
+                                        "キャンセルされました"
+                                    )
+                                    break
+                                row2 = {
+                                    "upload_ok": "〇" if upload_succeeded else "✖",
+                                    "file_name": file_path.name,
+                                    "resolved_path": str(file_path.resolve()),
+                                    "analysis": "",
+                                }
+                                attach_year_month(row2)
+                                analysis_json, raw_response = analyze_pdf_as_image_once()
+                                _apply_analysis_response_to_row(
+                                    row2,
+                                    analysis_json,
+                                    raw_response,
+                                )
+                                bucket_results[worker_idx].append(row2)
+                                emit_summary_row_md(row2)
+                                emit_company_match_ratio_progress(row2)
+                                if on_row_completed is not None:
+                                    on_row_completed(row2)
+                        finally:
+                            delete_file_chat(chat_holder.get("chat_uid") or None)
+                            for tmp_path in tmp_upload_paths:
+                                tmp_path.unlink(missing_ok=True)
             except BaseException as e:
                 signal_fatal(e)
                 break
