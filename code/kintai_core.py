@@ -36,6 +36,8 @@ SUMMARY_TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
 # アップロード: 初回試行後、最大 UPLOAD_MAX_RETRIES 回まで再試行（合計で最大 1 + UPLOAD_MAX_RETRIES 回）
 UPLOAD_MAX_RETRIES = 3
 UPLOAD_RETRY_DELAY_SEC = 0.35
+# 解析1件ごとの delete_chat を行うか（False: チャットは NewtonX 上に残す）
+DELETE_CHAT_AFTER_ANALYSIS = False
 
 DEFAULT_PARALLEL_ANALYSIS_CHATS = 1
 PARALLEL_WORKERS_MAX = 32
@@ -2731,6 +2733,8 @@ def run_analysis(
             UI のステータス欄へ on_log が流れるため、削除失敗はユーザーにとってノイズになりやすい。
             ここでは削除失敗/例外は握りつぶし（静かに無視）とし、成功時のみログを残す。
             """
+            if not DELETE_CHAT_AFTER_ANALYSIS:
+                return
             if not chat_uid:
                 return
             try:
