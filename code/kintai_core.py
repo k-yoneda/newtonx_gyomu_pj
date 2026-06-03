@@ -183,6 +183,21 @@ def _binarize_image_monochrome(img: Image.Image) -> Image.Image:
     return gray.point(lambda p: 255 if p > threshold else 0, mode="L")
 
 
+def _strip_pdf_structure_tree(doc) -> None:
+    """破損したPDFタグ（Structure Tree）をメモリ上で無効化する。
+
+    元ファイルは変更しない。get_pixmap が遅くなる／MuPDFエラーが出るPDFへの対処。
+    """
+    try:
+        pdf_catalog = doc.pdf_catalog
+        cat = pdf_catalog() if callable(pdf_catalog) else pdf_catalog
+        stree = doc.xref_get_key(cat, "StructTreeRoot")
+        if stree[1] != "null":
+            doc.xref_set_key(cat, "StructTreeRoot", "null")
+    except Exception:
+        pass
+
+
 def _resolve_upload_path(original: Path) -> tuple[str, Path | None]:
     """アップロード用パスと、削除すべき一時ファイル（あれば）を返す。元ファイルは書き換えない。"""
     if original.stat().st_size < MIB:
@@ -205,48 +220,59 @@ def _pdf_to_png_for_upload(pdf_path: Path) -> tuple[str, list[Path]]:
             "PDFを画像に変換するには pymupdf が必要です（pip install pymupdf）"
         ) from e
 
-    temps: list[Path] = []
-    doc = fitz.open(pdf_path)
+    tools = fitz.TOOLS
+    tools.mupdf_display_errors(False)
+    tools.mupdf_display_warnings(False)
     try:
-        page_count = doc.page_count
-        if page_count < 1:
-            raise ValueError(f"ページがありません: {pdf_path.name}")
+        if hasattr(tools, "mupdf_warnings"):
+            tools.mupdf_warnings(reset=True)
 
-        zoom = PDF_RENDER_DPI / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        page_images: list[Image.Image] = []
-        for page_idx in range(page_count):
-            pix = doc[page_idx].get_pixmap(matrix=mat, alpha=False)
-            page_img = Image.frombytes(
-                "RGB", (pix.width, pix.height), pix.samples
+        temps: list[Path] = []
+        doc = fitz.open(pdf_path)
+        try:
+            _strip_pdf_structure_tree(doc)
+            page_count = doc.page_count
+            if page_count < 1:
+                raise ValueError(f"ページがありません: {pdf_path.name}")
+
+            zoom = PDF_RENDER_DPI / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            page_images: list[Image.Image] = []
+            for page_idx in range(page_count):
+                pix = doc[page_idx].get_pixmap(matrix=mat, alpha=False)
+                page_img = Image.frombytes(
+                    "RGB", (pix.width, pix.height), pix.samples
+                )
+                page_images.append(_binarize_image_monochrome(page_img))
+
+            if len(page_images) == 1:
+                combined = page_images[0]
+            else:
+                width = max(im.width for im in page_images)
+                height = sum(im.height for im in page_images)
+                combined = Image.new("L", (width, height), 255)
+                y_off = 0
+                for im in page_images:
+                    combined.paste(im, (0, y_off))
+                    y_off += im.height
+
+            png_tmp = tempfile.NamedTemporaryFile(
+                prefix="nx_pdf_", suffix=".png", delete=False
             )
-            page_images.append(_binarize_image_monochrome(page_img))
+            png_tmp.close()
+            png_path = Path(png_tmp.name)
+            temps.append(png_path)
+            combined.save(png_path, format="PNG", optimize=True)
 
-        if len(page_images) == 1:
-            combined = page_images[0]
-        else:
-            width = max(im.width for im in page_images)
-            height = sum(im.height for im in page_images)
-            combined = Image.new("L", (width, height), 255)
-            y_off = 0
-            for im in page_images:
-                combined.paste(im, (0, y_off))
-                y_off += im.height
-
-        png_tmp = tempfile.NamedTemporaryFile(
-            prefix="nx_pdf_", suffix=".png", delete=False
-        )
-        png_tmp.close()
-        png_path = Path(png_tmp.name)
-        temps.append(png_path)
-        combined.save(png_path, format="PNG", optimize=True)
-
-        upload_src, compressed_tmp = _resolve_upload_path(png_path)
-        if compressed_tmp is not None:
-            temps.append(compressed_tmp)
-        return upload_src, temps
+            upload_src, compressed_tmp = _resolve_upload_path(png_path)
+            if compressed_tmp is not None:
+                temps.append(compressed_tmp)
+            return upload_src, temps
+        finally:
+            doc.close()
     finally:
-        doc.close()
+        tools.mupdf_display_errors(True)
+        tools.mupdf_display_warnings(True)
 
 
 def _filename_has_transport_expense_marker(file_name: str) -> bool:
@@ -363,6 +389,22 @@ def _parse_analysis_json_response(text: str) -> dict[str, str] | None:
     return None
 
 
+def _print_analysis_json_to_terminal(
+    file_name: str,
+    analysis_json: dict[str, str] | None,
+    raw_response: str,
+) -> None:
+    """生成AI応答の JSON をターミナル（stdout）に出力する。"""
+    label = (file_name or "").strip() or "（不明）"
+    if analysis_json:
+        body = json.dumps(analysis_json, ensure_ascii=False, indent=2)
+        print(f"--- 解析JSON: {label} ---\n{body}\n---", flush=True)
+        return
+    raw = (raw_response or "").strip()
+    if raw:
+        print(f"--- 解析JSON（パース失敗）: {label} ---\n{raw}\n---", flush=True)
+
+
 def _analysis_json_to_kintai_tab(analysis_json: dict[str, str]) -> dict[str, str]:
     """解析 JSON を _enrich_with_match_scores 用の内部キー辞書に変換する。"""
     return {
@@ -410,6 +452,11 @@ def _apply_analysis_response_to_row(
     prefer_kintai_section: bool = False,
 ) -> None:
     """analyze_image_once / analyze_pdf_once の戻り値を行データに反映する。"""
+    _print_analysis_json_to_terminal(
+        row.get("file_name") or "",
+        analysis_json,
+        raw_response,
+    )
     if analysis_json:
         row["analysis"] = json.dumps(analysis_json, ensure_ascii=False, indent=2)
     else:
@@ -459,6 +506,7 @@ def _build_check_message(display_file_name: str) -> str:
     		アップロードしたPDFファイル内の文字列から、会社検索キーワードとして記載されている文字列を抽出してください。
     		ただし、会社検索キーワードとアルファベット、カタカナの全角、半角、大文字小文字の違い、スペースの有無は同じものとみなす。
             会社検索キーワードを返すのではなく、PDFから抽出した会社名を返すこと。
+            読み取った会社名に、支社名や事業所名がある場合は、それを除いた部分を会社名とし、抽出してください。
 		3)氏名
             アップロードした画像ファイル内の文字をOCRし、画像内に明確に記載された氏名のみを返してください。
             {display_file_name}の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。社員番号の前の"_"から、その前の"_"までの文字列が氏名検索キーワードである。
@@ -486,13 +534,11 @@ def _build_check_message(display_file_name: str) -> str:
   				・抽出できない場合：✖
   				・上記以外の場合：✖
 		8)交通費合計
-			{display_file_name}に"交通費"という文字列を含んでいる場合
-				アップロードした画像ファイルの中で
-				交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
-				税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
-				金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
-			{display_file_name}に"交通費"という文字がある場合は""（空文字）を返す	
-     
+			アップロードした画像ファイルの中で
+			交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
+			税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
+			金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
+			読み取れない場合は、”（データなし）”を返す。
     """
 
 # def _build_check_message(display_file_name: str) -> str:
@@ -541,9 +587,10 @@ def _build_check_message(display_file_name: str) -> str:
 # 押印有無：〇/✖
 # {transport_line}
 # """
+
 def _build_pdf_check_message(display_file_name: str) -> str:
     return f"""
-    	アップロードしたPDFファイルから以下の情報を抽出してJSON形式でデータのみ返信してください。
+    	アップロードした画像ファイルから以下の情報を抽出してJSON形式でデータのみ返信してください。
     	
     	・対象ファイル
 		・会社名
@@ -555,64 +602,134 @@ def _build_pdf_check_message(display_file_name: str) -> str:
 		・交通費合計
 
         【重要ルール】
-        - PDF内に文字として明確に確認できない情報は、いかなる場合も推測・補完・類推して返さないこと。
+        - 画像内に文字として明確に確認できない情報は、いかなる場合も推測・補完・類推して返さないこと。
         - 会社名、氏名は、検索キーワードに近いからという理由で補完してはならない。
-        - PDF内から明瞭に読み取れた文字列のみを返すこと。
+        - 画像から明瞭に読み取れた文字列のみを返すこと。
         - 1文字でも判読が不確かな場合は「（データなし）」とする。
         - 画像内に存在しない、または確認できない会社名・氏名を返してはならない。
 
-    	
     	各項目の説明
     	1)対象ファイル
     		{display_file_name}を値として返す。
     	2)会社名
-    		アップロードしたPDFファイル内の文字を解析し、PDF内に明確に記載された会社名のみを返してください。
-            読み取った会社名の後ろに支社や事業所名がある場合は、それを除いて出力してください。
-            会社検索キーワードを返すのではなく、PDFから明確に抽出できた会社名をJSONの結果として返してください。
+    		アップロードした画像ファイル内の文字をOCRし、画像内に明確に記載された会社名のみを返してください。
+            会社検索キーワードはあくまで探索の補助であり、JSONの返却値ではありません。
+            キーワードに類似していても、画像内に明確な記載が確認できない場合は「（データなし）」を返してください。
+            会社検索キーワードを返すのではなく、画像から明確に抽出できた会社名を返してください。
             読み取れない、または確証がない場合は「（データなし）」を返してください。
-            会社検索キーワードというものを以下に設定するがこれはJSONの返却値ではない。
+            会社検索キーワードというものを以下に設定するがこれは返却値ではない。
     		{display_file_name}の先頭に[]でくくられた文字列がある場合、それ以降から次の'_’までの文字列を会社検索キーワードとする（最後の様などの継承は除く）。
     		{display_file_name}の先頭に[]でくくられた部分がない場合は、先頭から最初の'_’までの文字列を会社検索キーワードとする（最後の様などの継承は除く）。
     		アップロードしたPDFファイル内の文字列から、会社検索キーワードとして記載されている文字列を抽出してください。
     		ただし、会社検索キーワードとアルファベット、カタカナの全角、半角、大文字小文字の違い、スペースの有無は同じものとみなす。
             会社検索キーワードを返すのではなく、PDFから抽出した会社名を返すこと。
-
+            読み取った会社名に、支社名や事業所名がある場合は、それを除いた部分を会社名とし、抽出してください。
 		3)氏名
-            アップロードしたPDFファイル内の文字を解析し、PDF内に明確に記載された氏名のみを返してください。
-            氏名検索キーワードはあくまで探索の補助であり、返却値ではありません。
-            氏名検索キーワード、PDF内の氏名の比較の際はスペース等を除いて比較してもよいが、推測で補完してはいけません。
-            氏名検索キーワードを返すのではなく、PDFから明確に抽出できた氏名を返してください。
+            アップロードした画像ファイル内の文字をOCRし、画像内に明確に記載された氏名のみを返してください。
+            {display_file_name}の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。社員番号の前の"_"から、その前の"_"までの文字列が氏名検索キーワードである。
+            氏名検索キーワードはあくまで探索の補助であり、JSONの返却値ではありません。
+            氏名検索キーワード、画像内の氏名の比較の際はスペース等を除いて比較してもよいが、推測で補完してはいけません。
+            氏名検索キーワードを返すのではなく、画像から明確に抽出できた氏名を返してください。
             氏名検索キーワードを定義するが、これは検索結果ではない。
-			{display_file_name}の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。社員番号の前の"_"から、その前の"_"までの文字列が年月であり
-            そこからさらにその前の"_"までが氏名検索キーワードである。
 			アップロードした画像ファイルから氏名検索キーワードと類似した文字列を画像内から氏名として抜き出してください。
 			氏名検索キーワード、画像内の氏名の比較の際、スペースなどはパックして比較して同じかどうか判断してください。
             氏名検索キーワードを返すのではなく、画像から抽出した氏名を返すこと。
             読み取れない場合は、”（データなし）”を返す
 		4)年度
-			年度はアップロードしたPDFファイル内の勤務表から読み取れる西暦年度（4桁）を出力してください。読み取れない場合は、”（データなし）”を返す
+			年度はアップロードした画像ファイル内の勤務表から読み取れる西暦年度（4桁）を出力してください。読み取れない場合は、”（データなし）”を返す
 		5)月
-			月はアップロードしたPDFファイル内の勤務表から読み取れる月（1〜12）を出力してください。読み取れない場合は、”（データなし）”を返す
+			月はアップロードした画像ファイル内の勤務表から読み取れる月（1〜12）を出力してください。読み取れない場合は、”（データなし）”を返す
 		6)合計勤務時間
-			アップロードしたPDFファイルから、総労働時間と思える文字列をそのまま抽出してください。
+			アップロードした画像ファイルから、総労働時間と思える文字列をそのまま抽出してください。
 			例）（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
 		7)押印有無
 			押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
-			アップロードしたPDFファイルの中に
+			アップロードした画像ファイルの中に
   				・実際の印鑑の陰影がある：〇
   				・印鑑の陰影の印刷がある：〇
   				・サインの筆跡がある：〇
   				・抽出できない場合：✖
   				・上記以外の場合：✖
 		8)交通費合計
-			{display_file_name}に"交通費"という文字列を含んでいる場合
-				アップロードしたPDFファイルの中で
-				交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
-				税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
-				金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
-			{display_file_name}に"交通費"という文字がある場合は""（空文字）を返す	
-     
+			アップロードした画像ファイルの中で
+			交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
+			税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
+			金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
+			読み取れない場合は、”（データなし）”を返す。
     """
+
+# def _build_pdf_check_message(display_file_name: str) -> str:
+#     return f"""
+#     	アップロードしたPDFファイルから以下の情報を抽出してJSON形式でデータのみ返信してください。
+    	
+#     	・対象ファイル
+# 		・会社名
+# 		・氏名
+# 		・年度
+# 		・月
+# 		・合計勤務時間
+# 		・押印有無
+# 		・交通費合計
+
+#         【重要ルール】
+#         - PDF内に文字として明確に確認できない情報は、いかなる場合も推測・補完・類推して返さないこと。
+#         - 会社名、氏名は、検索キーワードに近いからという理由で補完してはならない。
+#         - PDF内から明瞭に読み取れた文字列のみを返すこと。
+#         - 1文字でも判読が不確かな場合は「（データなし）」とする。
+#         - 画像内に存在しない、または確認できない会社名・氏名を返してはならない。
+
+    	
+#     	各項目の説明
+#     	1)対象ファイル
+#     		{display_file_name}を値として返す。
+#     	2)会社名
+#     		アップロードしたPDFファイル内の文字を解析し、PDF内に明確に記載された会社名のみを返してください。
+#             読み取った会社名の後ろに支社や事業所名がある場合は、それを除いて出力してください。
+#             会社検索キーワードを返すのではなく、PDFから明確に抽出できた会社名をJSONの結果として返してください。
+#             読み取れない、または確証がない場合は「（データなし）」を返してください。
+#             会社検索キーワードというものを以下に設定するがこれはJSONの返却値ではない。
+#     		{display_file_name}の先頭に[]でくくられた文字列がある場合、それ以降から次の'_’までの文字列を会社検索キーワードとする（最後の様などの継承は除く）。
+#     		{display_file_name}の先頭に[]でくくられた部分がない場合は、先頭から最初の'_’までの文字列を会社検索キーワードとする（最後の様などの継承は除く）。
+#     		アップロードしたPDFファイル内の文字列から、会社検索キーワードとして記載されている文字列を抽出してください。
+#     		ただし、会社検索キーワードとアルファベット、カタカナの全角、半角、大文字小文字の違い、スペースの有無は同じものとみなす。
+#             会社検索キーワードを返すのではなく、PDFから抽出した会社名を返すこと。
+#             読み取った会社名に、支社名や事業所名がある場合は、それを除いた部分を会社名とし、抽出してください。
+# 		3)氏名
+#             アップロードしたPDFファイル内の文字を解析し、PDF内に明確に記載された氏名のみを返してください。
+#             氏名検索キーワードはあくまで探索の補助であり、返却値ではありません。
+#             氏名検索キーワード、PDF内の氏名の比較の際はスペース等を除いて比較してもよいが、推測で補完してはいけません。
+#             氏名検索キーワードを返すのではなく、PDFから明確に抽出できた氏名を返してください。
+#             氏名検索キーワードを定義するが、これは検索結果ではない。
+# 			{display_file_name}の拡張子の前に数値7桁あるいは'BP'+数値5桁が社員番号である。社員番号の前の"_"から、その前の"_"までの文字列が年月であり
+#             そこからさらにその前の"_"までが氏名検索キーワードである。
+# 			アップロードした画像ファイルから氏名検索キーワードと類似した文字列を画像内から氏名として抜き出してください。
+# 			氏名検索キーワード、画像内の氏名の比較の際、スペースなどはパックして比較して同じかどうか判断してください。
+#             氏名検索キーワードを返すのではなく、画像から抽出した氏名を返すこと。
+#             読み取れない場合は、”（データなし）”を返す
+# 		4)年度
+# 			年度はアップロードしたPDFファイル内の勤務表から読み取れる西暦年度（4桁）を出力してください。読み取れない場合は、”（データなし）”を返す
+# 		5)月
+# 			月はアップロードしたPDFファイル内の勤務表から読み取れる月（1〜12）を出力してください。読み取れない場合は、”（データなし）”を返す
+# 		6)合計勤務時間
+# 			アップロードしたPDFファイルから、総労働時間と思える文字列をそのまま抽出してください。
+# 			例）（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
+# 		7)押印有無
+# 			押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
+# 			アップロードしたPDFファイルの中に
+#   				・実際の印鑑の陰影がある：〇
+#   				・印鑑の陰影の印刷がある：〇
+#   				・サインの筆跡がある：〇
+#   				・抽出できない場合：✖
+#   				・上記以外の場合：✖
+# 		8)交通費合計
+# 			{display_file_name}に"交通費"という文字列を含んでいる場合
+# 				アップロードしたPDFファイルの中で
+# 				交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
+# 				税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
+# 				金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
+# 			{display_file_name}に"交通費"という文字がある場合は""（空文字）を返す	
+     
+#     """
 # def _build_pdf_check_message(display_file_name: str) -> str:
 #     """PDF用。アップロード直後は send_message にドキュメントIDを渡さなくても参照できる想定。"""
 #     transport_block = _transport_expense_prompt_block(display_file_name)
@@ -960,8 +1077,10 @@ def _trunc2_down(x: float) -> float:
 
 
 def _format_decimal_str(value: float) -> str:
-    """小数点以下第3位以下切り捨てのうえ、小数第2位まで 2 桁表示で保持。"""
+    """小数点以下第3位以下切り捨てのうえ、小数第2位まで保持（整数は .00 なし）。"""
     t = _trunc2_down(value)
+    if math.isclose(t, round(t), abs_tol=1e-9):
+        return str(int(round(t)))
     return f"{t:.2f}"
 
 
@@ -974,6 +1093,8 @@ def _work_hours_string_to_decimal(raw: str) -> str:
     - 144:00:00 … 60進（秒は切り捨て、時・分のみ換算）
     - 8時間35分 … 60進
     - 8_35H  … 60進（時_分H）
+    - 140   … 十進（時間のみの整数。140 時間 = 140）
+    - 140H  … 十進（整数 + H はそのまま時間）
     解釈できなければ空文字。
     """
     if not (raw and str(raw).strip()):
@@ -1053,6 +1174,22 @@ def _work_hours_string_to_decimal(raw: str) -> str:
             h, fr = m.group(1), m.group(2)
             val = int(h) + int(fr) / 10.0 ** len(fr)
             return _format_decimal_str(val)
+        except (ValueError, OverflowError):
+            return ""
+
+    # 5) 整数 + H（例: 140H → 140 時間）
+    m = re.match(r"^(\d+)[Hh]$", t)
+    if m:
+        try:
+            return _format_decimal_str(float(m.group(1)))
+        except (ValueError, OverflowError):
+            return ""
+
+    # 6) 整数のみ（例: 140 → 140 時間）
+    m = re.match(r"^(\d+)$", t)
+    if m:
+        try:
+            return _format_decimal_str(float(m.group(1)))
         except (ValueError, OverflowError):
             return ""
 
