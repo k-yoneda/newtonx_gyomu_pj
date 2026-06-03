@@ -62,6 +62,9 @@ SUMMARY_PERSON_COL = "氏名（読取）"
 LEGACY_PERSON_COL = "氏名"
 SUMMARY_EMPLOYEE_NO_COL = "社員番号（ファイル名より）"
 LEGACY_EMPLOYEE_NO_COL = "社員番号"
+SUMMARY_ROW_NO_COL = "No"
+SUMMARY_BILLING_UPDATE_HOURS_COL = "更新用合計時間（10進数）"
+SUMMARY_BILLING_UPDATE_TRANSPORT_COL = "更新用交通費合計"
 SUMMARY_FINAL_JUDGMENT_COL = "最終判断"
 LEGACY_USER_JUDGMENT_COL = "ユーザ判断"
 SUMMARY_BILLING_UPDATE_RESULT_COL = "請求用ファイル更新"
@@ -2124,12 +2127,14 @@ def _upload_http_error_should_recreate_chat(exc: BaseException) -> bool:
 
 
 SUMMARY_MD_HEADER = (
-    f"| {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | {TARGET_FILE_NAME_COL} | "
+    f"| {SUMMARY_ROW_NO_COL} | {SUMMARY_UPLOAD_COL} |{SUMMARY_TARGET_SHEET_COL} | "
+    f"{TARGET_FILE_NAME_COL} | "
     f"{SUMMARY_FINAL_JUDGMENT_COL} | {SUMMARY_BILLING_UPDATE_RESULT_COL} | 自動判断 | "
     f"{SUMMARY_YEAR_COL} | {SUMMARY_MONTH_COL} | "
     f"{SUMMARY_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
+    f"{SUMMARY_BILLING_UPDATE_HOURS_COL} | "
     "合計勤務時間（10進） | 合計勤務時間（読取） | "
-    f"{SUMMARY_TRANSPORT_EXPENSE_COL} | "
+    f"{SUMMARY_BILLING_UPDATE_TRANSPORT_COL} | {SUMMARY_TRANSPORT_EXPENSE_COL} | "
     "会社名比較 | 押印有無 |"
 )
 
@@ -2287,6 +2292,22 @@ def _row_total_hours_decimal(row: dict[str, str]) -> str:
     return (
         row.get("total_hours_decimal")
         or row.get("合計勤務時間（10進）")
+        or ""
+    ).strip()
+
+
+def _row_billing_update_hours_decimal(row: dict[str, str]) -> str:
+    return (
+        row.get("billing_update_hours_decimal")
+        or row.get(SUMMARY_BILLING_UPDATE_HOURS_COL)
+        or ""
+    ).strip()
+
+
+def _row_billing_update_transport(row: dict[str, str]) -> str:
+    return (
+        row.get("billing_update_transport")
+        or row.get(SUMMARY_BILLING_UPDATE_TRANSPORT_COL)
         or ""
     ).strip()
 
@@ -2569,8 +2590,8 @@ def _year_month_from_data_dir(data_dir: Path) -> tuple[str, str]:
     return "", ""
 
 
-def _one_summary_data_line(r: dict[str, str]) -> str:
-    """16列1行分（集計用）。Excel 行は対象シート有無のみを埋め、AI読取列は空欄にする。"""
+def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> str:
+    """19列1行分（集計用）。Excel 行は対象シート有無のみを埋め、AI読取列は空欄にする。"""
     is_excel = _row_is_excel(r)
     u_sym = _escape_md_table_cell(_upload_ok_symbol(r))
     ts = _escape_md_table_cell(_target_sheet_ok_symbol(r))
@@ -2595,6 +2616,11 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     emp = _escape_md_table_cell(
         (r.get("employee_no") or "").strip() or ""
     )
+    buh = _escape_md_table_cell(
+        _decimal_for_table_display(_row_billing_update_hours_decimal(r))
+        if _row_billing_update_hours_decimal(r)
+        else ""
+    )
     th = _escape_md_table_cell(
         ((
             _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
@@ -2603,13 +2629,16 @@ def _one_summary_data_line(r: dict[str, str]) -> str:
     lr = _escape_md_table_cell(
         ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
     )
+    but = _escape_md_table_cell(_row_billing_update_transport(r))
     te = _escape_md_table_cell((r.get("transport_expense_raw") or "").strip())
     mc = _escape_md_table_cell((r.get("match_company") or ("" if is_excel else "✖")))
     se = _escape_md_table_cell(
         "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
     )
+    no = _escape_md_table_cell(str(row_no) if row_no is not None else "")
     return (
-        f"| {u_sym} | {ts} | {fn} | {uj} | {bur} | {aj} | {yy} | {mm} | {co1} | {pe} | {emp} | {th} | {lr} | {te} | {mc} | {se} |"
+        f"| {no} | {u_sym} | {ts} | {fn} | {uj} | {bur} | {aj} | {yy} | {mm} | "
+        f"{co1} | {pe} | {emp} | {buh} | {th} | {lr} | {but} | {te} | {mc} | {se} |"
     )
 
 
@@ -2668,7 +2697,7 @@ def _summary_table_md_lines(
     解析結果.md 用: ヘッダ1行＋区切り行なし。データは各1行。
     """
     return _company_match_ratio_lines(results, total_target_count=total_target_count) + [SUMMARY_MD_HEADER] + [
-        _one_summary_data_line(r) for r in results
+        _one_summary_data_line(r, row_no=i + 1) for i, r in enumerate(results)
     ]
 
 
@@ -2683,7 +2712,10 @@ def summary_header_cells() -> tuple[str, ...]:
 
 
 def row_display_values(
-    r: dict[str, str], *, sync_user_judgment_to_auto: bool = False
+    r: dict[str, str],
+    *,
+    sync_user_judgment_to_auto: bool = False,
+    row_no: int | None = None,
 ) -> tuple[str, ...]:
     """グリッド表示用（Markdown エスケープなし）。 _one_summary_data_line と同一ルール。"""
     is_excel = _row_is_excel(r)
@@ -2705,16 +2737,40 @@ def row_display_values(
     co1 = ((r.get("name_company_1") or "").strip() or ("" if is_excel else "不明"))
     pe = ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
     emp = (r.get("employee_no") or "").strip() or ""
+    buh_raw = _row_billing_update_hours_decimal(r)
+    buh = _decimal_for_table_display(buh_raw) if buh_raw else ""
     th = (
         _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
         if (r.get("total_hours_decimal") or "").strip()
         else ("" if is_excel else "（なし）")
     )
     lr = ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
+    but = _row_billing_update_transport(r)
     te = (r.get("transport_expense_raw") or "").strip()
     mc = (r.get("match_company") or ("" if is_excel else "✖"))
     se = "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
-    return (up_sym, ts, fn, uj, bur, aj, yy, mm, co1, pe, emp, th, lr, te, mc, se)
+    no = str(row_no) if row_no is not None else ""
+    return (
+        no,
+        up_sym,
+        ts,
+        fn,
+        uj,
+        bur,
+        aj,
+        yy,
+        mm,
+        co1,
+        pe,
+        emp,
+        buh,
+        th,
+        lr,
+        but,
+        te,
+        mc,
+        se,
+    )
 
 
 def run_analysis(

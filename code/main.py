@@ -34,11 +34,14 @@ from kintai_core import (
     PARALLEL_WORKERS_MAX,
     LEGACY_USER_JUDGMENT_COL,
     SUMMARY_BILLING_UPDATE_RESULT_COL,
+    SUMMARY_BILLING_UPDATE_HOURS_COL,
+    SUMMARY_BILLING_UPDATE_TRANSPORT_COL,
     SUMMARY_COMPANY_COL,
     SUMMARY_EMPLOYEE_NO_COL,
     SUMMARY_FINAL_JUDGMENT_COL,
     SUMMARY_MONTH_COL,
     SUMMARY_PERSON_COL,
+    SUMMARY_ROW_NO_COL,
     SUMMARY_YEAR_COL,
     TARGET_ASSISTANT_NAME,
     TARGET_FILE_NAME_COL,
@@ -189,6 +192,9 @@ class KintaiApp(tk.Frame):
     YEAR_COL = SUMMARY_YEAR_COL
     MONTH_COL = SUMMARY_MONTH_COL
     EMPLOYEE_NO_COL = SUMMARY_EMPLOYEE_NO_COL
+    ROW_NO_COL = SUMMARY_ROW_NO_COL
+    BILLING_UPDATE_HOURS_COL = SUMMARY_BILLING_UPDATE_HOURS_COL
+    BILLING_UPDATE_TRANSPORT_COL = SUMMARY_BILLING_UPDATE_TRANSPORT_COL
     PERSON_COL = SUMMARY_PERSON_COL
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
@@ -207,6 +213,7 @@ class KintaiApp(tk.Frame):
     _ERROR_REANALYSIS_OK_VALUES = ("〇",)
     # 記号列（〇/△/✖ 等）の列幅（px）
     _SYMBOL_COLUMN_WIDTHS: dict[str, int] = {
+        ROW_NO_COL: 44,
         "アップロード": 72,
         "対象シート有無": 88,
         YEAR_COL: 56,
@@ -994,8 +1001,10 @@ class KintaiApp(tk.Frame):
             (self.COMPANY_COL, "name_company_1"),
             (self.PERSON_COL, "name_person_from_doc"),
             (self.EMPLOYEE_NO_COL, "employee_no"),
+            (self.BILLING_UPDATE_HOURS_COL, "billing_update_hours_decimal"),
             (self.TOTAL_HOURS_DECIMAL_COL, "total_hours_decimal"),
             (self.TOTAL_HOURS_RAW_COL, "total_hours_raw"),
+            (self.BILLING_UPDATE_TRANSPORT_COL, "billing_update_transport"),
             (self.TRANSPORT_EXPENSE_COL, "transport_expense_raw"),
             (self.MATCH_COMPANY_COL, "match_company"),
             ("押印有無", "seal_in_doc"),
@@ -1090,6 +1099,20 @@ class KintaiApp(tk.Frame):
             self._row_dict_to_core(row),
             sync_user_judgment_to_auto=sync_user_judgment_to_auto,
         )
+
+    def _refresh_row_numbers(self) -> None:
+        """No 列に 1 からの連番を付与する。"""
+        cols = list(self._tree["columns"])
+        try:
+            no_ci = cols.index(self.ROW_NO_COL)
+        except ValueError:
+            return
+        for seq, iid in enumerate(self._tree.get_children(), start=1):
+            vals = list(self._tree.item(iid, "values") or [])
+            while len(vals) <= no_ci:
+                vals.append("")
+            vals[no_ci] = str(seq)
+            self._tree.item(iid, values=tuple(vals))
 
     def _user_judgment_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.FINAL_JUDGMENT_COL)
@@ -1209,6 +1232,7 @@ class KintaiApp(tk.Frame):
             ),
         )
         self._item_paths[rid] = row.get("resolved_path", "")
+        self._refresh_row_numbers()
 
     def _set_row_reanalysis_highlight(self, rid: str, active: bool) -> None:
         """Treeview の指定行に、再解析中ハイライト（反転）を付与/解除する。"""
@@ -1809,6 +1833,7 @@ class KintaiApp(tk.Frame):
         for iid in self._tree.get_children():
             values = list(self._tree.item(iid, "values") or [])
             row = {cols[i]: (values[i] if i < len(values) else "") for i in range(len(cols))}
+            row.pop(self.ROW_NO_COL, None)
             # 内部データ
             row["resolved_path"] = self._item_paths.get(iid, "")
             rows.append(row)
@@ -2008,6 +2033,7 @@ class KintaiApp(tk.Frame):
             vals = self._grid_values_from_row(r)
             iid = self._tree.insert("", tk.END, values=vals)
             self._item_paths[iid] = (r.get("resolved_path") or "").strip()
+        self._refresh_row_numbers()
 
     def _update_title(self) -> None:
         base = "勤務表解析"
@@ -2153,9 +2179,10 @@ class KintaiApp(tk.Frame):
 
         def on_row(r: dict[str, str]) -> None:
             def append_row(row: dict[str, str]) -> None:
-                vals = row_display_values(row)
+                vals = self._grid_values_from_row(row)
                 iid = self._tree.insert("", tk.END, values=vals)
                 self._item_paths[iid] = row.get("resolved_path", "")
+                self._refresh_row_numbers()
                 try:
                     self._tree.yview_moveto(1)
                 except tk.TclError:
