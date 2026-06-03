@@ -63,7 +63,8 @@ LEGACY_PERSON_COL = "氏名"
 SUMMARY_EMPLOYEE_NO_COL = "社員番号（ファイル名より）"
 LEGACY_EMPLOYEE_NO_COL = "社員番号"
 SUMMARY_ROW_NO_COL = "No"
-SUMMARY_BILLING_UPDATE_HOURS_COL = "更新用合計時間（10進数）"
+SUMMARY_BILLING_UPDATE_HOURS_COL = "更新用合計勤務時間（10進）"
+LEGACY_BILLING_UPDATE_HOURS_COL = "更新用合計時間（10進数）"
 SUMMARY_BILLING_UPDATE_TRANSPORT_COL = "更新用交通費合計"
 SUMMARY_FINAL_JUDGMENT_COL = "最終判断"
 LEGACY_USER_JUDGMENT_COL = "ユーザ判断"
@@ -1091,6 +1092,96 @@ def _format_decimal_str(value: float) -> str:
     return f"{t:.2f}"
 
 
+def _work_hours_raw_to_hours_float(raw: str) -> float | None:
+    """合計勤務時間（読取）文字列を10進時間（float）に変換。切り捨て前の値を返す。"""
+    if not (raw and str(raw).strip()):
+        return None
+    t = unicodedata.normalize("NFKC", str(raw).strip())
+    t = t.split("(")[0].split("（")[0]
+    t = re.sub(r"[\s　]+", "", t)
+    t = t.replace("：", ":").replace("．", ".")
+    if not t:
+        return None
+
+    m = re.match(r"^(\d+)_(\d{1,2})[Hh]$", t)
+    if m:
+        try:
+            hh, mm = int(m.group(1)), int(m.group(2))
+            if mm > 59:
+                return None
+            return float(hh) + mm / 60.0
+        except (ValueError, OverflowError):
+            return None
+
+    m = re.match(r"^(\d+):(\d{1,2})$", t)
+    if m:
+        try:
+            hh, mm = int(m.group(1)), int(m.group(2))
+            if mm > 59:
+                return None
+            return float(hh) + mm / 60.0
+        except (ValueError, OverflowError):
+            return None
+
+    m = re.match(r"^(\d+):(\d{1,2}):(\d{1,2})$", t)
+    if m:
+        try:
+            hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if mm > 59 or ss > 59:
+                return None
+            return float(hh) + mm / 60.0
+        except (ValueError, OverflowError):
+            return None
+
+    m = re.match(r"^(\d+)時間(\d{1,2})分$", t)
+    if m:
+        try:
+            hh, mm = int(m.group(1)), int(m.group(2))
+            if mm > 59:
+                return None
+            return float(hh) + mm / 60.0
+        except (ValueError, OverflowError):
+            return None
+
+    m = re.match(r"^(\d+)時間$", t)
+    if m:
+        try:
+            return float(int(m.group(1)))
+        except (ValueError, OverflowError):
+            return None
+
+    m = re.match(r"^(\d+\.\d+)[Hh]$", t)
+    if m:
+        try:
+            return float(m.group(1))
+        except (ValueError, OverflowError):
+            return None
+
+    m = re.match(r"^(\d+)\.(\d+)$", t)
+    if m:
+        try:
+            h, fr = m.group(1), m.group(2)
+            return int(h) + int(fr) / 10.0 ** len(fr)
+        except (ValueError, OverflowError):
+            return None
+
+    m = re.match(r"^(\d+)[Hh]$", t)
+    if m:
+        try:
+            return float(m.group(1))
+        except (ValueError, OverflowError):
+            return None
+
+    m = re.match(r"^(\d+)$", t)
+    if m:
+        try:
+            return float(m.group(1))
+        except (ValueError, OverflowError):
+            return None
+
+    return None
+
+
 def _work_hours_string_to_decimal(raw: str) -> str:
     """
     合計（総）勤務時間の10進2桁化（第3位未満切り捨て）。
@@ -1104,103 +1195,10 @@ def _work_hours_string_to_decimal(raw: str) -> str:
     - 140H  … 十進（整数 + H はそのまま時間）
     解釈できなければ空文字。
     """
-    if not (raw and str(raw).strip()):
+    val = _work_hours_raw_to_hours_float(raw)
+    if val is None:
         return ""
-    t = unicodedata.normalize("NFKC", str(raw).strip())
-    t = t.split("(")[0].split("（")[0]
-    t = re.sub(r"[\s　]+", "", t)
-    t = t.replace("：", ":").replace("．", ".")
-    if not t:
-        return ""
-
-    # 0) 60進 H_MMH（例: 101_10H → 101時間10分。末尾は H/h）
-    m = re.match(r"^(\d+)_(\d{1,2})[Hh]$", t)
-    if m:
-        try:
-            hh, mm = int(m.group(1)), int(m.group(2))
-            if mm > 59:
-                return ""
-            return _format_decimal_str(float(hh) + mm / 60.0)
-        except (ValueError, OverflowError):
-            return ""
-
-    # 1) HH:MM
-    m = re.match(r"^(\d+):(\d{1,2})$", t)
-    if m:
-        try:
-            hh, mm = int(m.group(1)), int(m.group(2))
-            if mm > 59:
-                return ""
-            return _format_decimal_str(float(hh) + mm / 60.0)
-        except (ValueError, OverflowError):
-            return ""
-
-    # 1b) HH:MM:SS（秒は切り捨て、時・分のみ 60進 → 10進）
-    m = re.match(r"^(\d+):(\d{1,2}):(\d{1,2})$", t)
-    if m:
-        try:
-            hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            if mm > 59 or ss > 59:
-                return ""
-            return _format_decimal_str(float(hh) + mm / 60.0)
-        except (ValueError, OverflowError):
-            return ""
-
-    # 2) HH時間MM分
-    m = re.match(r"^(\d+)時間(\d{1,2})分$", t)
-    if m:
-        try:
-            hh, mm = int(m.group(1)), int(m.group(2))
-            if mm > 59:
-                return ""
-            return _format_decimal_str(float(hh) + mm / 60.0)
-        except (ValueError, OverflowError):
-            return ""
-
-    # 2.5) HH時間（分の記載なしは 0分 扱い）
-    m = re.match(r"^(\d+)時間$", t)
-    if m:
-        try:
-            hh = int(m.group(1))
-            return _format_decimal_str(float(hh))
-        except (ValueError, OverflowError):
-            return ""
-
-    # 3) H.xxxH（例: 174.75H = 174.75 時間の10進・末尾 H）
-    m = re.match(r"^(\d+\.\d+)[Hh]$", t)
-    if m:
-        try:
-            return _format_decimal_str(float(m.group(1)))
-        except (ValueError, OverflowError):
-            return ""
-
-    # 4) H.xxx ドット（8.20 は 8.20h 風。小数部は桁数可変→浮動後に2位切り捨て）
-    m = re.match(r"^(\d+)\.(\d+)$", t)
-    if m:
-        try:
-            h, fr = m.group(1), m.group(2)
-            val = int(h) + int(fr) / 10.0 ** len(fr)
-            return _format_decimal_str(val)
-        except (ValueError, OverflowError):
-            return ""
-
-    # 5) 整数 + H（例: 140H → 140 時間）
-    m = re.match(r"^(\d+)[Hh]$", t)
-    if m:
-        try:
-            return _format_decimal_str(float(m.group(1)))
-        except (ValueError, OverflowError):
-            return ""
-
-    # 6) 整数のみ（例: 140 → 140 時間）
-    m = re.match(r"^(\d+)$", t)
-    if m:
-        try:
-            return _format_decimal_str(float(m.group(1)))
-        except (ValueError, OverflowError):
-            return ""
-
-    return ""
+    return _format_decimal_str(val)
 
 
 def _md_table_row_cells(line: str) -> list[str]:
@@ -2279,15 +2277,6 @@ def _billing_file_update_result_display(row: dict[str, str]) -> str:
     ).strip()
 
 
-def _row_employee_no(row: dict[str, str]) -> str:
-    return (
-        row.get("employee_no")
-        or row.get(SUMMARY_EMPLOYEE_NO_COL)
-        or row.get(LEGACY_EMPLOYEE_NO_COL)
-        or ""
-    ).strip()
-
-
 def _row_total_hours_decimal(row: dict[str, str]) -> str:
     return (
         row.get("total_hours_decimal")
@@ -2300,6 +2289,7 @@ def _row_billing_update_hours_decimal(row: dict[str, str]) -> str:
     return (
         row.get("billing_update_hours_decimal")
         or row.get(SUMMARY_BILLING_UPDATE_HOURS_COL)
+        or row.get(LEGACY_BILLING_UPDATE_HOURS_COL)
         or ""
     ).strip()
 
@@ -2310,6 +2300,124 @@ def _row_billing_update_transport(row: dict[str, str]) -> str:
         or row.get(SUMMARY_BILLING_UPDATE_TRANSPORT_COL)
         or ""
     ).strip()
+
+
+def _row_total_hours_raw(row: dict[str, str]) -> str:
+    return (
+        row.get("total_hours_raw")
+        or row.get("合計勤務時間（読取）")
+        or ""
+    ).strip()
+
+
+def _row_employee_no(row: dict[str, str]) -> str:
+    fn = (
+        row.get("file_name")
+        or row.get(TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_FILE_NAME_COL)
+        or ""
+    ).strip()
+    return (
+        row.get("employee_no")
+        or row.get(SUMMARY_EMPLOYEE_NO_COL)
+        or row.get(LEGACY_EMPLOYEE_NO_COL)
+        or _employee_no_from_file_name(fn)
+        or ""
+    ).strip()
+
+
+def _clear_billing_update_columns(row: dict[str, str]) -> None:
+    row["billing_update_hours_decimal"] = ""
+    row["billing_update_transport"] = ""
+    row[SUMMARY_BILLING_UPDATE_HOURS_COL] = ""
+    row[SUMMARY_BILLING_UPDATE_TRANSPORT_COL] = ""
+    row.pop(LEGACY_BILLING_UPDATE_HOURS_COL, None)
+
+
+def _set_billing_update_columns(
+    row: dict[str, str], *, hours: str, transport: str
+) -> None:
+    row["billing_update_hours_decimal"] = hours
+    row["billing_update_transport"] = transport
+    row[SUMMARY_BILLING_UPDATE_HOURS_COL] = hours
+    row[SUMMARY_BILLING_UPDATE_TRANSPORT_COL] = transport
+
+
+def _format_transport_sum(value: float) -> str:
+    if math.isclose(value, round(value), abs_tol=1e-9):
+        return str(int(round(value)))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
+    """表示順の行リストについて更新用列を設定する（in-place）。
+
+    社員番号が1件のみ: 合計勤務時間（10進）・交通費合計（読取）をコピー。
+    複数件: No順先頭行に読取合算値を設定し、他行の更新用列は空にする。
+    戻り値: 更新用値を設定したグループ数。
+    """
+    if not rows:
+        return 0
+
+    for row in rows:
+        _clear_billing_update_columns(row)
+
+    groups: dict[str, list[int]] = {}
+    for idx, row in enumerate(rows):
+        emp = _row_employee_no(row)
+        if not _is_valid_employee_no(emp):
+            continue
+        groups.setdefault(emp, []).append(idx)
+
+    updated_groups = 0
+    for indices in groups.values():
+        if len(indices) == 1:
+            row = rows[indices[0]]
+            hours = _row_total_hours_decimal(row)
+            transport = _row_transport_expense_raw(row)
+            if not hours and not transport:
+                continue
+            _set_billing_update_columns(
+                row,
+                hours=hours,
+                transport=transport,
+            )
+            updated_groups += 1
+            continue
+
+        first_idx = indices[0]
+        hour_sum = 0.0
+        hours_ok = True
+        for idx in indices:
+            raw_hours = _row_total_hours_raw(rows[idx])
+            parsed = _work_hours_raw_to_hours_float(raw_hours)
+            if parsed is None:
+                hours_ok = False
+                break
+            hour_sum += parsed
+
+        transport_sum = 0.0
+        transport_ok = True
+        for idx in indices:
+            amount, ok = _transport_amount_for_excel(_row_transport_expense_raw(rows[idx]))
+            if not ok or amount is None:
+                transport_ok = False
+                break
+            transport_sum += amount
+
+        hours_str = _format_decimal_str(hour_sum) if hours_ok else ""
+        transport_str = _format_transport_sum(transport_sum) if transport_ok else ""
+        if not hours_str and not transport_str:
+            continue
+        _set_billing_update_columns(
+            rows[first_idx],
+            hours=hours_str,
+            transport=transport_str,
+        )
+        updated_groups += 1
+
+    return updated_groups
 
 
 def _row_transport_expense_raw(row: dict[str, str]) -> str:
@@ -2429,12 +2537,12 @@ def update_billing_engineer_ts_sheet(
             if not targets:
                 results.append(BILLING_UPDATE_NO_TARGET_RECORD)
                 continue
-            hours = _hours_decimal_for_excel(_row_total_hours_decimal(row))
+            hours = _hours_decimal_for_excel(_row_billing_update_hours_decimal(row))
             if hours is None:
                 results.append("✖")
                 continue
             transport, transport_ok = _transport_amount_for_excel(
-                _row_transport_expense_raw(row)
+                _row_billing_update_transport(row)
             )
             if not transport_ok or transport is None:
                 results.append("✖")
