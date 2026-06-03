@@ -71,6 +71,7 @@ LEGACY_USER_JUDGMENT_COL = "ユーザ判断"
 SUMMARY_BILLING_UPDATE_RESULT_COL = "請求用ファイル更新"
 LEGACY_BILLING_UPDATE_RESULT_COL = "請求量ファイル更新結果"
 BILLING_UPDATE_NO_TARGET_RECORD = "（対象レコードなし）"
+BILLING_AGGREGATED_MARKER_SUFFIX = "のレコードに合算済"
 BILLING_ENGINEER_TS_SHEET_NAME = "エンジニアTS一覧"
 BILLING_TS_COL_EMPLOYEE_NO = 1  # A列
 BILLING_TS_COL_CLIENT_NAME = 4  # D列: 取引先名
@@ -2302,6 +2303,15 @@ def _row_billing_update_transport(row: dict[str, str]) -> str:
     ).strip()
 
 
+def _billing_aggregated_marker(representative_no: int) -> str:
+    return f"No.{representative_no}{BILLING_AGGREGATED_MARKER_SUFFIX}"
+
+
+def _is_billing_aggregated_marker(value: str) -> bool:
+    t = (value or "").strip()
+    return bool(t) and t.startswith("No.") and t.endswith(BILLING_AGGREGATED_MARKER_SUFFIX)
+
+
 def _row_total_hours_raw(row: dict[str, str]) -> str:
     return (
         row.get("total_hours_raw")
@@ -2362,7 +2372,7 @@ def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
     """表示順の行リストについて更新用列を設定する（in-place）。
 
     社員番号が1件のみ: 合計勤務時間（10進）・交通費合計（読取）をコピー。
-    複数件: No順先頭行に読取合算値を設定し、他行の更新用列は空にする。
+    複数件: No順先頭行に読取合算値を設定し、他行には「No.XXのレコードに合算済」を設定する。
     戻り値: 更新用値を設定したグループ数。
     """
     if not rows:
@@ -2423,6 +2433,12 @@ def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
             hours=hours_str,
             transport=transport_str,
         )
+        rep_no = _row_grid_no(rows[first_idx])
+        if rep_no < 10**9:
+            marker = _billing_aggregated_marker(rep_no)
+            for idx in indices:
+                if idx != first_idx:
+                    _set_billing_update_columns(rows[idx], hours=marker, transport=marker)
         updated_groups += 1
 
     return updated_groups
@@ -2463,7 +2479,7 @@ def _normalize_employee_no_cell_value(value: object) -> str:
 
 def _hours_decimal_for_excel(value: str) -> float | None:
     t = (value or "").strip()
-    if not t or not _is_valid_total_hours_decimal(t):
+    if not t or _is_billing_aggregated_marker(t) or not _is_valid_total_hours_decimal(t):
         return None
     try:
         return float(t)
@@ -2474,6 +2490,8 @@ def _hours_decimal_for_excel(value: str) -> float | None:
 def _transport_amount_for_excel(value: str) -> tuple[float | None, bool]:
     """旅費交通費請求金額（O列）用。空欄は 0 として扱う。(金額, 解析成功)"""
     t = (value or "").strip()
+    if _is_billing_aggregated_marker(t):
+        return None, False
     if not t or t in ("（なし）", "不明", "（不明）"):
         return 0.0, True
     nfkc = unicodedata.normalize("NFKC", t)
@@ -2545,7 +2563,11 @@ def update_billing_engineer_ts_sheet(
             if not targets:
                 results.append(BILLING_UPDATE_NO_TARGET_RECORD)
                 continue
-            hours = _hours_decimal_for_excel(_row_billing_update_hours_decimal(row))
+            hours_raw = _row_billing_update_hours_decimal(row)
+            if _is_billing_aggregated_marker(hours_raw):
+                results.append("✖")
+                continue
+            hours = _hours_decimal_for_excel(hours_raw)
             if hours is None:
                 results.append("✖")
                 continue
@@ -2732,11 +2754,13 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
     emp = _escape_md_table_cell(
         (r.get("employee_no") or "").strip() or ""
     )
-    buh = _escape_md_table_cell(
-        _decimal_for_table_display(_row_billing_update_hours_decimal(r))
-        if _row_billing_update_hours_decimal(r)
-        else ""
-    )
+    buh_raw = _row_billing_update_hours_decimal(r)
+    if _is_billing_aggregated_marker(buh_raw):
+        buh = _escape_md_table_cell(buh_raw)
+    elif buh_raw:
+        buh = _escape_md_table_cell(_decimal_for_table_display(buh_raw))
+    else:
+        buh = _escape_md_table_cell("")
     th = _escape_md_table_cell(
         ((
             _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
@@ -2854,7 +2878,12 @@ def row_display_values(
     pe = ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
     emp = (r.get("employee_no") or "").strip() or ""
     buh_raw = _row_billing_update_hours_decimal(r)
-    buh = _decimal_for_table_display(buh_raw) if buh_raw else ""
+    if _is_billing_aggregated_marker(buh_raw):
+        buh = buh_raw
+    elif buh_raw:
+        buh = _decimal_for_table_display(buh_raw)
+    else:
+        buh = ""
     th = (
         _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
         if (r.get("total_hours_decimal") or "").strip()
