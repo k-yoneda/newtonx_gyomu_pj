@@ -2350,6 +2350,14 @@ def _format_transport_sum(value: float) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
+def _row_grid_no(row: dict[str, str]) -> int:
+    for key in ("grid_row_no", SUMMARY_ROW_NO_COL, "No"):
+        v = str(row.get(key) or "").strip()
+        if v.isdigit():
+            return int(v)
+    return 10**9
+
+
 def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
     """表示順の行リストについて更新用列を設定する（in-place）。
 
@@ -2386,7 +2394,7 @@ def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
             updated_groups += 1
             continue
 
-        first_idx = indices[0]
+        first_idx = min(indices, key=lambda i: _row_grid_no(rows[i]))
         hour_sum = 0.0
         hours_ok = True
         for idx in indices:

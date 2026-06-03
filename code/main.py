@@ -275,6 +275,7 @@ class KintaiApp(tk.Frame):
         self._sort_column: str | None = None
         self._sort_reverse: bool = False
         self._tree_column_headings: tuple[str, ...] = ()
+        self._grid_row_no_seq: int = 0
 
         self._build_ui()
 
@@ -964,6 +965,7 @@ class KintaiApp(tk.Frame):
         for iid in self._tree.get_children():
             self._tree.delete(iid)
         self._item_paths.clear()
+        self._grid_row_no_seq = 0
         self._sort_column = None
         self._sort_reverse = False
         self._update_column_heading_labels()
@@ -1040,7 +1042,6 @@ class KintaiApp(tk.Frame):
         ):
             self._tree.move(iid, "", index)
 
-        self._refresh_row_numbers()
         self._update_column_heading_labels()
 
     def _resolve_file_path_for_row(self, rid: str) -> Path | None:
@@ -1240,6 +1241,9 @@ class KintaiApp(tk.Frame):
             out["expected_year"] = str(ey)
         if em is not None:
             out["expected_month"] = str(em)
+        grid_no = str(row.get("grid_row_no") or "").strip()
+        if grid_no:
+            out["grid_row_no"] = grid_no
         return out
 
     def _grid_values_from_row(
@@ -1251,19 +1255,56 @@ class KintaiApp(tk.Frame):
             sync_user_judgment_to_auto=sync_user_judgment_to_auto,
         )
 
-    def _refresh_row_numbers(self) -> None:
-        """No 列に 1 からの連番を付与する。"""
-        cols = list(self._tree["columns"])
-        try:
-            no_ci = cols.index(self.ROW_NO_COL)
-        except ValueError:
-            return
-        for seq, iid in enumerate(self._tree.get_children(), start=1):
-            vals = list(self._tree.item(iid, "values") or [])
-            while len(vals) <= no_ci:
-                vals.append("")
-            vals[no_ci] = str(seq)
-            self._tree.item(iid, values=tuple(vals))
+    def _row_no_column_index(self) -> int:
+        return list(self._tree["columns"]).index(self.ROW_NO_COL)
+
+    def _tree_row_no(self, iid: str) -> str:
+        vals = self._tree.item(iid, "values") or ()
+        ci = self._row_no_column_index()
+        return str(vals[ci]).strip() if ci < len(vals) else ""
+
+    def _assign_row_no_to_iid(self, iid: str, no: int | None = None) -> int:
+        """行に No を付与する（既存 No は上書きしない用途以外で no を指定）。"""
+        if no is None:
+            self._grid_row_no_seq += 1
+            no = self._grid_row_no_seq
+        else:
+            self._grid_row_no_seq = max(self._grid_row_no_seq, no)
+        vals = list(self._tree.item(iid, "values") or ())
+        ci = self._row_no_column_index()
+        while len(vals) <= ci:
+            vals.append("")
+        vals[ci] = str(no)
+        self._tree.item(iid, values=tuple(vals))
+        return no
+
+    def _merge_preserved_row_no(
+        self, rid: str, new_vals: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """行更新時に No 列だけ保持する（未設定なら新規採番）。"""
+        ci = self._row_no_column_index()
+        old_vals = self._tree.item(rid, "values") or ()
+        old_no = str(old_vals[ci]).strip() if ci < len(old_vals) else ""
+        vals = list(new_vals)
+        while len(vals) <= ci:
+            vals.append("")
+        if old_no:
+            vals[ci] = old_no
+            if old_no.isdigit():
+                self._grid_row_no_seq = max(self._grid_row_no_seq, int(old_no))
+        else:
+            self._grid_row_no_seq += 1
+            vals[ci] = str(self._grid_row_no_seq)
+        return tuple(vals)
+
+    def _sync_grid_row_no_seq_from_tree(self) -> None:
+        """グリッド上の No 最大値から採番カウンタを復元する。"""
+        max_no = 0
+        for iid in self._tree.get_children():
+            no_s = self._tree_row_no(iid)
+            if no_s.isdigit():
+                max_no = max(max_no, int(no_s))
+        self._grid_row_no_seq = max_no
 
     def _user_judgment_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.FINAL_JUDGMENT_COL)
@@ -1378,12 +1419,14 @@ class KintaiApp(tk.Frame):
     ) -> None:
         self._tree.item(
             rid,
-            values=self._grid_values_from_row(
-                row, sync_user_judgment_to_auto=sync_user_judgment_to_auto
+            values=self._merge_preserved_row_no(
+                rid,
+                self._grid_values_from_row(
+                    row, sync_user_judgment_to_auto=sync_user_judgment_to_auto
+                ),
             ),
         )
         self._item_paths[rid] = row.get("resolved_path", "")
-        self._refresh_row_numbers()
 
     def _set_row_reanalysis_highlight(self, rid: str, active: bool) -> None:
         """Treeview の指定行に、再解析中ハイライト（反転）を付与/解除する。"""
@@ -1986,6 +2029,9 @@ class KintaiApp(tk.Frame):
         for iid in self._tree.get_children():
             values = list(self._tree.item(iid, "values") or [])
             row = {cols[i]: (values[i] if i < len(values) else "") for i in range(len(cols))}
+            no_val = self._tree_row_no(iid)
+            if no_val:
+                row["grid_row_no"] = no_val
             row.pop(self.ROW_NO_COL, None)
             # 内部データ
             row["resolved_path"] = self._item_paths.get(iid, "")
@@ -2182,11 +2228,17 @@ class KintaiApp(tk.Frame):
 
     def _rebuild_grid_from_rows(self, rows: list[dict[str, str]]) -> None:
         self._clear_grid()
+        self._grid_row_no_seq = 0
         for r in rows:
             vals = self._grid_values_from_row(r)
             iid = self._tree.insert("", tk.END, values=vals)
             self._item_paths[iid] = (r.get("resolved_path") or "").strip()
-        self._refresh_row_numbers()
+            saved_no = str(r.get("grid_row_no") or "").strip()
+            if saved_no.isdigit():
+                self._assign_row_no_to_iid(iid, int(saved_no))
+            else:
+                self._assign_row_no_to_iid(iid)
+        self._sync_grid_row_no_seq_from_tree()
 
     def _update_title(self) -> None:
         base = "勤務表解析"
@@ -2336,7 +2388,7 @@ class KintaiApp(tk.Frame):
                 vals = self._grid_values_from_row(row)
                 iid = self._tree.insert("", tk.END, values=vals)
                 self._item_paths[iid] = row.get("resolved_path", "")
-                self._refresh_row_numbers()
+                self._assign_row_no_to_iid(iid)
                 try:
                     self._tree.yview_moveto(1)
                 except tk.TclError:
