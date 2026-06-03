@@ -59,6 +59,7 @@ from kintai_core import (
     run_analysis,
     summary_header_cells,
     update_billing_engineer_ts_sheet,
+    _is_billing_aggregated_marker,
     _row_billing_update_hours_decimal,
 )
 from newtonx_adk.exceptions import APIError
@@ -795,7 +796,8 @@ class KintaiApp(tk.Frame):
         if not messagebox.askokcancel(
             "請求データ作成",
             "社員番号ごとに更新用合計勤務時間（10進）・更新用交通費合計を作成します。\n"
-            "同一社員番号が複数ある場合は、No順の先頭行に合算値を設定します。",
+            "同一社員番号が複数ある場合は、No順の先頭行に合算値を設定し、\n"
+            "他行には「No.XXのレコードに合算済」と表示します（請求ファイル更新の対象外）。",
             parent=self._root,
         ):
             return
@@ -835,7 +837,8 @@ class KintaiApp(tk.Frame):
             if self._final_judgment_symbol_from_row(ui_row) != "〇":
                 continue
             core_row = self._row_dict_to_core(ui_row)
-            if not _row_billing_update_hours_decimal(core_row):
+            hours_val = _row_billing_update_hours_decimal(core_row)
+            if not hours_val or _is_billing_aggregated_marker(hours_val):
                 continue
             targets.append((iid, core_row))
         if not targets:
