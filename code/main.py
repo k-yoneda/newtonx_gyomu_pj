@@ -269,6 +269,9 @@ class KintaiApp(tk.Frame):
         self._loaded_json_path: Path | None = None
         self._last_saved_snapshot: str = ""
         self._chain_error_reanalysis_after_new = False
+        self._sort_column: str | None = None
+        self._sort_reverse: bool = False
+        self._tree_column_headings: tuple[str, ...] = ()
 
         self._build_ui()
 
@@ -506,6 +509,7 @@ class KintaiApp(tk.Frame):
         grid_frame.pack(fill=tk.BOTH, expand=True)
 
         headings = summary_header_cells()
+        self._tree_column_headings = headings
         y_scroll = ttk.Scrollbar(grid_frame)
         x_scroll = ttk.Scrollbar(grid_frame, orient=tk.HORIZONTAL)
 
@@ -533,7 +537,13 @@ class KintaiApp(tk.Frame):
             self._tree.column(
                 h, width=w_px, minwidth=48, stretch=tk.NO, anchor="w"
             )
-            self._tree.heading(h, text=h, anchor="w")
+            self._tree.heading(
+                h,
+                text=h,
+                anchor="w",
+                command=lambda col=h: self._sort_grid_by_column(col),
+            )
+        self._update_column_heading_labels()
 
         self._tree.grid(row=0, column=0, sticky="nsew")
         y_scroll.grid(row=0, column=1, sticky="ns")
@@ -892,6 +902,84 @@ class KintaiApp(tk.Frame):
         for iid in self._tree.get_children():
             self._tree.delete(iid)
         self._item_paths.clear()
+        self._sort_column = None
+        self._sort_reverse = False
+        self._update_column_heading_labels()
+
+    def _grid_sort_empty_marker(self, value: str) -> bool:
+        t = (value or "").strip()
+        return not t or t in ("（なし）", "不明", "（不明）", "（対象レコードなし）")
+
+    def _grid_sort_numeric_columns(self) -> frozenset[str]:
+        return frozenset(
+            {
+                self.ROW_NO_COL,
+                self.YEAR_COL,
+                self.MONTH_COL,
+                self.TOTAL_HOURS_DECIMAL_COL,
+                self.BILLING_UPDATE_HOURS_COL,
+                self.BILLING_UPDATE_TRANSPORT_COL,
+                self.TRANSPORT_EXPENSE_COL,
+            }
+        )
+
+    def _grid_sort_key(self, value: str, column: str) -> tuple[int, float | str]:
+        if self._grid_sort_empty_marker(value):
+            return (2, "")
+        t = (value or "").strip()
+        if column in self._grid_sort_numeric_columns():
+            cleaned = t.replace(",", "").replace("，", "").replace("円", "")
+            num_match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+            if num_match:
+                try:
+                    return (0, float(num_match.group()))
+                except ValueError:
+                    pass
+        return (1, t.casefold())
+
+    def _update_column_heading_labels(self) -> None:
+        for h in self._tree_column_headings:
+            text = h
+            if h == self._sort_column:
+                text += " ▲" if not self._sort_reverse else " ▼"
+            try:
+                self._tree.heading(h, text=text)
+            except tk.TclError:
+                pass
+
+    def _sort_grid_by_column(self, column: str) -> None:
+        """列見出しクリックで昇順/降順をトグルし、行全体を並べ替える。"""
+        if column not in self._tree_column_headings:
+            return
+        if self._sort_column == column:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = column
+            self._sort_reverse = False
+
+        cols = list(self._tree["columns"])
+        try:
+            col_idx = cols.index(column)
+        except ValueError:
+            return
+
+        children = list(self._tree.get_children())
+        if len(children) <= 1:
+            self._update_column_heading_labels()
+            return
+
+        def row_key(iid: str) -> tuple[int, float | str]:
+            values = self._tree.item(iid, "values") or ()
+            cell = values[col_idx] if col_idx < len(values) else ""
+            return self._grid_sort_key(str(cell), column)
+
+        for index, iid in enumerate(
+            sorted(children, key=row_key, reverse=self._sort_reverse)
+        ):
+            self._tree.move(iid, "", index)
+
+        self._refresh_row_numbers()
+        self._update_column_heading_labels()
 
     def _resolve_file_path_for_row(self, rid: str) -> Path | None:
         """行に対応する画像/PDF/Excel の絶対パスを返す。"""
