@@ -2345,6 +2345,13 @@ def _clear_billing_update_columns(row: dict[str, str]) -> None:
     row.pop(LEGACY_BILLING_UPDATE_HOURS_COL, None)
 
 
+def clear_billing_update_hours_column(row: dict[str, str]) -> None:
+    """更新用合計勤務時間（10進）のみクリアする。"""
+    row["billing_update_hours_decimal"] = ""
+    row[SUMMARY_BILLING_UPDATE_HOURS_COL] = ""
+    row.pop(LEGACY_BILLING_UPDATE_HOURS_COL, None)
+
+
 def _set_billing_update_columns(
     row: dict[str, str], *, hours: str, transport: str
 ) -> None:

@@ -54,6 +54,7 @@ from kintai_core import (
     create_client,
     is_manual_user_judgment,
     normalize_judgment_symbol,
+    clear_billing_update_hours_column,
     populate_billing_update_columns,
     row_display_values,
     run_analysis,
@@ -473,28 +474,36 @@ class KintaiApp(tk.Frame):
         )
         self._billing_prepare_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
 
+        self._billing_delete_btn = ttk.Button(
+            ctrl,
+            text="請求データ削除",
+            command=self._delete_billing_data,
+            state=tk.DISABLED,
+        )
+        self._billing_delete_btn.grid(row=0, column=6, sticky="w", padx=(8, 0))
+
         self._billing_update_btn = ttk.Button(
             ctrl,
             text="請求ファイル更新",
             command=self._update_billing_file,
             state=tk.DISABLED,
         )
-        self._billing_update_btn.grid(row=0, column=6, sticky="w", padx=(8, 0))
+        self._billing_update_btn.grid(row=0, column=7, sticky="w", padx=(8, 0))
 
         self._save_btn = ttk.Button(
             ctrl, text="保存", command=self._save_json, state=tk.DISABLED
         )
-        self._save_btn.grid(row=0, column=7, sticky="w", padx=(8, 0))
+        self._save_btn.grid(row=0, column=8, sticky="w", padx=(8, 0))
 
         self._load_btn = ttk.Button(
             ctrl, text="読み込み", command=self._load_json, state=tk.NORMAL
         )
-        self._load_btn.grid(row=0, column=8, sticky="w", padx=(8, 0))
+        self._load_btn.grid(row=0, column=9, sticky="w", padx=(8, 0))
 
         self._cancel_btn = ttk.Button(
             ctrl, text="中断", command=self._cancel_analysis, state=tk.DISABLED
         )
-        self._cancel_btn.grid(row=0, column=9, sticky="w", padx=(16, 0))
+        self._cancel_btn.grid(row=0, column=10, sticky="w", padx=(16, 0))
 
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
@@ -502,10 +511,10 @@ class KintaiApp(tk.Frame):
         # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
         # （環境によってフォントが少し太く、26文字だと末尾が欠けるケースがあったため更に増やす）
         ttk.Label(ctrl, textvariable=self._progress_var, width=30).grid(
-            row=0, column=10, sticky="w", padx=(16, 0)
+            row=0, column=11, sticky="w", padx=(16, 0)
         )
         # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
-        ctrl.columnconfigure(10, minsize=240)
+        ctrl.columnconfigure(11, minsize=240)
 
         self._status_label = ttk.Label(
             ctrl,
@@ -515,8 +524,8 @@ class KintaiApp(tk.Frame):
             wraplength=900,
             justify="left",
         )
-        self._status_label.grid(row=0, column=11, sticky="ew", padx=(12, 0))
-        ctrl.columnconfigure(11, weight=1)
+        self._status_label.grid(row=0, column=12, sticky="ew", padx=(12, 0))
+        ctrl.columnconfigure(12, weight=1)
 
         grid_frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         grid_frame.pack(fill=tk.BOTH, expand=True)
@@ -675,10 +684,14 @@ class KintaiApp(tk.Frame):
     def _refresh_billing_buttons_state(self) -> None:
         if self._busy:
             self._billing_prepare_btn.configure(state=tk.DISABLED)
+            self._billing_delete_btn.configure(state=tk.DISABLED)
             self._billing_update_btn.configure(state=tk.DISABLED)
             return
         has_rows = bool(self._tree.get_children())
         self._billing_prepare_btn.configure(
+            state=(tk.NORMAL if has_rows else tk.DISABLED)
+        )
+        self._billing_delete_btn.configure(
             state=(tk.NORMAL if has_rows else tk.DISABLED)
         )
         enabled = (
@@ -783,6 +796,17 @@ class KintaiApp(tk.Frame):
         vals[ci] = symbol
         self._tree.item(rid, values=tuple(vals))
 
+    def _billing_target_iids(self) -> list[str]:
+        selected = self._selected_tree_iids()
+        if selected:
+            return selected
+        return list(self._tree.get_children())
+
+    def _billing_target_scope_label(self) -> str:
+        if self._selected_tree_iids():
+            return f"選択行（{len(self._billing_target_iids())} 行）"
+        return "全行"
+
     def _create_billing_data(self) -> None:
         if self._busy:
             return
@@ -793,8 +817,10 @@ class KintaiApp(tk.Frame):
                 parent=self._root,
             )
             return
+        scope = self._billing_target_scope_label()
         if not messagebox.askokcancel(
             "請求データ作成",
+            f"対象: {scope}\n\n"
             "社員番号ごとに更新用合計勤務時間（10進）・更新用交通費合計を作成します。\n"
             "同一社員番号が複数ある場合は、No順の先頭行に合算値を設定し、\n"
             "他行には「No.XXのレコードに合算済」と表示します（請求ファイル更新の対象外）。",
@@ -803,7 +829,7 @@ class KintaiApp(tk.Frame):
             return
 
         ordered: list[tuple[str, dict[str, str]]] = []
-        for iid in self._tree.get_children():
+        for iid in self._billing_target_iids():
             ordered.append((iid, self._row_dict_to_core(self._current_row_dict_from_iid(iid))))
 
         cores = [core for _, core in ordered]
@@ -813,11 +839,48 @@ class KintaiApp(tk.Frame):
 
         self._loaded_rows = self._current_grid_rows()
         self._status_var.set(
-            f"請求データ作成完了: {group_count} グループに更新用列を設定しました"
+            f"請求データ作成完了（{scope}）: {group_count} グループに更新用列を設定しました"
         )
         messagebox.showinfo(
             "請求データ作成",
-            f"更新用列を設定しました（{group_count} グループ）。",
+            f"対象: {scope}\n更新用列を設定しました（{group_count} グループ）。",
+            parent=self._root,
+        )
+
+    def _delete_billing_data(self) -> None:
+        if self._busy:
+            return
+        if not self._tree.get_children():
+            messagebox.showinfo(
+                "請求データ削除",
+                "グリッドに行がありません。",
+                parent=self._root,
+            )
+            return
+        scope = self._billing_target_scope_label()
+        if not messagebox.askokcancel(
+            "請求データ削除",
+            f"対象: {scope}\n\n"
+            "更新用合計勤務時間（10進）をクリアします。",
+            parent=self._root,
+        ):
+            return
+
+        cleared = 0
+        for iid in self._billing_target_iids():
+            core = self._row_dict_to_core(self._current_row_dict_from_iid(iid))
+            if _row_billing_update_hours_decimal(core):
+                cleared += 1
+            clear_billing_update_hours_column(core)
+            self._replace_row_with_result(iid, core)
+
+        self._loaded_rows = self._current_grid_rows()
+        self._status_var.set(
+            f"請求データ削除完了（{scope}）: {cleared} 行の更新用合計勤務時間（10進）をクリアしました"
+        )
+        messagebox.showinfo(
+            "請求データ削除",
+            f"対象: {scope}\n更新用合計勤務時間（10進）をクリアしました（{cleared} 行）。",
             parent=self._root,
         )
 
@@ -1487,6 +1550,7 @@ class KintaiApp(tk.Frame):
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
+        self._billing_delete_btn.configure(state=tk.DISABLED)
         self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set("再解析中 0 / 1")
         self._status_var.set(f"再解析しています… {file_name}")
@@ -1615,6 +1679,7 @@ class KintaiApp(tk.Frame):
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
+        self._billing_delete_btn.configure(state=tk.DISABLED)
         self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set(f"{label}中 0 / {total}")
         self._status_var.set(f"{label}しています… {total} 件（並列 {parallel}）")
@@ -2337,6 +2402,7 @@ class KintaiApp(tk.Frame):
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
+        self._billing_delete_btn.configure(state=tk.DISABLED)
         self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set("")
         self._status_var.set("解析を準備しています…")

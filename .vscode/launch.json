@@ -11,7 +11,7 @@
             "justMyCode": false,
             "cwd": "${fileDirname}",
             "env": {
-                "PYTHONPATH": "${workspaceFolder}\\myvenv\\Lib\\site-packages"
+                "PYTHONPATH": "${workspaceFolder}\\.venv\\Lib\\site-packages"
             }
         },
         {
@@ -22,7 +22,7 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "PYTHONPATH": "${workspaceFolder}\\myvenv\\Lib\\site-packages"
+                "PYTHONPATH": "${workspaceFolder}\\.venv\\Lib\\site-packages"
             },
             "cwd": "${fileDirname}",
             "args": ["-c","config.yml"]
@@ -35,7 +35,7 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
-                "PYTHONPATH": "${workspaceFolder}\\myvenv\\Lib\\site-packages"
+                "PYTHONPATH": "${workspaceFolder}\\.venv\\Lib\\site-packages"
             },
             "cwd": "${fileDirname}",
             "args": ["sample_data", "output.csv"]
