@@ -64,7 +64,9 @@ from kintai_core import (
     company_alias_lookup_key,
     default_company_alias_table_path,
     load_company_aliases,
+    is_match_company_ok_for_ratio,
     recalculate_match_company_for_row,
+    recalculate_match_person_for_row,
     save_company_aliases,
     _parse_filename_company_and_person,
     _is_billing_aggregated_marker,
@@ -235,11 +237,15 @@ class KintaiApp(tk.Frame):
         FINAL_JUDGMENT_COL: 72,
         BILLING_UPDATE_RESULT_COL: 120,
         AUTO_JUDGMENT_COL: 72,
-        MATCH_COMPANY_COL: 72,
+        MATCH_COMPANY_COL: 100,
         "押印有無": 72,
     }
     _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
-    _ROW_EXTRA_KEYS = ("name_company_from_file", "name_company_from_doc")
+    _ROW_EXTRA_KEYS = (
+        "name_company_from_file",
+        "name_company_from_doc",
+        "match_company_manual_ok",
+    )
 
     def __init__(
         self,
@@ -1416,13 +1422,15 @@ class KintaiApp(tk.Frame):
         return list(self._tree["columns"]).index(self.MATCH_COMPANY_COL)
 
     def _sync_row_extra_from_row(self, iid: str, row: dict[str, str]) -> None:
-        extra: dict[str, str] = {}
+        extra = dict(self._row_extra.get(iid, {}))
         for key in self._ROW_EXTRA_KEYS:
             val = str(row.get(key) or "").strip()
             if key == "name_company_from_doc":
                 val = _document_company_for_display(val)
             if val:
                 extra[key] = val
+            elif key in extra:
+                del extra[key]
         if extra:
             self._row_extra[iid] = extra
         elif iid in self._row_extra:
@@ -1431,11 +1439,19 @@ class KintaiApp(tk.Frame):
     def _merge_row_extra(self, iid: str, row: dict[str, str]) -> dict[str, str]:
         out = dict(row)
         for key, val in self._row_extra.get(iid, {}).items():
+            if key not in self._ROW_EXTRA_KEYS:
+                continue
             if key == "name_company_from_doc":
                 val = _document_company_for_display(val)
+            if key == "match_company_manual_ok":
+                out[key] = val
+                continue
             if val and not str(out.get(key) or "").strip():
                 out[key] = val
         return out
+
+    def _is_match_company_manual_ok(self, row: dict[str, str]) -> bool:
+        return (row.get("match_company_manual_ok") or "").strip() == "1"
 
     def _reload_company_aliases(self) -> None:
         self._company_aliases = load_company_aliases(self._company_alias_table_path)
@@ -1476,8 +1492,23 @@ class KintaiApp(tk.Frame):
         core["match_company"] = recalculate_match_company_for_row(
             core, company_aliases=self._company_aliases
         )
+        if self._is_match_company_manual_ok(core):
+            core["match_company"] = "〇"
         core[self.MATCH_COMPANY_COL] = core["match_company"]
+        core["match_person"] = recalculate_match_person_for_row(core)
         self._recalculate_auto_judgment_for_row(rid, core)
+
+    def _set_match_company_temp_ok(self, rid: str) -> None:
+        """会社名比較を対応表登録なしで一旦〇にする。"""
+        row = self._merge_row_extra(rid, self._current_row_dict_from_iid(rid))
+        core = self._row_dict_to_core(row)
+        core["match_company_manual_ok"] = "1"
+        core["match_company"] = "〇"
+        core[self.MATCH_COMPANY_COL] = "〇"
+        core["match_person"] = recalculate_match_person_for_row(core)
+        self._recalculate_auto_judgment_for_row(rid, core)
+        self._sync_row_extra_from_row(rid, core)
+        self._status_var.set("会社名比較を一旦〇にしました（対応表には登録しません）")
 
     def _file_company_lookup_key(self, file_co: str) -> str:
         return company_alias_lookup_key(file_co, "")[0]
@@ -1796,6 +1827,7 @@ class KintaiApp(tk.Frame):
         core = self._row_dict_to_core(
             row if row is not None else self._current_row_dict_from_iid(rid)
         )
+        core["match_person"] = recalculate_match_person_for_row(core)
         aj = auto_judgment_symbol(core)
         core["auto_judgment"] = aj
         core["user_judgment_company"] = aj
@@ -1872,6 +1904,10 @@ class KintaiApp(tk.Frame):
             menu.add_command(
                 label="この対応をOK登録",
                 command=lambda: self._register_company_alias_from_row(rid),
+            )
+            menu.add_command(
+                label="一旦〇にする（対応表に登録しない）",
+                command=lambda: self._set_match_company_temp_ok(rid),
             )
             menu.add_command(
                 label="会社名対応表を編集",
@@ -2551,7 +2587,7 @@ class KintaiApp(tk.Frame):
                 or (row.get("match_company") or "").strip()
             )
             processed_count += 1
-            if symbol in ("〇", "△"):
+            if is_match_company_ok_for_ratio(symbol):
                 ok_count += 1
 
         target_count = total_target_count if total_target_count is not None else processed_count

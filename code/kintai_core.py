@@ -51,6 +51,7 @@ TARGET_FILE_NAME_COL = "対象ファイル名（左クリックで表示）"
 LEGACY_TARGET_FILE_NAME_COL = "対象ファイル名"
 LEGACY_FILE_NAME_COL = "画像ファイル名"
 SUMMARY_COMPANY_COL = "会社名（読取）"
+SUMMARY_MATCH_COMPANY_COL = "会社名比較"
 LEGACY_COMPANY_READ_LONG_COL = "会社名（読み取）"
 LEGACY_COMPANY_COL = "会社名1"
 LEGACY_COMPANY_NAME_COL = "会社名"
@@ -1056,25 +1057,26 @@ def _extract_excel_target_sheet_row(
             if doc_m:
                 row["month"] = doc_m
 
-            file_company, _file_person = _parse_filename_company_and_person(file_path.name)
+            file_company, file_person = _parse_filename_company_and_person(file_path.name)
+            file_person = _filename_person_from_file_name(file_path.name)
             doc_company_raw = str(company).strip() if company is not None else ""
             doc_company_norm = _document_company_for_display(doc_company_raw)
             doc_company_match = _document_company_for_match(doc_company_raw)
             match_company = _match_company_symbol_single(
                 file_company, doc_company_match, company_aliases=company_aliases
             )
+            doc_person_raw = str(person).strip() if person is not None else ""
+            doc_person_match = _document_person_for_match(doc_person_raw)
 
             row["name_company_from_file"] = file_company
             row["name_company_from_doc"] = doc_company_norm
             row["name_company_1"] = doc_company_norm
-            row["name_person_from_doc"] = str(person).strip() if person is not None else ""
+            row["name_person_from_file"] = file_person
+            row["name_person_from_doc"] = doc_person_raw
             row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
             row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
             row["match_company"] = match_company
-            # 仕様: 1行解析時は自動判断をユーザ判断にもセットする
-            aj = _auto_judgment_symbol(row)
-            row["auto_judgment"] = aj
-            row["user_judgment_company"] = aj
+            row["match_person"] = _compare_person(file_person, doc_person_match)
         except Exception as e:
             row["analysis"] = f"Excelセル読み取り失敗: {e}"
         finally:
@@ -1556,6 +1558,12 @@ def _strip_trailing_sama(company_segment: str) -> str:
     return t
 
 
+def _filename_person_from_file_name(file_name: str) -> str:
+    """ファイル名から氏名照合用の氏名を抽出する（勤務表・年月・社員番号は除外）。"""
+    _, person_segment = _parse_filename_company_and_person(file_name)
+    return _filename_person_for_billing_lookup(person_segment)
+
+
 def _parse_filename_company_and_person(file_name: str) -> tuple[str, str]:
     """ファイル名（拡張子除く）から会社名と氏名を分離。
 
@@ -1748,17 +1756,36 @@ def _normalize_document_company_read_value(raw: str) -> str:
         return ""
     if t.startswith("不明(") or t.startswith("不明（"):
         return ""
+    if _company_text_contains_seraku(t):
+        return ""
     return t
 
 
 def _document_company_for_display(ktab_company: str) -> str:
-    """会社名列用。空欄・未取得・（データなし）等は空文字。"""
-    return _normalize_document_company_read_value(ktab_company)
+    """会社名列用。空欄・未取得・セラク社名等は空文字。"""
+    parts = _split_document_company_candidates(ktab_company)
+    return ", ".join(parts) if parts else ""
 
 
 def _document_company_for_match(ktab_company: str) -> str:
-    """照合用の文書側会社。複数候補はカンマ区切りのまま返し、比較側で分解する。"""
-    return _normalize_document_company_read_value(ktab_company)
+    """照合用の文書側会社。セラク社名は除外し、空文字として比較する。"""
+    return _document_company_for_display(ktab_company)
+
+
+def _normalize_document_person_read_value(raw: str) -> str:
+    t = unicodedata.normalize("NFKC", (raw or "").strip())
+    if not t:
+        return ""
+    if t in _EMPTY_COMPANY_READ_VALUES:
+        return ""
+    if t.startswith("不明(") or t.startswith("不明（"):
+        return ""
+    return t
+
+
+def _document_person_for_match(person: str) -> str:
+    """照合用の文書側氏名。未取得表記は空文字。"""
+    return _normalize_document_person_read_value(person)
 
 
 def _split_document_company_candidates(companies_text: str) -> list[str]:
@@ -1769,10 +1796,9 @@ def _split_document_company_candidates(companies_text: str) -> list[str]:
     parts = re.split(r"\s*[,，、]\s*", raw)
     out: list[str] = []
     for p in parts:
-        t = (p or "").strip()
-        if not t:
-            continue
-        out.append(t)
+        t = _normalize_document_company_read_value(p)
+        if t:
+            out.append(t)
     return out
 
 
@@ -1935,6 +1961,47 @@ def recalculate_match_company_for_row(
     )
 
 
+def recalculate_match_person_for_row(row: dict[str, str]) -> str:
+    """行データから氏名比較記号を再計算する。"""
+    fn = (
+        row.get("file_name")
+        or row.get(TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_FILE_NAME_COL)
+        or ""
+    ).strip()
+    file_pe = (row.get("name_person_from_file") or "").strip()
+    if not file_pe and fn:
+        file_pe = _filename_person_from_file_name(fn)
+    doc_pe = _document_person_for_match(
+        (row.get("name_person_from_doc") or "").strip()
+        or (row.get(SUMMARY_PERSON_COL) or "").strip()
+        or (row.get(LEGACY_PERSON_COL) or "").strip()
+    )
+    return _compare_person(file_pe, doc_pe)
+
+
+def _judgment_match_tier(symbol: str, *, is_company: bool) -> int:
+    """比較記号の厳しさ（0=〇, 1=△, 2=✖）。"""
+    t = (symbol or "").strip()
+    if is_company and is_match_company_ok_symbol(t):
+        return 0
+    if t == "〇":
+        return 0
+    if t == "△":
+        return 1
+    return 2
+
+
+def _judgment_from_match_symbols(company_symbol: str, person_symbol: str) -> str:
+    """会社名・氏名の比較記号から自動判断の〇/△/✖を決める。"""
+    worst = max(
+        _judgment_match_tier(company_symbol, is_company=True),
+        _judgment_match_tier(person_symbol, is_company=False),
+    )
+    return ("〇", "△", "✖")[worst]
+
+
 def _match_company_symbol_single(
     file_co: str,
     doc_company: str,
@@ -1948,7 +2015,7 @@ def _match_company_symbol_single(
         if not fp:
             return "〇"
         if is_company_alias_match(file_co, doc_company, company_aliases):
-            return "〇"
+            return MATCH_COMPANY_ALIAS_OK_SYMBOL
         return "✖"
     if not fp:
         return "△"
@@ -1957,10 +2024,10 @@ def _match_company_symbol_single(
         return "〇"
     if "△" in symbols:
         if is_company_alias_match(file_co, doc_company, company_aliases):
-            return "〇"
+            return MATCH_COMPANY_ALIAS_OK_SYMBOL
         return "△"
     if is_company_alias_match(file_co, doc_company, company_aliases):
-        return "〇"
+        return MATCH_COMPANY_ALIAS_OK_SYMBOL
     return "✖"
 
 
@@ -2219,7 +2286,8 @@ def _enrich_with_match_scores(
             else analysis
         )
         ktab = _extract_kintai_from_markdown_table(text_for_extraction, fn) or {}
-    fp_co, fp_pe = _parse_filename_company_and_person(fn)
+    fp_co, _fp_pe_seg = _parse_filename_company_and_person(fn)
+    fp_pe = _filename_person_from_file_name(fn)
     row["employee_no"] = _employee_no_from_file_name(fn)
     k_co = (ktab.get("company") or "").strip()
     name_company_1 = _document_company_for_display(k_co)
@@ -2253,14 +2321,14 @@ def _enrich_with_match_scores(
     row["match_company"] = _match_company_symbol_single(
         fp_co, doc_co_match, company_aliases=company_aliases
     )
-    row["match_person"] = _compare_person(fp_pe, d_pe)
+    row["match_person"] = _compare_person(
+        fp_pe, _document_person_for_match(d_pe)
+    )
     th_dec = _work_hours_string_to_decimal(th_raw)
     row["total_hours_raw"] = th_raw
     row["total_hours_decimal"] = th_dec
     # 仕様: 1行解析時は自動判断をユーザ判断にもセットする（合計勤務時間設定後に計算）
-    aj = _auto_judgment_symbol(row)
-    row["auto_judgment"] = aj
-    row["user_judgment_company"] = aj
+    _apply_parsed_auto_judgment(row)
     # 読取列は解析から抜いた文字列をそのまま用いる（60進/10進の別は _work_hours_string_to_decimal 側のルール）
     row["labor_read_display"] = (th_raw or "").strip() or "（なし）"
     row["seal_in_doc"] = _seal_norm or _extract_seal_in_from_document(
@@ -2323,15 +2391,28 @@ SUMMARY_MD_HEADER = (
     f"{TARGET_FILE_NAME_COL} | "
     f"{SUMMARY_FINAL_JUDGMENT_COL} | {SUMMARY_BILLING_UPDATE_RESULT_COL} | 自動判断 | "
     f"{SUMMARY_YEAR_COL} | {SUMMARY_MONTH_COL} | "
-    f"{SUMMARY_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
+    f"{SUMMARY_COMPANY_COL} | {SUMMARY_MATCH_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
     f"{SUMMARY_BILLING_UPDATE_HOURS_COL} | "
     "合計勤務時間（10進） | 合計勤務時間（読取） | "
     f"{SUMMARY_BILLING_UPDATE_TRANSPORT_COL} | {SUMMARY_TRANSPORT_EXPENSE_COL} | "
-    "会社名比較 | 押印有無 |"
+    "押印有無 |"
 )
 
 # 旧UI列名（JSON読み込み互換）
 LEGACY_MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
+MATCH_COMPANY_ALIAS_OK_SYMBOL = "〇（対応表）"
+
+
+def is_match_company_ok_symbol(symbol: str) -> bool:
+    """会社名比較が〇扱いか（通常〇・対応表〇）。"""
+    t = (symbol or "").strip()
+    return t in ("〇", MATCH_COMPANY_ALIAS_OK_SYMBOL)
+
+
+def is_match_company_ok_for_ratio(symbol: str) -> bool:
+    """会社名比較〇率の分子に含めるか（〇・対応表〇・△）。"""
+    t = (symbol or "").strip()
+    return is_match_company_ok_symbol(t) or t == "△"
 
 
 _EMPLOYEE_NO_VALID_RE = re.compile(r"^(?:\d{7}|BP\d{5})$", re.IGNORECASE)
@@ -2375,11 +2456,19 @@ def auto_judgment_symbol(row: dict[str, str]) -> str:
         or row.get(LEGACY_MATCH_COMPANY_COL)
         or ""
     ).strip()
+    mp = (row.get("match_person") or "").strip()
     return _auto_judgment_symbol(
         {
             "employee_no": emp,
             "total_hours_decimal": th,
             "match_company": mc,
+            "match_person": mp,
+            "name_person_from_file": (row.get("name_person_from_file") or "").strip(),
+            "name_person_from_doc": (
+                (row.get("name_person_from_doc") or "").strip()
+                or (row.get(SUMMARY_PERSON_COL) or "").strip()
+                or (row.get(LEGACY_PERSON_COL) or "").strip()
+            ),
             "file_name": (
                 row.get("file_name")
                 or row.get(TARGET_FILE_NAME_COL)
@@ -2790,20 +2879,29 @@ def update_billing_engineer_ts_sheet(
         wb.close()
 
 
+def _apply_parsed_auto_judgment(row: dict[str, str]) -> None:
+    """解析直後の行に自動判断を計算し、最終判断（ユーザ判断）にも同じ値をセットする。"""
+    aj = _auto_judgment_symbol(row)
+    row["auto_judgment"] = aj
+    row["user_judgment_company"] = aj
+
+
 def _auto_judgment_symbol(row: dict[str, str]) -> str:
     """自動判断（〇/△/✖）を計算する。
 
     仕様:
       - 読み取った年・月とコンボ（expected_year/month）が不一致 → ✖
-      - 〇: 年・月一致、社員番号が有効、合計勤務時間(10進)が有効、会社名比較が〇
-      - △: 上記と同様だが会社名比較が△（画像/PDF・Excel 共通）
-      - ✖: 年・月不一致、または社員番号・勤務時間・会社名比較のいずれかが不適合
+      - 〇: 年・月一致、社員番号が有効、合計勤務時間(10進)が有効、
+            会社名比較・氏名比較がともに〇扱い
+      - △: 上記前提を満たし、会社名または氏名の比較が△（もう一方は〇扱い）
+      - ✖: 年・月不一致、または社員番号・勤務時間・会社名・氏名のいずれかが不適合
     """
     if not _year_month_matches_expected(row):
         return "✖"
     emp = (row.get("employee_no") or "").strip()
     th = (row.get("total_hours_decimal") or "").strip()
     mc = (row.get("match_company") or "").strip()
+    mp = recalculate_match_person_for_row(row)
     file_name = (
         row.get("file_name")
         or row.get(TARGET_FILE_NAME_COL)
@@ -2816,11 +2914,7 @@ def _auto_judgment_symbol(row: dict[str, str]) -> str:
         return "✖"
     if not is_transport_file and not _is_valid_total_hours_decimal(th):
         return "✖"
-    if mc == "〇":
-        return "〇"
-    if mc == "△":
-        return "△"
-    return "✖"
+    return _judgment_from_match_symbols(mc, mp)
 
 
 def _upload_image_with_retries(
@@ -2988,7 +3082,7 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
     no = _escape_md_table_cell(str(row_no) if row_no is not None else "")
     return (
         f"| {no} | {u_sym} | {ts} | {fn} | {uj} | {bur} | {aj} | {yy} | {mm} | "
-        f"{co1} | {pe} | {emp} | {buh} | {th} | {lr} | {but} | {te} | {mc} | {se} |"
+        f"{co1} | {mc} | {pe} | {emp} | {buh} | {th} | {lr} | {but} | {te} | {se} |"
     )
 
 
@@ -2999,7 +3093,7 @@ def _company_match_counts(results: list[dict[str, str]]) -> tuple[int, int]:
     for row in results:
         processed_count += 1
         symbol = (row.get("match_company") or "").strip()
-        if symbol in ("〇", "△"):
+        if is_match_company_ok_for_ratio(symbol):
             ok_count += 1
     return ok_count, processed_count
 
@@ -3116,6 +3210,7 @@ def row_display_values(
         yy,
         mm,
         co1,
+        mc,
         pe,
         emp,
         buh,
@@ -3123,7 +3218,6 @@ def row_display_values(
         lr,
         but,
         te,
-        mc,
         se,
     )
 
@@ -3284,7 +3378,7 @@ def run_analysis(
         symbol = (row_dict.get("match_company") or "").strip()
         with company_ratio_lock:
             company_match_processed_count += 1
-            if symbol in ("〇", "△"):
+            if is_match_company_ok_for_ratio(symbol):
                 company_match_ok_count += 1
             line = _company_match_ratio_progress_line(
                 company_match_ok_count,
@@ -3424,6 +3518,7 @@ def run_analysis(
                         file_path, company_aliases=company_aliases
                     )
                     attach_year_month(row_excel)
+                    _apply_parsed_auto_judgment(row_excel)
                     bucket_results[worker_idx].append(row_excel)
                     emit_summary_row_md(row_excel)
                     emit_company_match_ratio_progress(row_excel)
