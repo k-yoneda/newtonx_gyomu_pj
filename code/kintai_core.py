@@ -79,6 +79,8 @@ BILLING_TS_COL_PERSON_NAME = 5  # E列: 氏名
 BILLING_TS_COL_NORMAL_HOURS = 8  # H列: 通常請求時間
 BILLING_TS_COL_TRANSPORT_AMOUNT = 15  # O列: 旅費交通費請求金額
 
+COMPANY_ALIAS_TABLE_FILENAME = "会社名対応表.json"
+
 #TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
 TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
 #TARGET_ASSISTANT_NAME = "Gemini 3.1 Pro(高性能)"
@@ -455,6 +457,7 @@ def _apply_analysis_response_to_row(
     raw_response: str,
     *,
     prefer_kintai_section: bool = False,
+    company_aliases: list[dict[str, str]] | None = None,
 ) -> None:
     """analyze_image_once / analyze_pdf_once の戻り値を行データに反映する。"""
     _print_analysis_json_to_terminal(
@@ -473,6 +476,7 @@ def _apply_analysis_response_to_row(
         row["analysis"],
         prefer_kintai_section=prefer_kintai_section,
         analysis_json=analysis_json,
+        company_aliases=company_aliases,
     )
 
 
@@ -1011,6 +1015,7 @@ def _extract_excel_target_sheet_row(
     file_path: Path,
     *,
     target_sheet_name: str = TARGET_EXCEL_SHEET_NAME,
+    company_aliases: list[dict[str, str]] | None = None,
 ) -> dict[str, str]:
     row = {
         "upload_ok": "",
@@ -1053,12 +1058,15 @@ def _extract_excel_target_sheet_row(
 
             file_company, _file_person = _parse_filename_company_and_person(file_path.name)
             doc_company_raw = str(company).strip() if company is not None else ""
+            doc_company_norm = _document_company_for_display(doc_company_raw)
             doc_company_match = _document_company_for_match(doc_company_raw)
-            match_company = _match_company_symbol_single(file_company, doc_company_match)
+            match_company = _match_company_symbol_single(
+                file_company, doc_company_match, company_aliases=company_aliases
+            )
 
             row["name_company_from_file"] = file_company
-            row["name_company_from_doc"] = doc_company_raw
-            row["name_company_1"] = str(company).strip() if company is not None else ""
+            row["name_company_from_doc"] = doc_company_norm
+            row["name_company_1"] = doc_company_norm
             row["name_person_from_doc"] = str(person).strip() if person is not None else ""
             row["total_hours_raw"] = _excel_cell_value_to_raw_text(total_raw_value)
             row["total_hours_decimal"] = _excel_cell_value_to_decimal_hours(total_raw_value)
@@ -1726,19 +1734,31 @@ def _file_co_for_match(company_from_file: str) -> str:
     return s
 
 
+_EMPTY_COMPANY_READ_VALUES = frozenset(
+    unicodedata.normalize("NFKC", v)
+    for v in ("不明", "（不明）", "（データなし）", "（なし）")
+)
+
+
+def _normalize_document_company_read_value(raw: str) -> str:
+    t = unicodedata.normalize("NFKC", (raw or "").strip())
+    if not t:
+        return ""
+    if t in _EMPTY_COMPANY_READ_VALUES:
+        return ""
+    if t.startswith("不明(") or t.startswith("不明（"):
+        return ""
+    return t
+
+
 def _document_company_for_display(ktab_company: str) -> str:
-    """会社名列用。セラクを含む勤怠表の会社は表示しない（不明扱い）。"""
-    k = (ktab_company or "").strip()
-    if not k:
-        return "不明"
-    if _company_text_contains_seraku(k):
-        return "不明"
-    return k
+    """会社名列用。空欄・未取得・（データなし）等は空文字。"""
+    return _normalize_document_company_read_value(ktab_company)
 
 
 def _document_company_for_match(ktab_company: str) -> str:
     """照合用の文書側会社。複数候補はカンマ区切りのまま返し、比較側で分解する。"""
-    return (ktab_company or "").strip()
+    return _normalize_document_company_read_value(ktab_company)
 
 
 def _split_document_company_candidates(companies_text: str) -> list[str]:
@@ -1752,25 +1772,195 @@ def _split_document_company_candidates(companies_text: str) -> list[str]:
         t = (p or "").strip()
         if not t:
             continue
-        if _company_text_contains_seraku(t):
-            continue
         out.append(t)
     return out
 
 
-def _match_company_symbol_single(file_co: str, doc_company: str) -> str:
+def default_company_alias_table_path(project_root: Path | None = None) -> Path:
+    """会社名対応表 JSON の既定パス（プロジェクト直下）。"""
+    root = project_root if project_root is not None else Path(__file__).resolve().parent.parent
+    return root / COMPANY_ALIAS_TABLE_FILENAME
+
+
+def company_alias_lookup_key(file_co: str, doc_co: str) -> tuple[str, str]:
+    """対応表の照合キー（正規化後のファイル名会社・文書会社）。"""
+    return (_company_core_for_match(file_co), _company_core_for_match(doc_co))
+
+
+def load_company_aliases(path: Path) -> list[dict[str, str]]:
+    """会社名対応表 JSON を読み込む。ファイルがない場合は空リスト。"""
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    aliases = data.get("aliases")
+    if not isinstance(aliases, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in aliases:
+        if not isinstance(item, dict):
+            continue
+        fc = str(item.get("file_company") or "").strip()
+        dc = str(item.get("doc_company") or "").strip()
+        if not fc:
+            continue
+        out.append(
+            {
+                "file_company": fc,
+                "doc_company": dc,
+                "note": str(item.get("note") or "").strip(),
+                "updated_at": str(item.get("updated_at") or "").strip(),
+            }
+        )
+    return out
+
+
+def save_company_aliases(path: Path, aliases: list[dict[str, str]]) -> None:
+    """会社名対応表 JSON を保存する。"""
+    payload = {"version": 1, "aliases": aliases}
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _company_alias_key_set(aliases: list[dict[str, str]] | None) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    if not aliases:
+        return keys
+    for item in aliases:
+        fc = str(item.get("file_company") or "").strip()
+        dc = str(item.get("doc_company") or "").strip()
+        if fc:
+            keys.add(company_alias_lookup_key(fc, dc))
+    return keys
+
+
+def is_company_alias_match(
+    file_co: str,
+    doc_company: str,
+    aliases: list[dict[str, str]] | None,
+) -> bool:
+    """対応表に登録されたファイル名会社・文書会社の組み合わせか。"""
+    if not aliases:
+        return False
+    fp = _file_co_for_match(file_co)
+    if not fp:
+        return False
+    doc_candidates = _split_document_company_candidates(doc_company)
+    keys = _company_alias_key_set(aliases)
+    if not keys:
+        return False
+    if not doc_candidates:
+        return company_alias_lookup_key(fp, "") in keys
+    for d in doc_candidates:
+        if company_alias_lookup_key(fp, d) in keys:
+            return True
+    return False
+
+
+def add_company_alias(
+    aliases: list[dict[str, str]],
+    *,
+    file_company: str,
+    doc_company: str,
+    note: str = "",
+) -> bool:
+    """対応表に1件追加する。同一キーがあれば更新し False を返す。新規追加時は True。"""
+    fc = (file_company or "").strip()
+    dc = (doc_company or "").strip()
+    if not fc:
+        return False
+    key = company_alias_lookup_key(fc, dc)
+    now = DTDateTime.now().isoformat(timespec="seconds")
+    for item in aliases:
+        if company_alias_lookup_key(
+            str(item.get("file_company") or ""),
+            str(item.get("doc_company") or ""),
+        ) == key:
+            item["file_company"] = fc
+            item["doc_company"] = dc
+            item["note"] = (note or "").strip()
+            item["updated_at"] = now
+            return False
+    aliases.append(
+        {
+            "file_company": fc,
+            "doc_company": dc,
+            "note": (note or "").strip(),
+            "updated_at": now,
+        }
+    )
+    return True
+
+
+def recalculate_match_company_for_row(
+    row: dict[str, str],
+    *,
+    company_aliases: list[dict[str, str]] | None = None,
+) -> str:
+    """行データから会社名比較記号を再計算する（対応表を参照）。"""
+    fn = (
+        row.get("file_name")
+        or row.get(TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_FILE_NAME_COL)
+        or ""
+    ).strip()
+    file_co = (row.get("name_company_from_file") or "").strip()
+    if not file_co and fn:
+        file_co = _parse_filename_company_and_person(fn)[0]
+    doc_co = _normalize_document_company_read_value(
+        (row.get("name_company_from_doc") or "").strip()
+    )
+    if not doc_co:
+        display_co = _normalize_document_company_read_value(
+            (
+                row.get("name_company_1")
+                or row.get(SUMMARY_COMPANY_COL)
+                or row.get(LEGACY_COMPANY_READ_LONG_COL)
+                or row.get(LEGACY_COMPANY_COL)
+                or row.get(LEGACY_COMPANY_NAME_COL)
+                or ""
+            ).strip()
+        )
+        if display_co:
+            doc_co = display_co
+    return _match_company_symbol_single(
+        file_co,
+        _document_company_for_match(doc_co),
+        company_aliases=company_aliases,
+    )
+
+
+def _match_company_symbol_single(
+    file_co: str,
+    doc_company: str,
+    *,
+    company_aliases: list[dict[str, str]] | None = None,
+) -> str:
     """勤怠表から取れた会社名とファイル名会社を照合。複数社名は候補のいずれか一致で判定。"""
     fp = _file_co_for_match(file_co)
     doc_candidates = _split_document_company_candidates(doc_company)
     if not doc_candidates:
-        return "〇" if not fp else "✖"
+        if not fp:
+            return "〇"
+        if is_company_alias_match(file_co, doc_company, company_aliases):
+            return "〇"
+        return "✖"
     if not fp:
         return "△"
     symbols = [_compare_company(fp, d) for d in doc_candidates]
     if "〇" in symbols:
         return "〇"
     if "△" in symbols:
+        if is_company_alias_match(file_co, doc_company, company_aliases):
+            return "〇"
         return "△"
+    if is_company_alias_match(file_co, doc_company, company_aliases):
+        return "〇"
     return "✖"
 
 
@@ -2008,6 +2198,7 @@ def _enrich_with_match_scores(
     *,
     prefer_kintai_section: bool = False,
     analysis_json: dict[str, str] | None = None,
+    company_aliases: list[dict[str, str]] | None = None,
 ) -> None:
     """比較記号（会社名・氏名）と参照文字列を row に追加。
 
@@ -2057,9 +2248,11 @@ def _enrich_with_match_scores(
     row["name_person_from_file"] = fp_pe
     row["name_company_1"] = name_company_1
     # 互換: 従来キーも残す（勤怠表の会社セルのみ）
-    row["name_company_from_doc"] = k_co
+    row["name_company_from_doc"] = name_company_1
     row["name_person_from_doc"] = d_pe
-    row["match_company"] = _match_company_symbol_single(fp_co, doc_co_match)
+    row["match_company"] = _match_company_symbol_single(
+        fp_co, doc_co_match, company_aliases=company_aliases
+    )
     row["match_person"] = _compare_person(fp_pe, d_pe)
     th_dec = _work_hours_string_to_decimal(th_raw)
     row["total_hours_raw"] = th_raw
@@ -2611,7 +2804,17 @@ def _auto_judgment_symbol(row: dict[str, str]) -> str:
     emp = (row.get("employee_no") or "").strip()
     th = (row.get("total_hours_decimal") or "").strip()
     mc = (row.get("match_company") or "").strip()
-    if not (_is_valid_employee_no(emp) and _is_valid_total_hours_decimal(th)):
+    file_name = (
+        row.get("file_name")
+        or row.get(TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_FILE_NAME_COL)
+        or ""
+    ).strip()
+    is_transport_file = _filename_has_transport_expense_marker(file_name)
+    if not _is_valid_employee_no(emp):
+        return "✖"
+    if not is_transport_file and not _is_valid_total_hours_decimal(th):
         return "✖"
     if mc == "〇":
         return "〇"
@@ -2753,7 +2956,7 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
     mm = _escape_md_table_cell((r.get("month") or "").strip())
 
     co1 = _escape_md_table_cell(
-        ((r.get("name_company_1") or "").strip() or ("" if is_excel else "不明"))
+        _document_company_for_display((r.get("name_company_1") or "").strip())
     )
     pe = _escape_md_table_cell(
         ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
@@ -2881,7 +3084,7 @@ def row_display_values(
     fn = r.get("file_name", "") or ""
     yy = (r.get("year") or "").strip()
     mm = (r.get("month") or "").strip()
-    co1 = ((r.get("name_company_1") or "").strip() or ("" if is_excel else "不明"))
+    co1 = _document_company_for_display((r.get("name_company_1") or "").strip())
     pe = ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
     emp = (r.get("employee_no") or "").strip() or ""
     buh_raw = _row_billing_update_hours_decimal(r)
@@ -2942,6 +3145,7 @@ def run_analysis(
     parallel_chats: int = DEFAULT_PARALLEL_ANALYSIS_CHATS,
     expected_year: int | str | None = None,
     expected_month: int | str | None = None,
+    company_aliases: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     """
     指定フォルダ直下の画像・PDF・Excel を名前順で処理し、結果行のリストを返す。
@@ -3125,6 +3329,7 @@ def run_analysis(
             row,
             row["analysis"],
             prefer_kintai_section=prefer_pdf_section,
+            company_aliases=company_aliases,
         )
         bucket_results[worker_ix].append(row)
         emit_summary_row_md(row)
@@ -3215,7 +3420,9 @@ def run_analysis(
             chat_holder: dict[str, str] = {"chat_uid": ""}
             try:
                 if kind == "excel":
-                    row_excel = _extract_excel_target_sheet_row(file_path)
+                    row_excel = _extract_excel_target_sheet_row(
+                        file_path, company_aliases=company_aliases
+                    )
                     attach_year_month(row_excel)
                     bucket_results[worker_idx].append(row_excel)
                     emit_summary_row_md(row_excel)
@@ -3304,7 +3511,10 @@ def run_analysis(
                                 attach_year_month(row)
                                 analysis_json, raw_response = analyze_image_once()
                                 _apply_analysis_response_to_row(
-                                    row, analysis_json, raw_response
+                                    row,
+                                    analysis_json,
+                                    raw_response,
+                                    company_aliases=company_aliases,
                                 )
                                 bucket_results[worker_idx].append(row)
                                 emit_summary_row_md(row)
@@ -3415,6 +3625,7 @@ def run_analysis(
                                     row2,
                                     analysis_json,
                                     raw_response,
+                                    company_aliases=company_aliases,
                                 )
                                 bucket_results[worker_idx].append(row2)
                                 emit_summary_row_md(row2)

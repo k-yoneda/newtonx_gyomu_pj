@@ -60,8 +60,17 @@ from kintai_core import (
     run_analysis,
     summary_header_cells,
     update_billing_engineer_ts_sheet,
+    add_company_alias,
+    company_alias_lookup_key,
+    default_company_alias_table_path,
+    load_company_aliases,
+    recalculate_match_company_for_row,
+    save_company_aliases,
+    _parse_filename_company_and_person,
     _is_billing_aggregated_marker,
     _row_billing_update_hours_decimal,
+    _company_text_contains_seraku,
+    _document_company_for_display,
 )
 from newtonx_adk.exceptions import APIError
 
@@ -230,6 +239,7 @@ class KintaiApp(tk.Frame):
         "押印有無": 72,
     }
     _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
+    _ROW_EXTRA_KEYS = ("name_company_from_file", "name_company_from_doc")
 
     def __init__(
         self,
@@ -278,6 +288,11 @@ class KintaiApp(tk.Frame):
         self._sort_reverse: bool = False
         self._tree_column_headings: tuple[str, ...] = ()
         self._grid_row_no_seq: int = 0
+        self._company_alias_table_path = default_company_alias_table_path(_ROOT)
+        self._company_aliases: list[dict[str, str]] = load_company_aliases(
+            self._company_alias_table_path
+        )
+        self._row_extra: dict[str, dict[str, str]] = {}
 
         self._build_ui()
 
@@ -1031,6 +1046,7 @@ class KintaiApp(tk.Frame):
         for iid in self._tree.get_children():
             self._tree.delete(iid)
         self._item_paths.clear()
+        self._row_extra.clear()
         self._grid_row_no_seq = 0
         self._sort_column = None
         self._sort_reverse = False
@@ -1038,7 +1054,13 @@ class KintaiApp(tk.Frame):
 
     def _grid_sort_empty_marker(self, value: str) -> bool:
         t = (value or "").strip()
-        return not t or t in ("（なし）", "不明", "（不明）", "（対象レコードなし）")
+        return not t or t in (
+            "（なし）",
+            "不明",
+            "（不明）",
+            "（データなし）",
+            "（対象レコードなし）",
+        )
 
     def _grid_sort_numeric_columns(self) -> frozenset[str]:
         return frozenset(
@@ -1259,14 +1281,16 @@ class KintaiApp(tk.Frame):
                     or ""
                 ).strip()
             elif core_key == "name_company_1":
-                val = str(
-                    row.get(self.COMPANY_COL)
-                    or row.get(self.LEGACY_COMPANY_READ_LONG_COL)
-                    or row.get(self.LEGACY_COMPANY_NAME_COL)
-                    or row.get(self.LEGACY_COMPANY_COL)
-                    or row.get(core_key)
-                    or ""
-                ).strip()
+                val = _document_company_for_display(
+                    str(
+                        row.get(self.COMPANY_COL)
+                        or row.get(self.LEGACY_COMPANY_READ_LONG_COL)
+                        or row.get(self.LEGACY_COMPANY_NAME_COL)
+                        or row.get(self.LEGACY_COMPANY_COL)
+                        or row.get(core_key)
+                        or ""
+                    ).strip()
+                )
             elif core_key == "name_person_from_doc":
                 val = str(
                     row.get(self.PERSON_COL)
@@ -1310,6 +1334,10 @@ class KintaiApp(tk.Frame):
         grid_no = str(row.get("grid_row_no") or "").strip()
         if grid_no:
             out["grid_row_no"] = grid_no
+        if "name_company_from_doc" in out:
+            out["name_company_from_doc"] = _document_company_for_display(
+                str(out.get("name_company_from_doc") or "")
+            )
         return out
 
     def _grid_values_from_row(
@@ -1383,6 +1411,383 @@ class KintaiApp(tk.Frame):
 
     def _total_hours_raw_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.TOTAL_HOURS_RAW_COL)
+
+    def _match_company_column_index(self) -> int:
+        return list(self._tree["columns"]).index(self.MATCH_COMPANY_COL)
+
+    def _sync_row_extra_from_row(self, iid: str, row: dict[str, str]) -> None:
+        extra: dict[str, str] = {}
+        for key in self._ROW_EXTRA_KEYS:
+            val = str(row.get(key) or "").strip()
+            if key == "name_company_from_doc":
+                val = _document_company_for_display(val)
+            if val:
+                extra[key] = val
+        if extra:
+            self._row_extra[iid] = extra
+        elif iid in self._row_extra:
+            del self._row_extra[iid]
+
+    def _merge_row_extra(self, iid: str, row: dict[str, str]) -> dict[str, str]:
+        out = dict(row)
+        for key, val in self._row_extra.get(iid, {}).items():
+            if key == "name_company_from_doc":
+                val = _document_company_for_display(val)
+            if val and not str(out.get(key) or "").strip():
+                out[key] = val
+        return out
+
+    def _reload_company_aliases(self) -> None:
+        self._company_aliases = load_company_aliases(self._company_alias_table_path)
+
+    def _persist_company_aliases(self) -> None:
+        save_company_aliases(self._company_alias_table_path, self._company_aliases)
+
+    def _company_pair_from_row(self, row: dict[str, str]) -> tuple[str, str]:
+        fn = self._file_name_from_row(row)
+        file_co = (row.get("name_company_from_file") or "").strip()
+        if not file_co and fn:
+            file_co = _parse_filename_company_and_person(fn)[0].strip()
+        doc_co = ""
+        for src in (
+            row.get("name_company_from_doc"),
+            row.get("name_company_1"),
+            row.get(self.COMPANY_COL),
+            row.get(self.LEGACY_COMPANY_READ_LONG_COL),
+            row.get(LEGACY_COMPANY_NAME_COL),
+            row.get(LEGACY_COMPANY_COL),
+        ):
+            doc_co = _document_company_for_display(str(src or "").strip())
+            if doc_co:
+                break
+        return file_co, doc_co
+
+    def _format_doc_company_for_message(self, doc_co: str) -> str:
+        return doc_co if doc_co else "（空欄）"
+
+    def _recalculate_company_match_for_row(
+        self, rid: str, row: dict[str, str] | None = None
+    ) -> None:
+        core = self._row_dict_to_core(
+            self._merge_row_extra(
+                rid, row if row is not None else self._current_row_dict_from_iid(rid)
+            )
+        )
+        core["match_company"] = recalculate_match_company_for_row(
+            core, company_aliases=self._company_aliases
+        )
+        core[self.MATCH_COMPANY_COL] = core["match_company"]
+        self._recalculate_auto_judgment_for_row(rid, core)
+
+    def _file_company_lookup_key(self, file_co: str) -> str:
+        return company_alias_lookup_key(file_co, "")[0]
+
+    def _find_empty_doc_company_mismatch_rows(
+        self,
+        file_co: str,
+        *,
+        exclude_rid: str | None = None,
+    ) -> list[str]:
+        """同じファイル名会社で文書会社が未取得かつ会社名比較が✖の行。"""
+        target_key = self._file_company_lookup_key(file_co)
+        if not target_key:
+            return []
+        hits: list[str] = []
+        for iid in self._tree.get_children():
+            if exclude_rid and iid == exclude_rid:
+                continue
+            row = self._merge_row_extra(iid, self._current_row_dict_from_iid(iid))
+            core = self._row_dict_to_core(row)
+            if (core.get("match_company") or "").strip() != "✖":
+                continue
+            row_file_co, row_doc_co = self._company_pair_from_row(row)
+            if self._file_company_lookup_key(row_file_co) != target_key:
+                continue
+            if row_doc_co:
+                continue
+            hits.append(iid)
+        return hits
+
+    def _apply_doc_company_to_row(self, rid: str, doc_co: str) -> None:
+        row = self._merge_row_extra(rid, self._current_row_dict_from_iid(rid))
+        row[self.COMPANY_COL] = doc_co
+        row["name_company_1"] = doc_co
+        row["name_company_from_doc"] = doc_co
+        core = self._row_dict_to_core(row)
+        core["name_company_1"] = doc_co
+        core["name_company_from_doc"] = doc_co
+        self._recalculate_company_match_for_row(rid, core)
+
+    def _offer_bulk_doc_company_fill(
+        self,
+        *,
+        source_rid: str,
+        file_co: str,
+        doc_co: str,
+    ) -> int:
+        """文書会社未取得の類似行へ、登録した文書会社を設定するか確認する。"""
+        targets = self._find_empty_doc_company_mismatch_rows(
+            file_co, exclude_rid=source_rid
+        )
+        if not targets:
+            return 0
+        sample_names = [
+            self._file_name_from_row(
+                self._merge_row_extra(iid, self._current_row_dict_from_iid(iid))
+            )
+            for iid in targets[:5]
+        ]
+        sample_names = [n for n in sample_names if n]
+        lines = [
+            f"同じファイル名会社で文書会社が未取得の行が {len(targets)} 件あります。",
+            f"登録した文書会社「{doc_co}」を設定しますか？",
+            "",
+            f"ファイル名会社: {file_co}",
+        ]
+        if sample_names:
+            lines.append("")
+            lines.append("対象例:")
+            lines.extend(f"・{name}" for name in sample_names)
+            if len(targets) > len(sample_names):
+                lines.append(f"…他 {len(targets) - len(sample_names)} 件")
+        if not messagebox.askyesno(
+            "会社名対応の一括反映",
+            "\n".join(lines),
+            parent=self._root,
+        ):
+            return 0
+        for iid in targets:
+            self._apply_doc_company_to_row(iid, doc_co)
+        return len(targets)
+
+    def _recalculate_all_company_matches(self) -> None:
+        for iid in self._tree.get_children():
+            self._recalculate_company_match_for_row(iid)
+
+    def _register_company_alias_from_row(self, rid: str) -> None:
+        row = self._merge_row_extra(rid, self._current_row_dict_from_iid(rid))
+        core = self._row_dict_to_core(row)
+        file_co, doc_co = self._company_pair_from_row(core)
+        if not file_co:
+            messagebox.showwarning(
+                "会社名対応登録",
+                "ファイル名から会社名を取得できません。",
+                parent=self._root,
+            )
+            return
+        if _company_text_contains_seraku(file_co):
+            messagebox.showwarning(
+                "会社名対応登録",
+                "ファイル名の会社名がセラクのため、登録できません。",
+                parent=self._root,
+            )
+            return
+        if not messagebox.askokcancel(
+            "会社名対応登録",
+            f"次の対応を「会社名対応表.json」に登録します。\n\n"
+            f"ファイル名会社: {file_co}\n"
+            f"文書会社: {self._format_doc_company_for_message(doc_co)}",
+            parent=self._root,
+        ):
+            return
+        added = add_company_alias(
+            self._company_aliases,
+            file_company=file_co,
+            doc_company=doc_co,
+        )
+        try:
+            self._persist_company_aliases()
+        except OSError as e:
+            messagebox.showerror(
+                "会社名対応登録",
+                f"対応表の保存に失敗しました。\n\n{e}",
+                parent=self._root,
+            )
+            return
+        self._recalculate_all_company_matches()
+        applied = 0
+        if doc_co:
+            applied = self._offer_bulk_doc_company_fill(
+                source_rid=rid,
+                file_co=file_co,
+                doc_co=doc_co,
+            )
+        action = "登録" if added else "更新"
+        self._loaded_rows = self._current_grid_rows()
+        ratio_text = self._company_match_ratio_text(self._loaded_rows)
+        status = f"会社名対応を{action}しました: {file_co} ↔ {self._format_doc_company_for_message(doc_co)} / {ratio_text}"
+        if applied:
+            status += f" / 類似行 {applied} 件に文書会社を設定"
+        self._status_var.set(status)
+
+    def _open_company_alias_table_file(self) -> None:
+        path = self._company_alias_table_path
+        if not path.is_file():
+            save_company_aliases(path, self._company_aliases)
+        try:
+            _win_shell_open_file(path)
+        except OSError as e:
+            messagebox.showerror(
+                "会社名対応表",
+                f"ファイルを開けませんでした。\n\n{e}",
+                parent=self._root,
+            )
+
+    def _open_company_alias_editor(self) -> None:
+        top = tk.Toplevel(self)
+        top.title("会社名対応表")
+        top.transient(self)
+        top.geometry("720x360")
+
+        frame = ttk.Frame(top, padding=8)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("file_company", "doc_company", "note")
+        tree = ttk.Treeview(
+            frame,
+            columns=cols,
+            show="headings",
+            selectmode="browse",
+            height=10,
+        )
+        tree.heading("file_company", text="ファイル名会社")
+        tree.heading("doc_company", text="文書会社")
+        tree.heading("note", text="メモ")
+        tree.column("file_company", width=220, stretch=True)
+        tree.column("doc_company", width=220, stretch=True)
+        tree.column("note", width=180, stretch=True)
+        y_scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=y_scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        working_aliases: list[dict[str, str]] = [
+            dict(item) for item in self._company_aliases
+        ]
+
+        def refresh_tree() -> None:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for idx, item in enumerate(working_aliases):
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=str(idx),
+                    values=(
+                        item.get("file_company", ""),
+                        item.get("doc_company", "") or "（空欄）",
+                        item.get("note", ""),
+                    ),
+                )
+
+        def prompt_pair(
+            *,
+            title: str,
+            initial_file: str = "",
+            initial_doc: str = "",
+            initial_note: str = "",
+        ) -> tuple[str, str, str] | None:
+            dlg = tk.Toplevel(top)
+            dlg.title(title)
+            dlg.transient(top)
+            dlg.grab_set()
+            ttk.Label(dlg, text="ファイル名会社:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+            file_var = tk.StringVar(value=initial_file)
+            ttk.Entry(dlg, textvariable=file_var, width=48).grid(row=0, column=1, padx=8, pady=(8, 4))
+            ttk.Label(dlg, text="文書会社:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+            doc_var = tk.StringVar(value=initial_doc)
+            ttk.Entry(dlg, textvariable=doc_var, width=48).grid(row=1, column=1, padx=8, pady=4)
+            ttk.Label(dlg, text="メモ:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+            note_var = tk.StringVar(value=initial_note)
+            ttk.Entry(dlg, textvariable=note_var, width=48).grid(row=2, column=1, padx=8, pady=4)
+            result: dict[str, tuple[str, str, str] | None] = {"value": None}
+
+            def on_ok() -> None:
+                fc = file_var.get().strip()
+                dc = doc_var.get().strip()
+                if not fc:
+                    messagebox.showwarning("入力不足", "ファイル名会社を入力してください。", parent=dlg)
+                    return
+                result["value"] = (fc, dc, note_var.get().strip())
+                dlg.destroy()
+
+            def on_cancel() -> None:
+                dlg.destroy()
+
+            btns = ttk.Frame(dlg)
+            btns.grid(row=3, column=0, columnspan=2, sticky="e", padx=8, pady=8)
+            ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
+            ttk.Button(btns, text="キャンセル", command=on_cancel).pack(side=tk.RIGHT, padx=(0, 8))
+            dlg.wait_window()
+            return result["value"]
+
+        def on_add() -> None:
+            pair = prompt_pair(title="対応を追加")
+            if pair is None:
+                return
+            fc, dc, note = pair
+            add_company_alias(working_aliases, file_company=fc, doc_company=dc, note=note)
+            refresh_tree()
+
+        def on_edit() -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            idx = int(sel[0])
+            item = working_aliases[idx]
+            pair = prompt_pair(
+                title="対応を編集",
+                initial_file=str(item.get("file_company") or ""),
+                initial_doc=str(item.get("doc_company") or ""),
+                initial_note=str(item.get("note") or ""),
+            )
+            if pair is None:
+                return
+            fc, dc, note = pair
+            item["file_company"] = fc
+            item["doc_company"] = dc
+            item["note"] = note
+            refresh_tree()
+
+        def on_delete() -> None:
+            sel = tree.selection()
+            if not sel:
+                return
+            idx = int(sel[0])
+            del working_aliases[idx]
+            refresh_tree()
+
+        def on_save() -> None:
+            try:
+                save_company_aliases(self._company_alias_table_path, working_aliases)
+            except OSError as e:
+                messagebox.showerror("保存失敗", str(e), parent=top)
+                return
+            self._company_aliases = [dict(item) for item in working_aliases]
+            self._recalculate_all_company_matches()
+            self._loaded_rows = self._current_grid_rows()
+            ratio_text = self._company_match_ratio_text(self._loaded_rows)
+            self._status_var.set(f"会社名対応表を保存しました / {ratio_text}")
+            top.destroy()
+
+        def on_reload() -> None:
+            self._reload_company_aliases()
+            working_aliases[:] = [dict(item) for item in self._company_aliases]
+            refresh_tree()
+
+        btns = ttk.Frame(top, padding=(8, 0, 8, 8))
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="追加", command=on_add).pack(side=tk.LEFT)
+        ttk.Button(btns, text="編集", command=on_edit).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="削除", command=on_delete).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="ファイルを開く", command=self._open_company_alias_table_file).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Button(btns, text="再読み込み", command=on_reload).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="保存して閉じる", command=on_save).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="閉じる", command=top.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+
+        refresh_tree()
 
     def _recalculate_auto_judgment_for_row(
         self, rid: str, row: dict[str, str] | None = None
@@ -1463,6 +1868,17 @@ class KintaiApp(tk.Frame):
             )
             menu.add_separator()
 
+        if cols[ci] == self.MATCH_COMPANY_COL:
+            menu.add_command(
+                label="この対応をOK登録",
+                command=lambda: self._register_company_alias_from_row(rid),
+            )
+            menu.add_command(
+                label="会社名対応表を編集",
+                command=self._open_company_alias_editor,
+            )
+            menu.add_separator()
+
         menu.add_command(label="再解析", command=lambda: self._start_row_reanalysis(rid))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1474,7 +1890,7 @@ class KintaiApp(tk.Frame):
         values = list(self._tree.item(rid, "values") or [])
         row = {cols[i]: (values[i] if i < len(values) else "") for i in range(len(cols))}
         row["resolved_path"] = self._item_paths.get(rid, "")
-        return row
+        return self._merge_row_extra(rid, row)
 
     def _replace_row_with_result(
         self,
@@ -1493,6 +1909,7 @@ class KintaiApp(tk.Frame):
             ),
         )
         self._item_paths[rid] = row.get("resolved_path", "")
+        self._sync_row_extra_from_row(rid, row)
 
     def _set_row_reanalysis_highlight(self, rid: str, active: bool) -> None:
         """Treeview の指定行に、再解析中ハイライト（反転）を付与/解除する。"""
@@ -1587,6 +2004,7 @@ class KintaiApp(tk.Frame):
                     parallel_chats=1,
                     expected_year=exp_y,
                     expected_month=exp_m,
+                    company_aliases=self._company_aliases,
                 )
             except BaseException as e:
                 err = e
@@ -1760,6 +2178,7 @@ class KintaiApp(tk.Frame):
                     parallel_chats=parallel,
                     expected_year=exp_y,
                     expected_month=exp_m,
+                    company_aliases=self._company_aliases,
                 )
             except BaseException as e:
                 err = e
@@ -2103,6 +2522,7 @@ class KintaiApp(tk.Frame):
             row.pop(self.ROW_NO_COL, None)
             # 内部データ
             row["resolved_path"] = self._item_paths.get(iid, "")
+            row = self._merge_row_extra(iid, row)
             rows.append(row)
         return rows
 
@@ -2301,6 +2721,7 @@ class KintaiApp(tk.Frame):
             vals = self._grid_values_from_row(r)
             iid = self._tree.insert("", tk.END, values=vals)
             self._item_paths[iid] = (r.get("resolved_path") or "").strip()
+            self._sync_row_extra_from_row(iid, r)
             saved_no = str(r.get("grid_row_no") or "").strip()
             if saved_no.isdigit():
                 self._assign_row_no_to_iid(iid, int(saved_no))
@@ -2457,6 +2878,7 @@ class KintaiApp(tk.Frame):
                 vals = self._grid_values_from_row(row)
                 iid = self._tree.insert("", tk.END, values=vals)
                 self._item_paths[iid] = row.get("resolved_path", "")
+                self._sync_row_extra_from_row(iid, row)
                 self._assign_row_no_to_iid(iid)
                 try:
                     self._tree.yview_moveto(1)
@@ -2541,6 +2963,7 @@ class KintaiApp(tk.Frame):
                     parallel_chats=parallel,
                     expected_year=exp_y,
                     expected_month=exp_m,
+                    company_aliases=self._company_aliases,
                 )
             except BaseException as e:
                 err = e
