@@ -60,6 +60,7 @@ SUMMARY_MONTH_COL = "月（読取）"
 LEGACY_YEAR_COL = "年"
 LEGACY_MONTH_COL = "月"
 SUMMARY_PERSON_COL = "氏名（読取）"
+SUMMARY_MATCH_PERSON_COL = "氏名比較"
 LEGACY_PERSON_COL = "氏名"
 SUMMARY_EMPLOYEE_NO_COL = "社員番号（ファイル名より）"
 LEGACY_EMPLOYEE_NO_COL = "社員番号"
@@ -1981,6 +1982,28 @@ def recalculate_match_person_for_row(row: dict[str, str]) -> str:
     return _compare_person(file_pe, doc_pe)
 
 
+def is_match_person_manual(row: dict[str, str]) -> bool:
+    """氏名比較を手動変更済みか。"""
+    return (row.get("match_person_manual") or "").strip() == "1"
+
+
+def match_person_symbol_for_row(row: dict[str, str], *, persist: bool = False) -> str:
+    """行の氏名比較記号を返す。手動変更時は保存値を優先する。"""
+    if is_match_person_manual(row):
+        sym = normalize_judgment_symbol(
+            (
+                row.get("match_person")
+                or row.get(SUMMARY_MATCH_PERSON_COL)
+                or ""
+            ).strip()
+        )
+        return sym if sym in ("〇", "△", "✖") else "✖"
+    mp = recalculate_match_person_for_row(row)
+    if persist:
+        row["match_person"] = mp
+    return mp
+
+
 def _judgment_match_tier(symbol: str, *, is_company: bool) -> int:
     """比較記号の厳しさ（0=〇, 1=△, 2=✖）。"""
     t = (symbol or "").strip()
@@ -2391,7 +2414,7 @@ SUMMARY_MD_HEADER = (
     f"{TARGET_FILE_NAME_COL} | "
     f"{SUMMARY_FINAL_JUDGMENT_COL} | {SUMMARY_BILLING_UPDATE_RESULT_COL} | 自動判断 | "
     f"{SUMMARY_YEAR_COL} | {SUMMARY_MONTH_COL} | "
-    f"{SUMMARY_COMPANY_COL} | {SUMMARY_MATCH_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
+    f"{SUMMARY_COMPANY_COL} | {SUMMARY_MATCH_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_MATCH_PERSON_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
     f"{SUMMARY_BILLING_UPDATE_HOURS_COL} | "
     "合計勤務時間（10進） | 合計勤務時間（読取） | "
     f"{SUMMARY_BILLING_UPDATE_TRANSPORT_COL} | {SUMMARY_TRANSPORT_EXPENSE_COL} | "
@@ -2456,13 +2479,15 @@ def auto_judgment_symbol(row: dict[str, str]) -> str:
         or row.get(LEGACY_MATCH_COMPANY_COL)
         or ""
     ).strip()
-    mp = (row.get("match_person") or "").strip()
+    mp = (row.get("match_person") or row.get(SUMMARY_MATCH_PERSON_COL) or "").strip()
     return _auto_judgment_symbol(
         {
             "employee_no": emp,
             "total_hours_decimal": th,
             "match_company": mc,
             "match_person": mp,
+            "match_person_manual": (row.get("match_person_manual") or "").strip(),
+            SUMMARY_MATCH_PERSON_COL: mp,
             "name_person_from_file": (row.get("name_person_from_file") or "").strip(),
             "name_person_from_doc": (
                 (row.get("name_person_from_doc") or "").strip()
@@ -2901,7 +2926,7 @@ def _auto_judgment_symbol(row: dict[str, str]) -> str:
     emp = (row.get("employee_no") or "").strip()
     th = (row.get("total_hours_decimal") or "").strip()
     mc = (row.get("match_company") or "").strip()
-    mp = recalculate_match_person_for_row(row)
+    mp = match_person_symbol_for_row(row)
     file_name = (
         row.get("file_name")
         or row.get(TARGET_FILE_NAME_COL)
@@ -3033,7 +3058,7 @@ def _year_month_from_data_dir(data_dir: Path) -> tuple[str, str]:
 
 
 def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> str:
-    """19列1行分（集計用）。Excel 行は対象シート有無のみを埋め、AI読取列は空欄にする。"""
+    """20列1行分（集計用）。Excel 行は対象シート有無のみを埋め、AI読取列は空欄にする。"""
     is_excel = _row_is_excel(r)
     u_sym = _escape_md_table_cell(_upload_ok_symbol(r))
     ts = _escape_md_table_cell(_target_sheet_ok_symbol(r))
@@ -3055,6 +3080,7 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
     pe = _escape_md_table_cell(
         ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
     )
+    mpe = _escape_md_table_cell(match_person_symbol_for_row(r, persist=not is_match_person_manual(r)))
     emp = _escape_md_table_cell(
         (r.get("employee_no") or "").strip() or ""
     )
@@ -3082,7 +3108,7 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
     no = _escape_md_table_cell(str(row_no) if row_no is not None else "")
     return (
         f"| {no} | {u_sym} | {ts} | {fn} | {uj} | {bur} | {aj} | {yy} | {mm} | "
-        f"{co1} | {mc} | {pe} | {emp} | {buh} | {th} | {lr} | {but} | {te} | {se} |"
+        f"{co1} | {mc} | {pe} | {mpe} | {emp} | {buh} | {th} | {lr} | {but} | {te} | {se} |"
     )
 
 
@@ -3180,6 +3206,9 @@ def row_display_values(
     mm = (r.get("month") or "").strip()
     co1 = _document_company_for_display((r.get("name_company_1") or "").strip())
     pe = ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
+    mpe = match_person_symbol_for_row(r, persist=not is_match_person_manual(r))
+    if not is_match_person_manual(r):
+        r["match_person"] = mpe
     emp = (r.get("employee_no") or "").strip() or ""
     buh_raw = _row_billing_update_hours_decimal(r)
     if _is_billing_aggregated_marker(buh_raw):
@@ -3212,6 +3241,7 @@ def row_display_values(
         co1,
         mc,
         pe,
+        mpe,
         emp,
         buh,
         th,

@@ -42,6 +42,7 @@ from kintai_core import (
     SUMMARY_FINAL_JUDGMENT_COL,
     SUMMARY_MONTH_COL,
     SUMMARY_PERSON_COL,
+    SUMMARY_MATCH_PERSON_COL,
     SUMMARY_ROW_NO_COL,
     SUMMARY_YEAR_COL,
     TARGET_ASSISTANT_NAME,
@@ -65,6 +66,8 @@ from kintai_core import (
     default_company_alias_table_path,
     load_company_aliases,
     is_match_company_ok_for_ratio,
+    is_match_person_manual,
+    match_person_symbol_for_row,
     recalculate_match_company_for_row,
     recalculate_match_person_for_row,
     save_company_aliases,
@@ -212,6 +215,7 @@ class KintaiApp(tk.Frame):
     BILLING_UPDATE_HOURS_COL = SUMMARY_BILLING_UPDATE_HOURS_COL
     BILLING_UPDATE_TRANSPORT_COL = SUMMARY_BILLING_UPDATE_TRANSPORT_COL
     PERSON_COL = SUMMARY_PERSON_COL
+    MATCH_PERSON_COL = SUMMARY_MATCH_PERSON_COL
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
     TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
@@ -238,6 +242,7 @@ class KintaiApp(tk.Frame):
         BILLING_UPDATE_RESULT_COL: 120,
         AUTO_JUDGMENT_COL: 72,
         MATCH_COMPANY_COL: 100,
+        MATCH_PERSON_COL: 72,
         "押印有無": 72,
     }
     _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
@@ -245,6 +250,7 @@ class KintaiApp(tk.Frame):
         "name_company_from_file",
         "name_company_from_doc",
         "match_company_manual_ok",
+        "match_person_manual",
     )
 
     def __init__(
@@ -1245,6 +1251,7 @@ class KintaiApp(tk.Frame):
             (self.MONTH_COL, "month"),
             (self.COMPANY_COL, "name_company_1"),
             (self.PERSON_COL, "name_person_from_doc"),
+            (self.MATCH_PERSON_COL, "match_person"),
             (self.EMPLOYEE_NO_COL, "employee_no"),
             (self.BILLING_UPDATE_HOURS_COL, "billing_update_hours_decimal"),
             (LEGACY_BILLING_UPDATE_HOURS_COL, "billing_update_hours_decimal"),
@@ -1286,6 +1293,13 @@ class KintaiApp(tk.Frame):
                     or row.get(self.LEGACY_MATCH_COMPANY_COL)
                     or ""
                 ).strip()
+            elif core_key == "match_person":
+                val = str(
+                    row.get(core_key)
+                    or row.get(self.MATCH_PERSON_COL)
+                    or ""
+                ).strip()
+                val = normalize_judgment_symbol(val) if val else ""
             elif core_key == "name_company_1":
                 val = _document_company_for_display(
                     str(
@@ -1421,6 +1435,9 @@ class KintaiApp(tk.Frame):
     def _match_company_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.MATCH_COMPANY_COL)
 
+    def _match_person_column_index(self) -> int:
+        return list(self._tree["columns"]).index(self.MATCH_PERSON_COL)
+
     def _sync_row_extra_from_row(self, iid: str, row: dict[str, str]) -> None:
         extra = dict(self._row_extra.get(iid, {}))
         for key in self._ROW_EXTRA_KEYS:
@@ -1446,12 +1463,18 @@ class KintaiApp(tk.Frame):
             if key == "match_company_manual_ok":
                 out[key] = val
                 continue
+            if key == "match_person_manual":
+                out[key] = val
+                continue
             if val and not str(out.get(key) or "").strip():
                 out[key] = val
         return out
 
     def _is_match_company_manual_ok(self, row: dict[str, str]) -> bool:
         return (row.get("match_company_manual_ok") or "").strip() == "1"
+
+    def _is_match_person_manual(self, row: dict[str, str]) -> bool:
+        return is_match_person_manual(row)
 
     def _reload_company_aliases(self) -> None:
         self._company_aliases = load_company_aliases(self._company_alias_table_path)
@@ -1495,8 +1518,25 @@ class KintaiApp(tk.Frame):
         if self._is_match_company_manual_ok(core):
             core["match_company"] = "〇"
         core[self.MATCH_COMPANY_COL] = core["match_company"]
-        core["match_person"] = recalculate_match_person_for_row(core)
+        if not self._is_match_person_manual(core):
+            core["match_person"] = recalculate_match_person_for_row(core)
+        core[self.MATCH_PERSON_COL] = core.get("match_person", "")
         self._recalculate_auto_judgment_for_row(rid, core)
+
+    def _set_match_person_symbol(self, rid: str, value: str) -> None:
+        """氏名比較を右クリックで手動設定し、自動判断・最終判断を連動更新する。"""
+        value = normalize_judgment_symbol(value)
+        if value not in ("〇", "△", "✖"):
+            return
+        row = self._merge_row_extra(rid, self._current_row_dict_from_iid(rid))
+        core = self._row_dict_to_core(row)
+        core["match_person_manual"] = "1"
+        core["match_person"] = value
+        core[self.MATCH_PERSON_COL] = value
+        self._recalculate_auto_judgment_for_row(rid, core)
+        self._sync_row_extra_from_row(rid, core)
+        self._loaded_rows = self._current_grid_rows()
+        self._status_var.set(f"氏名比較を {value} に変更しました")
 
     def _set_match_company_temp_ok(self, rid: str) -> None:
         """会社名比較を対応表登録なしで一旦〇にする。"""
@@ -1505,7 +1545,9 @@ class KintaiApp(tk.Frame):
         core["match_company_manual_ok"] = "1"
         core["match_company"] = "〇"
         core[self.MATCH_COMPANY_COL] = "〇"
-        core["match_person"] = recalculate_match_person_for_row(core)
+        if not self._is_match_person_manual(core):
+            core["match_person"] = recalculate_match_person_for_row(core)
+        core[self.MATCH_PERSON_COL] = core.get("match_person", "")
         self._recalculate_auto_judgment_for_row(rid, core)
         self._sync_row_extra_from_row(rid, core)
         self._status_var.set("会社名比較を一旦〇にしました（対応表には登録しません）")
@@ -1824,10 +1866,14 @@ class KintaiApp(tk.Frame):
         self, rid: str, row: dict[str, str] | None = None
     ) -> None:
         """列編集後に自動判断を再計算し、ユーザ判断も同じ結果で上書きする。"""
-        core = self._row_dict_to_core(
-            row if row is not None else self._current_row_dict_from_iid(rid)
-        )
-        core["match_person"] = recalculate_match_person_for_row(core)
+        base = row if row is not None else self._current_row_dict_from_iid(rid)
+        core = self._row_dict_to_core(self._merge_row_extra(rid, base))
+        if self._is_match_company_manual_ok(core):
+            core["match_company"] = "〇"
+            core[self.MATCH_COMPANY_COL] = "〇"
+        if not self._is_match_person_manual(core):
+            core["match_person"] = recalculate_match_person_for_row(core)
+        core[self.MATCH_PERSON_COL] = core.get("match_person", "")
         aj = auto_judgment_symbol(core)
         core["auto_judgment"] = aj
         core["user_judgment_company"] = aj
@@ -1913,6 +1959,14 @@ class KintaiApp(tk.Frame):
                 label="会社名対応表を編集",
                 command=self._open_company_alias_editor,
             )
+            menu.add_separator()
+
+        if cols[ci] == self.MATCH_PERSON_COL:
+            for label, inner in (("〇", "〇"), ("△", "△"), ("✖", "✖")):
+                menu.add_command(
+                    label=label,
+                    command=lambda v=inner: self._set_match_person_symbol(rid, v),
+                )
             menu.add_separator()
 
         menu.add_command(label="再解析", command=lambda: self._start_row_reanalysis(rid))
