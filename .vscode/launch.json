@@ -1,7 +1,16 @@
 {
     "version": "0.2.0",
     "configurations": [
-
+        {
+            "name": "勤務表解析 (main.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/code/main.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}/code",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+        },
         {
             "name": "Python デバッガー: 現在のファイル",
             "type": "debugpy",
