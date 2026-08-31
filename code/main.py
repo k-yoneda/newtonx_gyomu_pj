@@ -43,6 +43,7 @@ from kintai_core import (
     SUMMARY_MONTH_COL,
     SUMMARY_PERSON_COL,
     SUMMARY_MATCH_PERSON_COL,
+    SUMMARY_MATCH_DOC_TYPE_COL,
     SUMMARY_ROW_NO_COL,
     SUMMARY_YEAR_COL,
     TARGET_ASSISTANT_NAME,
@@ -216,6 +217,7 @@ class KintaiApp(tk.Frame):
     BILLING_UPDATE_TRANSPORT_COL = SUMMARY_BILLING_UPDATE_TRANSPORT_COL
     PERSON_COL = SUMMARY_PERSON_COL
     MATCH_PERSON_COL = SUMMARY_MATCH_PERSON_COL
+    MATCH_DOC_TYPE_COL = SUMMARY_MATCH_DOC_TYPE_COL
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
     TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
     TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
@@ -243,6 +245,7 @@ class KintaiApp(tk.Frame):
         AUTO_JUDGMENT_COL: 72,
         MATCH_COMPANY_COL: 100,
         MATCH_PERSON_COL: 72,
+        MATCH_DOC_TYPE_COL: 72,
         "押印有無": 72,
     }
     _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
@@ -1252,6 +1255,7 @@ class KintaiApp(tk.Frame):
             (self.COMPANY_COL, "name_company_1"),
             (self.PERSON_COL, "name_person_from_doc"),
             (self.MATCH_PERSON_COL, "match_person"),
+            (self.MATCH_DOC_TYPE_COL, "match_doc_type"),
             (self.EMPLOYEE_NO_COL, "employee_no"),
             (self.BILLING_UPDATE_HOURS_COL, "billing_update_hours_decimal"),
             (LEGACY_BILLING_UPDATE_HOURS_COL, "billing_update_hours_decimal"),
@@ -1300,6 +1304,13 @@ class KintaiApp(tk.Frame):
                     or ""
                 ).strip()
                 val = normalize_judgment_symbol(val) if val else ""
+            elif core_key == "match_doc_type":
+                val = str(
+                    row.get(core_key)
+                    or row.get(self.MATCH_DOC_TYPE_COL)
+                    or ""
+                ).strip()
+                val = normalize_judgment_symbol(val) if val in ("〇", "△", "✖") else val
             elif core_key == "name_company_1":
                 val = _document_company_for_display(
                     str(
@@ -1521,6 +1532,11 @@ class KintaiApp(tk.Frame):
         if not self._is_match_person_manual(core):
             core["match_person"] = recalculate_match_person_for_row(core)
         core[self.MATCH_PERSON_COL] = core.get("match_person", "")
+        core[self.MATCH_DOC_TYPE_COL] = (
+            core.get("match_doc_type")
+            or core.get(self.MATCH_DOC_TYPE_COL)
+            or ""
+        )
         self._recalculate_auto_judgment_for_row(rid, core)
 
     def _set_match_person_symbol(self, rid: str, value: str) -> None:
@@ -1548,6 +1564,11 @@ class KintaiApp(tk.Frame):
         if not self._is_match_person_manual(core):
             core["match_person"] = recalculate_match_person_for_row(core)
         core[self.MATCH_PERSON_COL] = core.get("match_person", "")
+        core[self.MATCH_DOC_TYPE_COL] = (
+            core.get("match_doc_type")
+            or core.get(self.MATCH_DOC_TYPE_COL)
+            or ""
+        )
         self._recalculate_auto_judgment_for_row(rid, core)
         self._sync_row_extra_from_row(rid, core)
         self._status_var.set("会社名比較を一旦〇にしました（対応表には登録しません）")
@@ -1878,6 +1899,11 @@ class KintaiApp(tk.Frame):
         core["auto_judgment"] = aj
         core["user_judgment_company"] = aj
         core[self.FINAL_JUDGMENT_COL] = aj
+        core[self.MATCH_DOC_TYPE_COL] = (
+            core.get("match_doc_type")
+            or core.get(self.MATCH_DOC_TYPE_COL)
+            or ""
+        )
         self._replace_row_with_result(
             rid, core, sync_user_judgment_to_auto=True
         )

@@ -61,6 +61,7 @@ LEGACY_YEAR_COL = "年"
 LEGACY_MONTH_COL = "月"
 SUMMARY_PERSON_COL = "氏名（読取）"
 SUMMARY_MATCH_PERSON_COL = "氏名比較"
+SUMMARY_MATCH_DOC_TYPE_COL = "種別照合"
 LEGACY_PERSON_COL = "氏名"
 SUMMARY_EMPLOYEE_NO_COL = "社員番号（ファイル名より）"
 LEGACY_EMPLOYEE_NO_COL = "社員番号"
@@ -289,6 +290,27 @@ def _filename_has_transport_expense_marker(file_name: str) -> bool:
     return "交通費" in unicodedata.normalize("NFKC", file_name or "")
 
 
+def _filename_expects_kintai(file_name: str) -> bool:
+    """ファイル名の種別から勤怠データを期待するか。"""
+    t = unicodedata.normalize("NFKC", file_name or "")
+    return "勤務表" in t or "作業報告書" in t
+
+
+def _filename_expects_transport(file_name: str) -> bool:
+    """ファイル名の種別から交通費データを期待するか。"""
+    return _filename_has_transport_expense_marker(file_name)
+
+
+def _row_file_name(row: dict[str, str]) -> str:
+    return (
+        row.get("file_name")
+        or row.get(TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_TARGET_FILE_NAME_COL)
+        or row.get(LEGACY_FILE_NAME_COL)
+        or ""
+    ).strip()
+
+
 def _transport_expense_prompt_block(display_file_name: str) -> str:
     """ファイル名に交通費を含む場合のみ、AI への交通費合計抽出指示を返す。"""
     if not _filename_has_transport_expense_marker(display_file_name):
@@ -429,13 +451,9 @@ def _analysis_json_to_kintai_tab(analysis_json: dict[str, str]) -> dict[str, str
 
 def _build_json_response_instruction(display_file_name: str) -> str:
     """画像・PDF 共通: JSON 出力形式の指示ブロック。"""
-    transport_note = ""
-    if _filename_has_transport_expense_marker(display_file_name):
-        transport_note = (
-            f'  "{ANALYSIS_JSON_FIELD_TRANSPORT}": "税込み優先。読取不可は（なし）",\n'
-        )
-    else:
-        transport_note = f'  "{ANALYSIS_JSON_FIELD_TRANSPORT}": "",\n'
+    transport_note = (
+        f'  "{ANALYSIS_JSON_FIELD_TRANSPORT}": "税込み優先。読取不可は（なし）",\n'
+    )
     return f"""
 ７）出力形式
 必ず次のキー名を持つ JSON オブジェクト1つのみを返してください。
@@ -2016,12 +2034,20 @@ def _judgment_match_tier(symbol: str, *, is_company: bool) -> int:
     return 2
 
 
-def _judgment_from_match_symbols(company_symbol: str, person_symbol: str) -> str:
-    """会社名・氏名の比較記号から自動判断の〇/△/✖を決める。"""
-    worst = max(
+def _judgment_from_match_symbols(
+    company_symbol: str,
+    person_symbol: str,
+    *,
+    doc_type_symbol: str = "",
+) -> str:
+    """会社名・氏名・種別照合の比較記号から自動判断の〇/△/✖を決める。"""
+    tiers = [
         _judgment_match_tier(company_symbol, is_company=True),
         _judgment_match_tier(person_symbol, is_company=False),
-    )
+    ]
+    if (doc_type_symbol or "").strip() == "△":
+        tiers.append(1)
+    worst = max(tiers)
     return ("〇", "△", "✖")[worst]
 
 
@@ -2350,8 +2376,6 @@ def _enrich_with_match_scores(
     th_dec = _work_hours_string_to_decimal(th_raw)
     row["total_hours_raw"] = th_raw
     row["total_hours_decimal"] = th_dec
-    # 仕様: 1行解析時は自動判断をユーザ判断にもセットする（合計勤務時間設定後に計算）
-    _apply_parsed_auto_judgment(row)
     # 読取列は解析から抜いた文字列をそのまま用いる（60進/10進の別は _work_hours_string_to_decimal 側のルール）
     row["labor_read_display"] = (th_raw or "").strip() or "（なし）"
     row["seal_in_doc"] = _seal_norm or _extract_seal_in_from_document(
@@ -2359,12 +2383,17 @@ def _enrich_with_match_scores(
     )
     if _filename_has_transport_expense_marker(fn):
         row.setdefault("transport_expense_raw", "（不明）")
-        te_src = analysis if prefer_kintai_section else text_for_extraction
-        te_raw = (ktab.get("transport") or "").strip() or _extract_transport_expense_from_document(
-            te_src
-        )
-        if te_raw:
-            row["transport_expense_raw"] = te_raw
+    te_src = analysis if prefer_kintai_section else text_for_extraction
+    te_raw = (ktab.get("transport") or "").strip() or _extract_transport_expense_from_document(
+        te_src
+    )
+    if te_raw and unicodedata.normalize("NFKC", te_raw) not in (
+        "（データなし）",
+        "データなし",
+        "（なし）",
+    ):
+        row["transport_expense_raw"] = te_raw
+    _apply_parsed_auto_judgment(row)
 
 
 def _row_is_excel(row: dict[str, str]) -> bool:
@@ -2414,7 +2443,7 @@ SUMMARY_MD_HEADER = (
     f"{TARGET_FILE_NAME_COL} | "
     f"{SUMMARY_FINAL_JUDGMENT_COL} | {SUMMARY_BILLING_UPDATE_RESULT_COL} | 自動判断 | "
     f"{SUMMARY_YEAR_COL} | {SUMMARY_MONTH_COL} | "
-    f"{SUMMARY_COMPANY_COL} | {SUMMARY_MATCH_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_MATCH_PERSON_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
+    f"{SUMMARY_COMPANY_COL} | {SUMMARY_MATCH_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_MATCH_PERSON_COL} | {SUMMARY_MATCH_DOC_TYPE_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
     f"{SUMMARY_BILLING_UPDATE_HOURS_COL} | "
     "合計勤務時間（10進） | 合計勤務時間（読取） | "
     f"{SUMMARY_BILLING_UPDATE_TRANSPORT_COL} | {SUMMARY_TRANSPORT_EXPENSE_COL} | "
@@ -2466,6 +2495,7 @@ def normalize_judgment_symbol(value: str) -> str:
 
 def auto_judgment_symbol(row: dict[str, str]) -> str:
     """自動判断（〇/△/✖）を計算する（UI列名・内部キー両対応）。"""
+    _apply_match_doc_type_to_row(row)
     emp = (
         row.get("employee_no")
         or row.get(SUMMARY_EMPLOYEE_NO_COL)
@@ -2480,12 +2510,24 @@ def auto_judgment_symbol(row: dict[str, str]) -> str:
         or ""
     ).strip()
     mp = (row.get("match_person") or row.get(SUMMARY_MATCH_PERSON_COL) or "").strip()
+    mdt = (
+        (row.get("match_doc_type") or row.get(SUMMARY_MATCH_DOC_TYPE_COL) or "").strip()
+    )
+    te = (
+        row.get("transport_expense_raw")
+        or row.get(SUMMARY_TRANSPORT_EXPENSE_COL)
+        or ""
+    ).strip()
     return _auto_judgment_symbol(
         {
             "employee_no": emp,
             "total_hours_decimal": th,
             "match_company": mc,
             "match_person": mp,
+            "match_doc_type": mdt,
+            SUMMARY_MATCH_DOC_TYPE_COL: mdt,
+            "transport_expense_raw": te,
+            SUMMARY_TRANSPORT_EXPENSE_COL: te,
             "match_person_manual": (row.get("match_person_manual") or "").strip(),
             SUMMARY_MATCH_PERSON_COL: mp,
             "name_person_from_file": (row.get("name_person_from_file") or "").strip(),
@@ -2819,6 +2861,72 @@ def _transport_amount_for_excel(value: str) -> tuple[float | None, bool]:
         return None, False
 
 
+def _transport_read_value_usable(raw: str) -> bool:
+    """交通費合計（読取）が有効な読取値か。"""
+    t = (raw or "").strip()
+    if not t:
+        return False
+    nfkc = unicodedata.normalize("NFKC", t)
+    if nfkc in ("不明", "（不明）", "（なし）", "（データなし）", "データなし"):
+        return False
+    _, ok = _transport_amount_for_excel(t)
+    return ok
+
+
+def _row_has_kintai_data(row: dict[str, str]) -> bool:
+    th = (row.get("total_hours_decimal") or "").strip()
+    return _is_valid_total_hours_decimal(th)
+
+
+def _row_has_transport_data(row: dict[str, str]) -> bool:
+    return _transport_read_value_usable(_row_transport_expense_raw(row))
+
+
+def recalculate_match_doc_type_for_row(row: dict[str, str]) -> str:
+    """ファイル名の種別期待と読取結果を比較し、種別照合（〇/△/空欄）を返す。"""
+    fn = _row_file_name(row)
+    expects_kintai = _filename_expects_kintai(fn)
+    expects_transport = _filename_expects_transport(fn)
+    if not expects_kintai and not expects_transport:
+        return ""
+    has_kintai = _row_has_kintai_data(row)
+    has_transport = _row_has_transport_data(row)
+    if expects_kintai and not has_kintai:
+        return "△"
+    if expects_transport and not has_transport:
+        return "△"
+    if has_kintai and not expects_kintai:
+        return "△"
+    if has_transport and not expects_transport:
+        return "△"
+    return "〇"
+
+
+def _apply_match_doc_type_to_row(row: dict[str, str]) -> str:
+    sym = recalculate_match_doc_type_for_row(row)
+    row["match_doc_type"] = sym
+    row[SUMMARY_MATCH_DOC_TYPE_COL] = sym
+    return sym
+
+
+def _hours_check_blocks_auto_judgment(row: dict[str, str], file_name: str) -> bool:
+    """合計勤務時間が無効なとき、自動判断を ✖ にするか。"""
+    th = (row.get("total_hours_decimal") or "").strip()
+    if _is_valid_total_hours_decimal(th):
+        return False
+    expects_kintai = _filename_expects_kintai(file_name)
+    expects_transport = _filename_expects_transport(file_name)
+    has_kintai = _row_has_kintai_data(row)
+    has_transport = _row_has_transport_data(row)
+    if expects_kintai and not has_kintai:
+        return False
+    if expects_transport and not expects_kintai and has_transport:
+        return False
+    if has_transport and not expects_kintai:
+        return False
+    return True
+
+
 def _build_employee_no_row_index(ws) -> dict[str, list[int]]:
     """シート A列の社員番号 → 行番号リスト（1始まり）。"""
     index: dict[str, list[int]] = {}
@@ -2906,6 +3014,7 @@ def update_billing_engineer_ts_sheet(
 
 def _apply_parsed_auto_judgment(row: dict[str, str]) -> None:
     """解析直後の行に自動判断を計算し、最終判断（ユーザ判断）にも同じ値をセットする。"""
+    _apply_match_doc_type_to_row(row)
     aj = _auto_judgment_symbol(row)
     row["auto_judgment"] = aj
     row["user_judgment_company"] = aj
@@ -2917,29 +3026,26 @@ def _auto_judgment_symbol(row: dict[str, str]) -> str:
     仕様:
       - 読み取った年・月とコンボ（expected_year/month）が不一致 → ✖
       - 〇: 年・月一致、社員番号が有効、合計勤務時間(10進)が有効、
-            会社名比較・氏名比較がともに〇扱い
-      - △: 上記前提を満たし、会社名または氏名の比較が△（もう一方は〇扱い）
+            会社名比較・氏名比較がともに〇扱い、種別照合が〇
+      - △: 上記前提を満たし、会社名・氏名・種別のいずれかが△
       - ✖: 年・月不一致、または社員番号・勤務時間・会社名・氏名のいずれかが不適合
     """
     if not _year_month_matches_expected(row):
         return "✖"
     emp = (row.get("employee_no") or "").strip()
-    th = (row.get("total_hours_decimal") or "").strip()
     mc = (row.get("match_company") or "").strip()
     mp = match_person_symbol_for_row(row)
-    file_name = (
-        row.get("file_name")
-        or row.get(TARGET_FILE_NAME_COL)
-        or row.get(LEGACY_TARGET_FILE_NAME_COL)
-        or row.get(LEGACY_FILE_NAME_COL)
-        or ""
-    ).strip()
-    is_transport_file = _filename_has_transport_expense_marker(file_name)
+    file_name = _row_file_name(row)
     if not _is_valid_employee_no(emp):
         return "✖"
-    if not is_transport_file and not _is_valid_total_hours_decimal(th):
+    if _hours_check_blocks_auto_judgment(row, file_name):
         return "✖"
-    return _judgment_from_match_symbols(mc, mp)
+    doc_type = (
+        (row.get("match_doc_type") or "").strip()
+        or (row.get(SUMMARY_MATCH_DOC_TYPE_COL) or "").strip()
+        or _apply_match_doc_type_to_row(row)
+    )
+    return _judgment_from_match_symbols(mc, mp, doc_type_symbol=doc_type)
 
 
 def _upload_image_with_retries(
@@ -3081,6 +3187,10 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
         ((r.get("name_person_from_doc") or "").strip() or ("" if is_excel else "不明"))
     )
     mpe = _escape_md_table_cell(match_person_symbol_for_row(r, persist=not is_match_person_manual(r)))
+    mdt = _escape_md_table_cell(
+        (r.get("match_doc_type") or r.get(SUMMARY_MATCH_DOC_TYPE_COL) or "").strip()
+        or recalculate_match_doc_type_for_row(r)
+    )
     emp = _escape_md_table_cell(
         (r.get("employee_no") or "").strip() or ""
     )
@@ -3108,7 +3218,7 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
     no = _escape_md_table_cell(str(row_no) if row_no is not None else "")
     return (
         f"| {no} | {u_sym} | {ts} | {fn} | {uj} | {bur} | {aj} | {yy} | {mm} | "
-        f"{co1} | {mc} | {pe} | {mpe} | {emp} | {buh} | {th} | {lr} | {but} | {te} | {se} |"
+        f"{co1} | {mc} | {pe} | {mpe} | {mdt} | {emp} | {buh} | {th} | {lr} | {but} | {te} | {se} |"
     )
 
 
@@ -3209,6 +3319,12 @@ def row_display_values(
     mpe = match_person_symbol_for_row(r, persist=not is_match_person_manual(r))
     if not is_match_person_manual(r):
         r["match_person"] = mpe
+    mdt = (
+        (r.get("match_doc_type") or r.get(SUMMARY_MATCH_DOC_TYPE_COL) or "").strip()
+        or recalculate_match_doc_type_for_row(r)
+    )
+    r["match_doc_type"] = mdt
+    r[SUMMARY_MATCH_DOC_TYPE_COL] = mdt
     emp = (r.get("employee_no") or "").strip() or ""
     buh_raw = _row_billing_update_hours_decimal(r)
     if _is_billing_aggregated_marker(buh_raw):
@@ -3242,6 +3358,7 @@ def row_display_values(
         mc,
         pe,
         mpe,
+        mdt,
         emp,
         buh,
         th,
