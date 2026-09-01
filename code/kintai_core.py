@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from newtonx_adk import NewtonXClient, ConfigManager, FileUploadError
+from newtonx_adk import NewtonXClient, ConfigManager, FileUploadError, APIError
 from openpyxl import load_workbook
 import json
+import mimetypes
+import os
 import threading
 import math
 import re
@@ -105,7 +107,11 @@ def _process_sse_response_no_print(self, response) -> str:
 
 
 def create_client() -> NewtonXClient:
-    """NewtonX クライアントを生成し、SSE の標準出力を抑制するパッチを当てる。"""
+    """NewtonX クライアントを生成し、SSE の標準出力を抑制するパッチを当てる。
+
+    ADK 同梱の upload_image は multipart フィールド名が images[] だが、
+    NewtonX Web API（OpenAPI）では images が必須のため差し替える。
+    """
     config_manager = ConfigManager()
     _cfg = config_manager.get_config()
     _cfg.timeout = max(getattr(_cfg, "timeout", 30) or 30, 300)
@@ -113,7 +119,129 @@ def create_client() -> NewtonXClient:
     client._process_sse_response = types.MethodType(
         _process_sse_response_no_print, client
     )
+    client.upload_image = types.MethodType(_upload_image_robust, client)
     return client
+
+
+def _image_id_from_upload_response(result: object) -> str | None:
+    """画像アップロード API レスポンスから画像 ID を取り出す。"""
+    if not isinstance(result, dict):
+        return None
+    for list_key in ("uids", "uuids"):
+        vals = result.get(list_key)
+        if isinstance(vals, list) and vals:
+            return str(vals[0]).strip()
+    for key in ("image_id", "id", "uuid"):
+        val = result.get(key)
+        if val not in (None, ""):
+            return str(val).strip()
+    return None
+
+
+def _upload_image_robust(
+    self,
+    chat_uid: str,
+    file_path: str,
+    file_name: str | None = None,
+) -> str | None:
+    """画像アップロード（NewtonX Web API の images フィールドに準拠）。"""
+    if not file_name:
+        file_name = os.path.basename(file_path)
+    if not os.path.exists(file_path):
+        raise FileUploadError(f"ファイルが存在しません: {file_path}")
+    file_size = os.path.getsize(file_path)
+    if file_size == 0:
+        raise FileUploadError("ファイルが空です")
+    max_size = 10 * 1024 * 1024
+    if file_size > max_size:
+        raise FileUploadError(
+            f"ファイルサイズが大きすぎます: {file_size} bytes (制限: {max_size} bytes)"
+        )
+    with open(file_path, "rb") as f:
+        guessed_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        # OpenAPI: POST /chats/{chat_uid}/images の multipart フィールド名は images
+        files = [("images", (file_name, f, guessed_type))]
+        response = self._make_request("POST", f"/chats/{chat_uid}/images", files=files)
+    if response.status_code in (200, 201):
+        image_id = _image_id_from_upload_response(response.json())
+        if image_id:
+            return image_id
+        raise FileUploadError(
+            f"画像アップロード応答に ID がありません: {response.text[:300]}"
+        )
+    raise FileUploadError(
+        f"画像アップロードに失敗: {response.status_code} - {response.text[:300]}"
+    )
+
+
+def _send_kintai_analysis_message(
+    wc: NewtonXClient,
+    *,
+    chat_uid: str,
+    prompt: str,
+    image_paths: list[str | Path],
+    log_emit: Callable[[str], None] | None = None,
+) -> str:
+    """画像と解析プロンプトを NewtonX チャットへ送信する。
+
+    ADK ドキュメント推奨の 2 段階 I/F を使用する:
+      1. upload_image(chat_uid, file_path) -> image_id
+      2. send_message(chat_uid, message, image_ids=[image_id])
+    """
+    lg = log_emit if log_emit is not None else (lambda _msg: None)
+    message = (prompt or "").strip()
+    if not message:
+        raise ValueError("解析プロンプトが空です")
+    paths = [str(p) for p in image_paths if str(p).strip()]
+    if not paths:
+        raise ValueError("送信する画像がありません")
+    if len(paths) > 1:
+        lg(f"解析送信: 複数画像指定のため先頭のみ使用します ({len(paths)} 件中)")
+    path = paths[0]
+    file_name = Path(path).name
+    lg(f"解析送信: プロンプト {len(message)} 文字 / 画像 ({file_name})")
+
+    image_id = wc.upload_image(
+        chat_uid=chat_uid,
+        file_path=path,
+        file_name=file_name,
+    )
+    if not image_id:
+        raise FileUploadError(f"画像アップロードに失敗しました: {path}")
+    lg(f"画像アップロード完了: image_id={image_id}")
+
+    raw = wc.send_message(
+        chat_uid=chat_uid,
+        message=message,
+        image_ids=[image_id],
+        knowledge_search=False,
+        web_search=False,
+    )
+    return raw or ""
+
+
+def _cleanup_analysis_chat(
+    wc: NewtonXClient,
+    chat_uid: str | None,
+    *,
+    analysis_succeeded: bool,
+    log_emit: Callable[[str], None] | None = None,
+) -> None:
+    """解析用チャットの後片付け。失敗時は空チャットを残さない。"""
+    if not chat_uid:
+        return
+    lg = log_emit if log_emit is not None else (lambda _msg: None)
+    if analysis_succeeded:
+        if not DELETE_CHAT_AFTER_ANALYSIS:
+            return
+    try:
+        if wc.delete_chat(chat_uid):
+            if analysis_succeeded:
+                lg(f"チャットが削除されました: {chat_uid}")
+            else:
+                lg(f"未完了チャットを削除しました: {chat_uid}")
+    except Exception:
+        return
 
 
 def _compress_image_under_1mib(src: Path) -> Path:
@@ -436,24 +564,50 @@ def _print_analysis_json_to_terminal(
         print(f"--- 解析JSON（パース失敗）: {label} ---\n{raw}\n---", flush=True)
 
 
+def _sanitize_analysis_read_value(raw: str) -> str:
+    """AI が返す空欄相当の表記を空文字に正規化する。"""
+    t = unicodedata.normalize("NFKC", (raw or "").strip())
+    if t in (
+        "不明",
+        "（不明）",
+        "（なし）",
+        "（データなし）",
+        "データなし",
+    ):
+        return ""
+    return (raw or "").strip()
+
+
 def _analysis_json_to_kintai_tab(analysis_json: dict[str, str]) -> dict[str, str]:
     """解析 JSON を _enrich_with_match_scores 用の内部キー辞書に変換する。"""
     return {
-        "company": (analysis_json.get(ANALYSIS_JSON_FIELD_COMPANY) or "").strip(),
-        "person": (analysis_json.get(ANALYSIS_JSON_FIELD_PERSON) or "").strip(),
-        "year": (analysis_json.get(ANALYSIS_JSON_FIELD_YEAR) or "").strip(),
-        "month": (analysis_json.get(ANALYSIS_JSON_FIELD_MONTH) or "").strip(),
-        "total": (analysis_json.get(ANALYSIS_JSON_FIELD_TOTAL_HOURS) or "").strip(),
-        "seal": (analysis_json.get(ANALYSIS_JSON_FIELD_SEAL) or "").strip(),
-        "transport": (analysis_json.get(ANALYSIS_JSON_FIELD_TRANSPORT) or "").strip(),
+        "company": _sanitize_analysis_read_value(
+            analysis_json.get(ANALYSIS_JSON_FIELD_COMPANY) or ""
+        ),
+        "person": _sanitize_analysis_read_value(
+            analysis_json.get(ANALYSIS_JSON_FIELD_PERSON) or ""
+        ),
+        "year": _sanitize_analysis_read_value(
+            analysis_json.get(ANALYSIS_JSON_FIELD_YEAR) or ""
+        ),
+        "month": _sanitize_analysis_read_value(
+            analysis_json.get(ANALYSIS_JSON_FIELD_MONTH) or ""
+        ),
+        "total": _sanitize_analysis_read_value(
+            analysis_json.get(ANALYSIS_JSON_FIELD_TOTAL_HOURS) or ""
+        ),
+        "seal": _sanitize_analysis_read_value(
+            analysis_json.get(ANALYSIS_JSON_FIELD_SEAL) or ""
+        ),
+        "transport": _sanitize_analysis_read_value(
+            analysis_json.get(ANALYSIS_JSON_FIELD_TRANSPORT) or ""
+        ),
     }
 
 
 def _build_json_response_instruction(display_file_name: str) -> str:
     """画像・PDF 共通: JSON 出力形式の指示ブロック。"""
-    transport_note = (
-        f'  "{ANALYSIS_JSON_FIELD_TRANSPORT}": "税込み優先。読取不可は（なし）",\n'
-    )
+    transport_note = f'  "{ANALYSIS_JSON_FIELD_TRANSPORT}": "",\n'
     return f"""
 ７）出力形式
 必ず次のキー名を持つ JSON オブジェクト1つのみを返してください。
@@ -493,7 +647,7 @@ def _apply_analysis_response_to_row(
         )
     _enrich_with_match_scores(
         row,
-        row["analysis"],
+        (raw_response or "").strip() or row["analysis"],
         prefer_kintai_section=prefer_kintai_section,
         analysis_json=analysis_json,
         company_aliases=company_aliases,
@@ -555,7 +709,8 @@ def _build_check_message(display_file_name: str) -> str:
             Mar-26などの場合は、3月とする。
 		6)合計勤務時間
 			アップロードした画像ファイルから、総労働時間と思える文字列をそのまま抽出してください。
-			例）（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
+			勤務表・作業報告書の画像では、この項目を最優先で読み取ってください。
+			例）（8:20・8時間20分・8.20・101_10H・86.17H・170時間39分 等。必要に応じて実データの表記のまま）
 		7)押印有無
 			押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
 			アップロードした画像ファイルの中に
@@ -565,12 +720,11 @@ def _build_check_message(display_file_name: str) -> str:
   				・抽出できない場合：✖
   				・上記以外の場合：✖
 		8)交通費合計
-			アップロードした画像ファイルの中で
-			交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
+			勤務表のみの画像で交通費の記載が無い場合は「（データなし）」として構いません。
+			交通費・経費精算の記載がある場合のみ、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
 			税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
 			金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
-			読み取れない場合は、”（データなし）”を返す。
-    """
+    """ + _build_json_response_instruction(display_file_name)
 
 # def _build_check_message(display_file_name: str) -> str:
 #     """解析結果に出すファイル名をローカルの実名に固定する。"""
@@ -674,7 +828,8 @@ def _build_pdf_check_message(display_file_name: str) -> str:
             Mar-26などの場合は、3月とする。
 		6)合計勤務時間
 			アップロードした画像ファイルから、総労働時間と思える文字列をそのまま抽出してください。
-			例）（8:20・8時間20分・8.20・101_10H・86.17H 等。必要に応じて実データの表記のまま）
+			勤務表・作業報告書の画像では、この項目を最優先で読み取ってください。
+			例）（8:20・8時間20分・8.20・101_10H・86.17H・170時間39分 等。必要に応じて実データの表記のまま）
 		7)押印有無
 			押印有無については、以下の判断をしてください。〇、✖以外の結果は返さないでください。
 			アップロードした画像ファイルの中に
@@ -684,12 +839,11 @@ def _build_pdf_check_message(display_file_name: str) -> str:
   				・抽出できない場合：✖
   				・上記以外の場合：✖
 		8)交通費合計
-			アップロードした画像ファイルの中で
-			交通費・経費精算を部分から、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
+			勤務表のみの画像で交通費の記載が無い場合は「（データなし）」として構いません。
+			交通費・経費精算の記載がある場合のみ、交通費等の合計と思われる金額を抽出し「交通費合計」として出力してください。
 			税抜き・税込みの両方の金額がある場合は、税込みの金額を採用してください。
 			金額は表記のまま（円・カンマ等を含む）でよい。読み取れない場合は”（データなし）”を返す。
-			読み取れない場合は、”（データなし）”を返す。
-    """
+    """ + _build_json_response_instruction(display_file_name)
 
 # def _build_pdf_check_message(display_file_name: str) -> str:
 #     return f"""
@@ -2878,8 +3032,19 @@ def _row_has_kintai_data(row: dict[str, str]) -> bool:
     return _is_valid_total_hours_decimal(th)
 
 
+def _row_transport_read_amount(row: dict[str, str]) -> tuple[float | None, bool]:
+    """交通費合計（読取）の数値と解析成功可否。"""
+    return _transport_amount_for_excel(_row_transport_expense_raw(row))
+
+
 def _row_has_transport_data(row: dict[str, str]) -> bool:
     return _transport_read_value_usable(_row_transport_expense_raw(row))
+
+
+def _row_has_unexpected_nonzero_transport(row: dict[str, str]) -> bool:
+    """ファイル名に交通費がなく、読取交通費が 0 円以外の有効値か。"""
+    amount, ok = _row_transport_read_amount(row)
+    return ok and amount is not None and amount != 0.0
 
 
 def recalculate_match_doc_type_for_row(row: dict[str, str]) -> str:
@@ -2897,7 +3062,7 @@ def recalculate_match_doc_type_for_row(row: dict[str, str]) -> str:
         return "△"
     if has_kintai and not expects_kintai:
         return "△"
-    if has_transport and not expects_transport:
+    if not expects_transport and _row_has_unexpected_nonzero_transport(row):
         return "△"
     return "〇"
 
@@ -3617,23 +3782,13 @@ def run_analysis(
                 log(f"ワーカー {worker_idx + 1}: チャット作成処理で異常 — {e}")
                 return None
 
-        def delete_file_chat(chat_uid: str | None) -> None:
-            """解析用に作成したチャットを後片付けする。
-
-            UI のステータス欄へ on_log が流れるため、削除失敗はユーザーにとってノイズになりやすい。
-            ここでは削除失敗/例外は握りつぶし（静かに無視）とし、成功時のみログを残す。
-            """
-            if not DELETE_CHAT_AFTER_ANALYSIS:
-                return
-            if not chat_uid:
-                return
-            try:
-                success = wc.delete_chat(chat_uid)
-                if success:
-                    log(f"チャットが削除されました: {chat_uid}")
-            except Exception:
-                # 削除失敗は後続処理に影響しないため、表示・停止させない
-                return
+        def delete_file_chat(chat_uid: str | None, *, analysis_succeeded: bool = False) -> None:
+            _cleanup_analysis_chat(
+                wc,
+                chat_uid,
+                analysis_succeeded=analysis_succeeded,
+                log_emit=log,
+            )
 
         def signal_fatal(exc: BaseException) -> None:
             worker_exc[worker_idx] = exc
@@ -3697,61 +3852,44 @@ def run_analysis(
                             log("中断: 画像のアップロード前にキャンセルされました")
                             break
                         tmp_upload_path: Path | None = tmp_upload
+                        analysis_succeeded = False
                         try:
                             chat_uid = create_file_chat(f"#{worker_idx + 1} {file_path.name}")
                             if not chat_uid:
                                 raise RuntimeError(f"NewtonX 上でチャットの作成に失敗しました — {file_path.name}")
                             chat_holder["chat_uid"] = chat_uid
-                            image_id, upload_succeeded = _upload_image_with_retries(
-                                wc,
-                                chat_uid_holder=chat_holder,
-                                upload_src=upload_src,
-                                file_name=file_path.name,
-                                recreate_chat_fn=None,
-                                log_emit=log,
-                            )
-                            if not image_id:
+                            if is_cancelled():
+                                log("中断: 画像の解析要求前にキャンセルされました")
+                                break
+                            prompt = _build_check_message(file_path.name)
+                            try:
+                                raw_response = _send_kintai_analysis_message(
+                                    wc,
+                                    chat_uid=chat_holder["chat_uid"],
+                                    prompt=prompt,
+                                    image_paths=[upload_src],
+                                    log_emit=log,
+                                )
+                            except (FileUploadError, APIError, ValueError) as e:
                                 log(
-                                    f"スキップ: アップロードに失敗しました（最大 "
-                                    f"{UPLOAD_MAX_RETRIES} 回までリトライ）— "
-                                    f"{file_path.name}"
+                                    f"スキップ: 画像の送信に失敗しました — "
+                                    f"{file_path.name}: {e}"
                                 )
                                 append_upload_failure_row(
                                     worker_idx,
                                     file_path,
                                     prefer_pdf_section=False,
-                                    message=(
-                                        f"（画像アップロード失敗／{UPLOAD_MAX_RETRIES}回リトライまで）"
-                                    ),
+                                    message=f"（画像送信失敗: {e}）",
                                 )
                             else:
-                                if is_cancelled():
-                                    log(
-                                        "中断: 画像の解析要求前にキャンセルされました"
-                                    )
-                                    break
-                                def analyze_image_once() -> tuple[dict[str, str] | None, str]:
-                                    raw = wc.send_message(
-                                        chat_uid=chat_holder["chat_uid"],
-                                        message=_build_check_message(file_path.name),
-                                        image_ids=[image_id],
-                                    )
-                                    text = raw or ""
-                                    return _parse_analysis_json_response(text), text
-
-                                if is_cancelled():
-                                    log(
-                                        "中断: 画像の解析応答待ち後にキャンセルされました"
-                                    )
-                                    break
+                                analysis_json = _parse_analysis_json_response(raw_response)
                                 row = {
-                                    "upload_ok": "〇" if upload_succeeded else "✖",
+                                    "upload_ok": "〇" if raw_response.strip() else "✖",
                                     "file_name": file_path.name,
                                     "resolved_path": str(file_path.resolve()),
                                     "analysis": "",
                                 }
                                 attach_year_month(row)
-                                analysis_json, raw_response = analyze_image_once()
                                 _apply_analysis_response_to_row(
                                     row,
                                     analysis_json,
@@ -3763,8 +3901,12 @@ def run_analysis(
                                 emit_company_match_ratio_progress(row)
                                 if on_row_completed is not None:
                                     on_row_completed(row)
+                                analysis_succeeded = True
                         finally:
-                            delete_file_chat(chat_holder.get("chat_uid") or None)
+                            delete_file_chat(
+                                chat_holder.get("chat_uid") or None,
+                                analysis_succeeded=analysis_succeeded,
+                            )
                             if tmp_upload_path is not None:
                                 tmp_upload_path.unlink(missing_ok=True)
                 else:
@@ -3792,6 +3934,7 @@ def run_analysis(
                             log("中断: PDFの画像アップロード前にキャンセルされました")
                             break
                         try:
+                            analysis_succeeded = False
                             chat_uid = create_file_chat(
                                 f"#{worker_idx + 1} {file_path.name}"
                             )
@@ -3807,75 +3950,60 @@ def run_analysis(
                                 f"PDF→PNG変換完了: {file_path.name} → "
                                 f"{upload_file_name} ({png_kb:.0f} KB)"
                             )
-                            image_id, upload_succeeded = _upload_image_with_retries(
-                                wc,
-                                chat_uid_holder=chat_holder,
-                                upload_src=upload_src,
-                                file_name=upload_file_name,
-                                recreate_chat_fn=None,
-                                log_emit=log,
-                            )
-                            if not image_id:
+                            if is_cancelled():
                                 log(
-                                    f"スキップ: PDF（画像変換）のアップロードに失敗しました（最大 "
-                                    f"{UPLOAD_MAX_RETRIES} 回までリトライ）— "
-                                    f"{file_path.name}"
-                                )
-                                append_upload_failure_row(
-                                    worker_idx,
-                                    file_path,
-                                    prefer_pdf_section=True,
-                                    message=(
-                                        f"（PDF画像アップロード失敗／"
-                                        f"{UPLOAD_MAX_RETRIES}回リトライまで）"
-                                    ),
+                                    "中断: PDF（画像変換）の解析要求前に"
+                                    "キャンセルされました"
                                 )
                             else:
-                                if is_cancelled():
-                                    log(
-                                        "中断: PDF（画像変換）の解析要求前に"
-                                        "キャンセルされました"
-                                    )
-                                    break
-
-                                def analyze_pdf_as_image_once() -> (
-                                    tuple[dict[str, str] | None, str]
-                                ):
-                                    raw = wc.send_message(
+                                prompt = _build_check_message(file_path.name)
+                                try:
+                                    raw_response = _send_kintai_analysis_message(
+                                        wc,
                                         chat_uid=chat_holder["chat_uid"],
-                                        message=_build_check_message(file_path.name),
-                                        image_ids=[image_id],
+                                        prompt=prompt,
+                                        image_paths=[upload_src],
+                                        log_emit=log,
                                     )
-                                    text = raw or ""
-                                    return _parse_analysis_json_response(text), text
-
-                                if is_cancelled():
+                                except (FileUploadError, APIError, ValueError) as e:
                                     log(
-                                        "中断: PDF（画像変換）の解析応答待ち後に"
-                                        "キャンセルされました"
+                                        f"スキップ: PDF（画像変換）の送信に失敗しました — "
+                                        f"{file_path.name}: {e}"
                                     )
-                                    break
-                                row2 = {
-                                    "upload_ok": "〇" if upload_succeeded else "✖",
-                                    "file_name": file_path.name,
-                                    "resolved_path": str(file_path.resolve()),
-                                    "analysis": "",
-                                }
-                                attach_year_month(row2)
-                                analysis_json, raw_response = analyze_pdf_as_image_once()
-                                _apply_analysis_response_to_row(
-                                    row2,
-                                    analysis_json,
-                                    raw_response,
-                                    company_aliases=company_aliases,
-                                )
-                                bucket_results[worker_idx].append(row2)
-                                emit_summary_row_md(row2)
-                                emit_company_match_ratio_progress(row2)
-                                if on_row_completed is not None:
-                                    on_row_completed(row2)
+                                    append_upload_failure_row(
+                                        worker_idx,
+                                        file_path,
+                                        prefer_pdf_section=True,
+                                        message=f"（PDF画像送信失敗: {e}）",
+                                    )
+                                else:
+                                    analysis_json = _parse_analysis_json_response(
+                                        raw_response
+                                    )
+                                    row2 = {
+                                        "upload_ok": "〇" if raw_response.strip() else "✖",
+                                        "file_name": file_path.name,
+                                        "resolved_path": str(file_path.resolve()),
+                                        "analysis": "",
+                                    }
+                                    attach_year_month(row2)
+                                    _apply_analysis_response_to_row(
+                                        row2,
+                                        analysis_json,
+                                        raw_response,
+                                        company_aliases=company_aliases,
+                                    )
+                                    bucket_results[worker_idx].append(row2)
+                                    emit_summary_row_md(row2)
+                                    emit_company_match_ratio_progress(row2)
+                                    if on_row_completed is not None:
+                                        on_row_completed(row2)
+                                    analysis_succeeded = True
                         finally:
-                            delete_file_chat(chat_holder.get("chat_uid") or None)
+                            delete_file_chat(
+                                chat_holder.get("chat_uid") or None,
+                                analysis_succeeded=analysis_succeeded,
+                            )
                             for tmp_path in tmp_upload_paths:
                                 tmp_path.unlink(missing_ok=True)
             except BaseException as e:
