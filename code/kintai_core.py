@@ -30,6 +30,8 @@ PDF_RENDER_DPI = 150
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 PDF_SUFFIX = ".pdf"
 EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+# グリッド行削除時: 物理削除の代わりにファイル名末尾へ付与し run_analysis の対象外にする
+EXCLUDED_FILE_SUFFIX = ".bak"
 TARGET_EXCEL_SHEET_NAME = "タイムシート兼作業報告書_お客様先用"
 TRANSPORT_EXPENSE_EXCEL_SHEET_NAME = "交通宿泊費清算書お客様先用"
 TRANSPORT_EXPENSE_LABEL_COL = 6  # F列: 「合計」ラベル
@@ -411,6 +413,33 @@ def _pdf_to_png_for_upload(pdf_path: Path) -> tuple[str, list[Path]]:
     finally:
         tools.mupdf_display_errors(True)
         tools.mupdf_display_warnings(True)
+
+
+def path_is_excluded_archive(path: Path) -> bool:
+    """行削除で除外済みのファイル名か（例: 勤務表.pdf.bak）。"""
+    return Path(path).name.lower().endswith(EXCLUDED_FILE_SUFFIX)
+
+
+def path_after_exclude_rename(path: Path) -> Path:
+    """行削除用リネーム後のパス（元の拡張子の後ろに .bak を付与）。"""
+    p = Path(path)
+    if path_is_excluded_archive(p):
+        return p.resolve()
+    return p.parent / f"{p.name}{EXCLUDED_FILE_SUFFIX}"
+
+
+def rename_file_to_excluded(path: Path) -> Path:
+    """解析対象ファイルを *.bak 形式にリネームする。既に除外済みの場合はそのパスを返す。"""
+    src = Path(path).resolve()
+    if path_is_excluded_archive(src):
+        return src
+    if not src.is_file():
+        raise FileNotFoundError(f"ファイルが存在しません: {src}")
+    dest = path_after_exclude_rename(src)
+    if dest.exists():
+        raise FileExistsError(f"リネーム先が既に存在します: {dest}")
+    src.rename(dest)
+    return dest
 
 
 def _filename_has_transport_expense_marker(file_name: str) -> bool:

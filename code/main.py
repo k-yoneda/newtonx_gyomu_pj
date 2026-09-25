@@ -22,6 +22,7 @@ if str(_ROOT) not in sys.path:
 from kintai_core import (
     DEFAULT_PARALLEL_ANALYSIS_CHATS,
     EXCEL_SUFFIXES,
+    path_is_excluded_archive,
     LEGACY_COMPANY_COL,
     LEGACY_COMPANY_NAME_COL,
     LEGACY_COMPANY_READ_LONG_COL,
@@ -71,8 +72,10 @@ from kintai_core import (
     match_person_symbol_for_row,
     recalculate_match_company_for_row,
     recalculate_match_person_for_row,
+    rename_file_to_excluded,
     save_company_aliases,
     _parse_filename_company_and_person,
+    _billing_aggregated_marker,
     _is_billing_aggregated_marker,
     _row_billing_update_hours_decimal,
     _row_billing_update_transport,
@@ -477,7 +480,7 @@ class KintaiApp(tk.Frame):
         self._new_plus_error_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
         self._cont_btn = ttk.Button(
-            ctrl, text="継続解析", command=self._start_continue_analysis, state=tk.DISABLED
+            ctrl, text="追加継続解析", command=self._start_continue_analysis, state=tk.DISABLED
         )
         self._cont_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
 
@@ -837,6 +840,111 @@ class KintaiApp(tk.Frame):
         if self._selected_tree_iids():
             return f"選択行（{len(self._billing_target_iids())} 行）"
         return "全行"
+
+    def _delete_target_iids(self, rid: str) -> list[str]:
+        selected = self._selected_tree_iids()
+        if selected:
+            return list(selected)
+        return [rid] if rid else []
+
+    def _prompt_delete_grid_rows(self, rid: str) -> None:
+        iids = self._delete_target_iids(rid)
+        if not iids:
+            return
+        names: list[str] = []
+        for iid in iids:
+            row = self._current_row_dict_from_iid(iid)
+            fn = self._file_name_from_row(row)
+            names.append(fn or "（ファイル名なし）")
+        preview = "\n".join(names[:15])
+        if len(names) > 15:
+            preview += f"\n... 他 {len(names) - 15} 件"
+        if not messagebox.askokcancel(
+            "行を削除",
+            f"対象: {len(iids)} 行\n\n"
+            f"{preview}\n\n"
+            "グリッドから削除します。ファイル名の末尾に .bak を付け、"
+            "再解析の対象外にします（例: 勤務表.pdf → 勤務表.pdf.bak）。\n"
+            "元に戻す場合は末尾の .bak を手動で削除してください。",
+            parent=self._root,
+        ):
+            return
+        self._delete_grid_rows(iids)
+
+    def _delete_grid_rows(self, iids: list[str]) -> None:
+        to_remove: list[str] = []
+        rename_ok = 0
+        missing = 0
+        already_excluded = 0
+        failed: list[str] = []
+
+        for iid in iids:
+            path = self._resolve_file_path_for_row(iid)
+            row = self._current_row_dict_from_iid(iid)
+            fn = self._file_name_from_row(row) or iid
+            if path is None:
+                missing += 1
+                to_remove.append(iid)
+                continue
+            if path_is_excluded_archive(path):
+                already_excluded += 1
+                to_remove.append(iid)
+                continue
+            try:
+                rename_file_to_excluded(path)
+                rename_ok += 1
+                to_remove.append(iid)
+            except FileExistsError:
+                failed.append(f"{fn}: リネーム先（末尾 .bak）が既に存在します")
+            except OSError as e:
+                failed.append(f"{fn}: {e}")
+
+        for iid in to_remove:
+            if iid == self._preview_row_iid:
+                self._cancel_preview_hover_timer()
+                self._close_row_file()
+            self._row_extra.pop(iid, None)
+            self._item_paths.pop(iid, None)
+            try:
+                self._tree.delete(iid)
+            except tk.TclError:
+                pass
+
+        if to_remove:
+            self._renumber_grid_rows()
+            self._loaded_rows = self._current_grid_rows()
+            ratio_text = self._company_match_ratio_text(self._loaded_rows)
+            self._status_var.set(
+                f"行削除完了: {len(to_remove)} 行 / {ratio_text}"
+            )
+            self._refresh_reanalysis_buttons_state()
+            self._refresh_billing_buttons_state()
+
+        lines = [f"グリッドから削除: {len(to_remove)} 行"]
+        if rename_ok:
+            lines.append(f"ファイル名末尾に .bak を付与: {rename_ok} 件")
+        if already_excluded:
+            lines.append(f"既に除外済み（グリッドのみ削除）: {already_excluded} 件")
+        if missing:
+            lines.append(f"ファイル不在（グリッドのみ削除）: {missing} 件")
+        if failed:
+            lines.append(f"リネーム失敗（行は残しました）: {len(failed)} 件")
+            for msg in failed[:8]:
+                lines.append(f" ・{msg}")
+            if len(failed) > 8:
+                lines.append(f"  ... 他 {len(failed) - 8} 件")
+        if to_remove and self._tree.get_children():
+            lines.append("残り行の No を 1 から振り直しました。")
+        lines.append("")
+        lines.append(
+            "請求データの合算がある場合は「請求データ作成」を再実行してください。"
+        )
+        if failed:
+            messagebox.showwarning(
+                "行を削除（一部失敗）", "\n".join(lines), parent=self._root
+            )
+        elif to_remove:
+            messagebox.showinfo("行を削除", "\n".join(lines), parent=self._root)
 
     def _create_billing_data(self) -> None:
         if self._busy:
@@ -1435,6 +1543,55 @@ class KintaiApp(tk.Frame):
                 max_no = max(max_no, int(no_s))
         self._grid_row_no_seq = max_no
 
+    def _remap_billing_aggregated_marker(
+        self, value: str, old_to_new: dict[str, str]
+    ) -> str:
+        t = (value or "").strip()
+        if not _is_billing_aggregated_marker(t):
+            return value
+        m = re.match(r"^No\.(\d+)", t)
+        if not m:
+            return value
+        rep_new = old_to_new.get(m.group(1), m.group(1))
+        if not rep_new.isdigit():
+            return value
+        return _billing_aggregated_marker(int(rep_new))
+
+    def _renumber_grid_rows(self) -> None:
+        """表示順に No を 1…N に振り直し、合算済マーカー内の代表 No も追随する。"""
+        children = list(self._tree.get_children())
+        if not children:
+            self._grid_row_no_seq = 0
+            return
+
+        old_no_by_iid = {iid: self._tree_row_no(iid) for iid in children}
+        old_to_new: dict[str, str] = {}
+        for n, iid in enumerate(children, start=1):
+            old = old_no_by_iid.get(iid, "")
+            if old:
+                old_to_new[old] = str(n)
+
+        ci_no = self._row_no_column_index()
+        cols = list(self._tree["columns"])
+        billing_col_indices: list[int] = []
+        for col in (self.BILLING_UPDATE_HOURS_COL, self.BILLING_UPDATE_TRANSPORT_COL):
+            if col in cols:
+                billing_col_indices.append(cols.index(col))
+
+        for n, iid in enumerate(children, start=1):
+            vals = list(self._tree.item(iid, "values") or ())
+            while len(vals) <= ci_no:
+                vals.append("")
+            vals[ci_no] = str(n)
+            for bci in billing_col_indices:
+                if bci < len(vals):
+                    vals[bci] = self._remap_billing_aggregated_marker(
+                        str(vals[bci]), old_to_new
+                    )
+            self._tree.item(iid, values=tuple(vals))
+
+        self._grid_row_no_seq = len(children)
+
     def _user_judgment_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.FINAL_JUDGMENT_COL)
 
@@ -1999,6 +2156,11 @@ class KintaiApp(tk.Frame):
                 )
             menu.add_separator()
 
+        menu.add_command(
+            label="行を削除",
+            command=lambda: self._prompt_delete_grid_rows(rid),
+        )
+        menu.add_separator()
         menu.add_command(label="再解析", command=lambda: self._start_row_reanalysis(rid))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -2914,7 +3076,7 @@ class KintaiApp(tk.Frame):
         self._start_new_analysis(chain_error_reanalysis_after=True)
 
     def _start_continue_analysis(self) -> None:
-        # 継続解析: 読み込み済み（または現在表示）の状態を起点
+        # 追加継続解析: 読み込み済み（または現在表示）の状態を起点
         base = self._loaded_rows or self._current_grid_rows()
         self._start_analysis(base_rows=base)
 
@@ -2948,7 +3110,7 @@ class KintaiApp(tk.Frame):
         self._progress_var.set("")
         self._status_var.set("解析を準備しています…")
 
-        # 継続解析のときは、まず既存行をグリッドに反映（ユーザ判断も含む）
+        # 追加継続解析のときは、まず既存行をグリッドに反映（ユーザ判断も含む）
         if base_rows is None:
             self._clear_grid()
         else:
@@ -2985,7 +3147,7 @@ class KintaiApp(tk.Frame):
             self._status_var.set(f"解析中… / {ratio_text}")
 
         def on_progress(done: int, total: int) -> None:
-            # 継続解析時は読み込み済み件数を加算して表示
+            # 追加継続解析時は読み込み済み件数を加算して表示
             def apply_progress(d: int = done, t: int = total, b: int = base_done) -> None:
                 progress_state["target"] = b + t
                 self._progress_var.set(f"実行済 {b + d} / 対象 {b + t}")
@@ -3010,7 +3172,7 @@ class KintaiApp(tk.Frame):
 
         def _as_core_row(r: dict[str, str]) -> dict[str, str]:
             """UI行(dict) -> kintai_core の row(dict) に寄せる"""
-            # 継続解析時に既存行の情報を落とさないよう、UI行をできるだけ保持したまま
+            # 追加継続解析時に既存行の情報を落とさないよう、UI行をできるだけ保持したまま
             # kintai_core が参照するキーへ寄せる。
             out: dict[str, str] = dict(r)
             out["file_name"] = self._file_name_from_row(r)
@@ -3032,7 +3194,7 @@ class KintaiApp(tk.Frame):
             rows_result: list[dict[str, str]] | None = None
             err: BaseException | None = None
 
-            # 起点行（継続解析）: file_name -> row
+            # 起点行（追加継続解析）: file_name -> row
             base_map: dict[str, dict[str, str]] = {}
             if base_rows:
                 for br in base_rows:
@@ -3091,7 +3253,7 @@ class KintaiApp(tk.Frame):
 
             rows_final = rows_result or []
 
-            # 継続解析: base を起点に、結果を追加（既存は skip_file_names でスキップされる想定）
+            # 追加継続解析: base を起点に、結果を追加（既存は skip_file_names でスキップされる想定）
             merged: dict[str, dict[str, str]] = {k: v for k, v in base_map.items()}
             for nr in rows_final:
                 fn = (nr.get("file_name") or "").strip()
@@ -3143,7 +3305,7 @@ class KintaiApp(tk.Frame):
                 n_rows = len(self._loaded_rows or [])
                 ratio_text = self._company_match_ratio_text(self._loaded_rows)
                 if err is not None:
-                    # 要件: 送信エラー等でも中断状態・保存/継続解析を有効にする
+                    # 要件: 送信エラー等でも中断状態・保存/追加継続解析を有効にする
                     messagebox.showerror(
                         "解析エラー",
                         str(err),
