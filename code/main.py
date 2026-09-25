@@ -75,6 +75,7 @@ from kintai_core import (
     _parse_filename_company_and_person,
     _is_billing_aggregated_marker,
     _row_billing_update_hours_decimal,
+    _row_billing_update_transport,
     _company_text_contains_seraku,
     _document_company_for_display,
 )
@@ -891,7 +892,7 @@ class KintaiApp(tk.Frame):
         if not messagebox.askokcancel(
             "請求データ削除",
             f"対象: {scope}\n\n"
-            "更新用合計勤務時間（10進）をクリアします。",
+            "更新用合計勤務時間（10進）と更新用交通費合計をクリアします。",
             parent=self._root,
         ):
             return
@@ -899,18 +900,21 @@ class KintaiApp(tk.Frame):
         cleared = 0
         for iid in self._billing_target_iids():
             core = self._row_dict_to_core(self._current_row_dict_from_iid(iid))
-            if _row_billing_update_hours_decimal(core):
+            if _row_billing_update_hours_decimal(core) or _row_billing_update_transport(
+                core
+            ):
                 cleared += 1
             clear_billing_update_hours_column(core)
             self._replace_row_with_result(iid, core)
 
         self._loaded_rows = self._current_grid_rows()
         self._status_var.set(
-            f"請求データ削除完了（{scope}）: {cleared} 行の更新用合計勤務時間（10進）をクリアしました"
+            f"請求データ削除完了（{scope}）: {cleared} 行の更新用列をクリアしました"
         )
         messagebox.showinfo(
             "請求データ削除",
-            f"対象: {scope}\n更新用合計勤務時間（10進）をクリアしました（{cleared} 行）。",
+            f"対象: {scope}\n"
+            f"更新用合計勤務時間（10進）・更新用交通費合計をクリアしました（{cleared} 行）。",
             parent=self._root,
         )
 
