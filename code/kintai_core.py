@@ -449,6 +449,72 @@ def rename_file_to_excluded(path: Path) -> Path:
     return dest
 
 
+def restored_file_name_from_excluded(path: Path) -> str:
+    """除外ファイル名（*.bak）から復帰後のファイル名を返す。"""
+    name = Path(path).name
+    if not path_is_excluded_archive(path):
+        return name
+    suffix = EXCLUDED_FILE_SUFFIX
+    if name.lower().endswith(suffix):
+        return name[: -len(suffix)]
+    return name
+
+
+def list_excluded_files(data_dir: Path) -> list[Path]:
+    """データフォルダ直下の行削除済み（*.bak）ファイルを名前順で返す。"""
+    root = Path(data_dir)
+    if not root.is_dir():
+        return []
+    return sorted(
+        p.resolve()
+        for p in root.iterdir()
+        if p.is_file() and path_is_excluded_archive(p)
+    )
+
+
+def rename_file_from_excluded(path: Path) -> Path:
+    """*.bak を外して元のファイル名にリネームする。"""
+    src = Path(path).resolve()
+    if not path_is_excluded_archive(src):
+        raise ValueError(f"除外ファイルではありません: {src}")
+    if not src.is_file():
+        raise FileNotFoundError(f"ファイルが存在しません: {src}")
+    dest_name = restored_file_name_from_excluded(src)
+    dest = src.parent / dest_name
+    if dest.exists():
+        raise FileExistsError(f"復帰先が既に存在します: {dest}")
+    src.rename(dest)
+    return dest
+
+
+def build_row_after_restore_without_analysis(
+    path: Path,
+    *,
+    company_aliases: list[dict[str, str]] | None = None,
+    expected_year: str = "",
+    expected_month: str = "",
+) -> dict[str, str]:
+    """削除データ復帰（再解析なし）用のグリッド行を構築する。"""
+    file_path = Path(path).resolve()
+    if file_path.suffix.lower() in EXCEL_SUFFIXES:
+        row = _extract_excel_target_sheet_row(
+            file_path, company_aliases=company_aliases
+        )
+    else:
+        row = {
+            "upload_ok": "",
+            "file_name": file_path.name,
+            "resolved_path": str(file_path),
+            "analysis": "",
+        }
+    if expected_year:
+        row["expected_year"] = expected_year.strip()
+    if expected_month:
+        row["expected_month"] = expected_month.strip()
+    _apply_parsed_auto_judgment(row)
+    return row
+
+
 def _filename_has_transport_expense_marker(file_name: str) -> bool:
     """ファイル名に「交通費」が含まれるか（全角半角正規化後）。"""
     return "交通費" in unicodedata.normalize("NFKC", file_name or "")

@@ -78,6 +78,10 @@ from kintai_core import (
     recalculate_match_company_for_row,
     recalculate_match_person_for_row,
     rename_file_to_excluded,
+    rename_file_from_excluded,
+    list_excluded_files,
+    restored_file_name_from_excluded,
+    build_row_after_restore_without_analysis,
     save_company_aliases,
     _parse_filename_company_and_person,
     _is_billing_aggregated_marker,
@@ -538,10 +542,18 @@ class KintaiApp(tk.Frame):
         )
         self._load_btn.grid(row=0, column=9, sticky="w", padx=(8, 0))
 
+        self._restore_excluded_btn = ttk.Button(
+            ctrl,
+            text="削除データ復帰",
+            command=self._prompt_restore_excluded_files,
+            state=tk.DISABLED,
+        )
+        self._restore_excluded_btn.grid(row=0, column=10, sticky="w", padx=(8, 0))
+
         self._cancel_btn = ttk.Button(
             ctrl, text="中断", command=self._cancel_analysis, state=tk.DISABLED
         )
-        self._cancel_btn.grid(row=0, column=10, sticky="w", padx=(16, 0))
+        self._cancel_btn.grid(row=0, column=11, sticky="w", padx=(16, 0))
 
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
@@ -549,10 +561,10 @@ class KintaiApp(tk.Frame):
         # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
         # （環境によってフォントが少し太く、26文字だと末尾が欠けるケースがあったため更に増やす）
         ttk.Label(ctrl, textvariable=self._progress_var, width=30).grid(
-            row=0, column=11, sticky="w", padx=(16, 0)
+            row=0, column=12, sticky="w", padx=(16, 0)
         )
         # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
-        ctrl.columnconfigure(11, minsize=240)
+        ctrl.columnconfigure(12, minsize=240)
 
         self._status_label = ttk.Label(
             ctrl,
@@ -562,8 +574,8 @@ class KintaiApp(tk.Frame):
             wraplength=900,
             justify="left",
         )
-        self._status_label.grid(row=0, column=12, sticky="ew", padx=(12, 0))
-        ctrl.columnconfigure(12, weight=1)
+        self._status_label.grid(row=0, column=13, sticky="ew", padx=(12, 0))
+        ctrl.columnconfigure(13, weight=1)
 
         grid_frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         grid_frame.pack(fill=tk.BOTH, expand=True)
@@ -717,6 +729,12 @@ class KintaiApp(tk.Frame):
             state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED)
         )
         self._cancel_btn.configure(state=tk.DISABLED)
+        has_data_dir = (
+            self._data_dir is not None and self._data_dir.is_dir()
+        )
+        self._restore_excluded_btn.configure(
+            state=(tk.NORMAL if has_data_dir else tk.DISABLED)
+        )
         self._refresh_reanalysis_buttons_state()
 
     def _refresh_billing_buttons_state(self) -> None:
@@ -869,7 +887,7 @@ class KintaiApp(tk.Frame):
             f"{preview}\n\n"
             "グリッドから削除します。ファイル名の末尾に .bak を付け、"
             "再解析の対象外にします（例: 勤務表.pdf → 勤務表.pdf.bak）。\n"
-            "元に戻す場合は末尾の .bak を手動で削除してください。",
+            "元に戻す場合は「削除データ復帰」ボタンを使用してください。",
             parent=self._root,
         ):
             return
@@ -949,6 +967,220 @@ class KintaiApp(tk.Frame):
             )
         elif to_remove:
             messagebox.showinfo("行を削除", "\n".join(lines), parent=self._root)
+
+    def _grid_file_names_set(self) -> set[str]:
+        names: set[str] = set()
+        for iid in self._tree.get_children():
+            row = self._current_row_dict_from_iid(iid)
+            fn = self._file_name_from_row(row)
+            if fn:
+                names.add(fn)
+        return names
+
+    def _insert_minimal_restored_row(self, restored_path: Path) -> str:
+        """復帰直後のプレースホルダ行をグリッド末尾に追加し iid を返す。"""
+        row: dict[str, str] = {
+            "upload_ok": "",
+            "file_name": restored_path.name,
+            "resolved_path": str(restored_path.resolve()),
+            "analysis": "",
+        }
+        row["user_judgment_company"] = auto_judgment_symbol(row)
+        vals = self._grid_values_from_row(row)
+        iid = self._tree.insert("", tk.END, values=vals)
+        self._item_paths[iid] = row["resolved_path"]
+        self._sync_row_extra_from_row(iid, row)
+        self._assign_row_no_to_iid(iid)
+        return iid
+
+    def _prompt_restore_excluded_files(self) -> None:
+        if self._busy:
+            return
+        if self._data_dir is None or not self._data_dir.is_dir():
+            messagebox.showwarning(
+                "削除データ復帰",
+                "データフォルダを選択してください。",
+                parent=self._root,
+            )
+            return
+        bak_paths = list_excluded_files(self._data_dir)
+        if not bak_paths:
+            messagebox.showinfo(
+                "削除データ復帰",
+                "削除済みファイルはありません。",
+                parent=self._root,
+            )
+            return
+
+        top = tk.Toplevel(self._root)
+        top.title("削除データ復帰")
+        top.transient(self._root)
+        top.geometry("720x420")
+        top.minsize(480, 280)
+
+        outer = ttk.Frame(top, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text=(
+                "データフォルダ直下の .bak ファイルです。"
+                "復帰する行を選択してください（複数可）。"
+            ),
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        list_wrap = ttk.Frame(outer)
+        list_wrap.pack(fill=tk.BOTH, expand=True)
+        y_scroll = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL)
+        listbox = tk.Listbox(
+            list_wrap,
+            selectmode=tk.EXTENDED,
+            yscrollcommand=y_scroll.set,
+            height=14,
+        )
+        y_scroll.config(command=listbox.yview)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        display_names = [restored_file_name_from_excluded(p) for p in bak_paths]
+        for name in display_names:
+            listbox.insert(tk.END, name)
+
+        reanalyze_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            outer,
+            text="復帰後に再解析する",
+            variable=reanalyze_var,
+        ).pack(anchor="w", pady=(8, 0))
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill=tk.X, pady=(12, 0))
+
+        def on_cancel() -> None:
+            top.destroy()
+
+        def on_restore() -> None:
+            sel = list(listbox.curselection())
+            if not sel:
+                messagebox.showwarning(
+                    "削除データ復帰",
+                    "復帰するファイルを1件以上選択してください。",
+                    parent=top,
+                )
+                return
+            reanalyze = reanalyze_var.get()
+            if reanalyze and not self._analysis_prerequisites_met():
+                messagebox.showwarning(
+                    "削除データ復帰",
+                    "再解析するには、データフォルダと請求用ファイルの両方を"
+                    "選択してください。\n"
+                    "再解析しない場合はチェックを外してください。",
+                    parent=top,
+                )
+                return
+            chosen = [bak_paths[i] for i in sel]
+            top.destroy()
+            self._restore_excluded_files(chosen, reanalyze=reanalyze)
+
+        ttk.Button(btns, text="復帰", command=on_restore).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="キャンセル", command=on_cancel).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+        top.bind("<Escape>", lambda _e: on_cancel())
+        top.grab_set()
+        listbox.focus_set()
+
+    def _restore_excluded_files(
+        self, bak_paths: list[Path], *, reanalyze: bool
+    ) -> None:
+        if self._busy:
+            return
+        grid_names = self._grid_file_names_set()
+        restored_iids: dict[str, str] = {}
+        skipped_duplicate: list[str] = []
+        failed: list[str] = []
+        restored_count = 0
+
+        for bak_path in bak_paths:
+            restored_name = restored_file_name_from_excluded(bak_path)
+            if restored_name in grid_names:
+                skipped_duplicate.append(restored_name)
+                continue
+            try:
+                restored_path = rename_file_from_excluded(bak_path)
+            except (FileNotFoundError, FileExistsError, ValueError, OSError) as e:
+                failed.append(f"{bak_path.name}: {e}")
+                continue
+            iid = self._insert_minimal_restored_row(restored_path)
+            restored_iids[restored_name] = iid
+            grid_names.add(restored_name)
+            restored_count += 1
+
+        if restored_count:
+            self._renumber_grid_rows()
+            self._loaded_rows = self._current_grid_rows()
+
+        exp_y, exp_m = self._expected_year_month()
+
+        if restored_count and not reanalyze:
+            for fn, iid in restored_iids.items():
+                row = build_row_after_restore_without_analysis(
+                    Path(self._item_paths.get(iid, "")),
+                    company_aliases=self._company_aliases,
+                    expected_year=exp_y,
+                    expected_month=exp_m,
+                )
+                row["user_judgment_company"] = auto_judgment_symbol(row)
+                self._replace_row_with_result(iid, row)
+            self._loaded_rows = self._current_grid_rows()
+            ratio_text = self._company_match_ratio_text(self._loaded_rows)
+            self._status_var.set(
+                f"削除データ復帰完了: {restored_count} 行 / {ratio_text}"
+            )
+            self._refresh_reanalysis_buttons_state()
+            self._refresh_billing_buttons_state()
+
+        lines: list[str] = []
+        if restored_count:
+            lines.append(f"グリッドに復帰: {restored_count} 行")
+            lines.append("No を表示順に振り直しました。")
+        else:
+            lines.append("復帰できた行はありません。")
+        if skipped_duplicate:
+            lines.append(f"グリッドに同名あり（スキップ）: {len(skipped_duplicate)} 件")
+            for name in skipped_duplicate[:8]:
+                lines.append(f" ・{name}")
+            if len(skipped_duplicate) > 8:
+                lines.append(f"  ... 他 {len(skipped_duplicate) - 8} 件")
+        if failed:
+            lines.append(f"リネーム失敗: {len(failed)} 件")
+            for msg in failed[:8]:
+                lines.append(f" ・{msg}")
+            if len(failed) > 8:
+                lines.append(f"  ... 他 {len(failed) - 8} 件")
+
+        if reanalyze and restored_iids:
+            if lines:
+                messagebox.showinfo(
+                    "削除データ復帰",
+                    "\n".join(lines) + "\n\n再解析を開始します。",
+                    parent=self._root,
+                )
+            self._run_targeted_reanalysis(
+                restored_iids,
+                label="削除データ復帰",
+                complete_message=(
+                    "選択した削除データの復帰と再解析が完了しました。"
+                ),
+            )
+            return
+
+        if restored_count or skipped_duplicate or failed:
+            title = "削除データ復帰"
+            if failed and not restored_count:
+                messagebox.showwarning(title, "\n".join(lines), parent=self._root)
+            else:
+                messagebox.showinfo(title, "\n".join(lines), parent=self._root)
 
     def _create_billing_data(self) -> None:
         if self._busy:
@@ -2370,6 +2602,7 @@ class KintaiApp(tk.Frame):
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
+        self._restore_excluded_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
@@ -2500,6 +2733,7 @@ class KintaiApp(tk.Frame):
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
+        self._restore_excluded_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
@@ -3226,6 +3460,7 @@ class KintaiApp(tk.Frame):
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
+        self._restore_excluded_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
