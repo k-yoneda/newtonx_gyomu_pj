@@ -76,6 +76,7 @@ from kintai_core import (
     is_match_person_manual,
     match_person_symbol_for_row,
     recalculate_match_company_for_row,
+    recalculate_match_doc_type_for_row,
     recalculate_match_person_for_row,
     rename_file_to_excluded,
     rename_file_from_excluded,
@@ -87,6 +88,7 @@ from kintai_core import (
     _is_billing_aggregated_marker,
     _row_billing_update_hours_decimal,
     _row_billing_update_transport,
+    _normalize_billing_update_copy,
     _company_text_contains_seraku,
     _document_company_for_display,
     _is_valid_employee_no,
@@ -2017,6 +2019,9 @@ class KintaiApp(tk.Frame):
     def _total_hours_raw_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.TOTAL_HOURS_RAW_COL)
 
+    def _transport_expense_column_index(self) -> int:
+        return list(self._tree["columns"]).index(self.TRANSPORT_EXPENSE_COL)
+
     def _match_company_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.MATCH_COMPANY_COL)
 
@@ -2529,6 +2534,13 @@ class KintaiApp(tk.Frame):
             menu.add_command(
                 label="合計勤務時間（読取）を編集",
                 command=lambda: self._prompt_edit_total_hours_raw(rid),
+            )
+            menu.add_separator()
+
+        if cols[ci] == self.TRANSPORT_EXPENSE_COL:
+            menu.add_command(
+                label="交通費合計（読取）を編集",
+                command=lambda: self._prompt_edit_transport_expense_raw(rid),
             )
             menu.add_separator()
 
@@ -3189,6 +3201,65 @@ class KintaiApp(tk.Frame):
             row[self.TOTAL_HOURS_RAW_COL] = row["total_hours_raw"]
             row["total_hours_decimal"] = dec_str if dec_str else ""
             row[self.TOTAL_HOURS_DECIMAL_COL] = new_dec
+            self._recalculate_auto_judgment_for_row(rid, row)
+            top.destroy()
+
+        def on_cancel() -> None:
+            top.destroy()
+
+        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="キャンセル", command=on_cancel).pack(side=tk.RIGHT, padx=(0, 8))
+
+        top.bind("<Return>", lambda _e: on_ok())
+        top.bind("<Escape>", lambda _e: on_cancel())
+
+    def _prompt_edit_transport_expense_raw(self, rid: str) -> None:
+        """交通費合計（読取）を右クリックから編集し、更新用交通費合計も連動更新する。"""
+        try:
+            te_ci = self._transport_expense_column_index()
+        except ValueError:
+            return
+
+        vals = list(self._tree.item(rid, "values") or [])
+        cur = vals[te_ci] if te_ci < len(vals) else ""
+
+        top = tk.Toplevel(self)
+        top.title("交通費合計（読取）を編集")
+        top.transient(self)
+        top.grab_set()
+
+        ttk.Label(
+            top,
+            text=(
+                "交通費合計（読取）を入力してください。\n"
+                "例: 12,345円 / 0 / 5000\n"
+                "記載がない場合は（データなし）または（なし）。空欄は（なし）として保存します。\n"
+                "更新用交通費合計も同じ規則で自動反映します（更新用勤務時間は変更しません）。"
+            ),
+            justify="left",
+        ).pack(fill=tk.X, padx=10, pady=(10, 6))
+
+        var = tk.StringVar(value=str(cur))
+        ent = ttk.Entry(top, textvariable=var, width=28)
+        ent.pack(fill=tk.X, padx=10)
+        ent.focus_set()
+        ent.select_range(0, tk.END)
+
+        btns = ttk.Frame(top)
+        btns.pack(fill=tk.X, padx=10, pady=10)
+
+        def on_ok() -> None:
+            new_raw = (var.get() or "").strip()
+            stored = new_raw or "（なし）"
+            row = self._row_dict_to_core(self._current_row_dict_from_iid(rid))
+            row["transport_expense_raw"] = stored
+            row[self.TRANSPORT_EXPENSE_COL] = stored
+            transport_billing = _normalize_billing_update_copy(stored)
+            row["billing_update_transport"] = transport_billing
+            row[self.BILLING_UPDATE_TRANSPORT_COL] = transport_billing
+            mdt = recalculate_match_doc_type_for_row(row)
+            row["match_doc_type"] = mdt
+            row[self.MATCH_DOC_TYPE_COL] = mdt
             self._recalculate_auto_judgment_for_row(rid, row)
             top.destroy()
 
