@@ -38,7 +38,16 @@ TRANSPORT_EXPENSE_EXCEL_SHEET_NAME = "交通宿泊費清算書お客様先用"
 TRANSPORT_EXPENSE_LABEL_COL = 6  # F列: 「合計」ラベル
 TRANSPORT_EXPENSE_VALUE_COL = 7  # G列: 交通費合計の値
 TRANSPORT_EXPENSE_LABEL_TEXT = "合計"
-SUMMARY_TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
+SUMMARY_TRANSPORT_EXPENSE_COL = "(読取)交通費合計"
+SUMMARY_TOTAL_HOURS_RAW_COL = "(読取)合計勤務時間"
+# Treeview 列 ID は一意のため内部名を使い、見出しは AI_READ_STATE_COLUMN_HEADING
+SUMMARY_LABOR_AI_READ_STATE_COL = "AI読取状態［勤務］"
+SUMMARY_TRANSPORT_AI_READ_STATE_COL = "AI読取状態［交通費］"
+AI_READ_STATE_COLUMN_HEADING = "AI読取状態"
+AI_READ_STATE_LABEL_NO_DATA = "データなし"
+AI_READ_STATE_LABEL_ABNORMAL = "データ異常"
+AI_READ_STATE_LABEL_ZERO = "ゼロ"
+AI_READ_STATE_LABEL_VALUE = "値あり"
 
 # アップロード: 初回試行後、最大 UPLOAD_MAX_RETRIES 回まで再試行（合計で最大 1 + UPLOAD_MAX_RETRIES 回）
 UPLOAD_MAX_RETRIES = 3
@@ -55,16 +64,16 @@ SUMMARY_TARGET_SHEET_COL = "対象シート有無"
 TARGET_FILE_NAME_COL = "対象ファイル名（左クリックで表示）"
 LEGACY_TARGET_FILE_NAME_COL = "対象ファイル名"
 LEGACY_FILE_NAME_COL = "画像ファイル名"
-SUMMARY_COMPANY_COL = "会社名（読取）"
+SUMMARY_COMPANY_COL = "(読取)会社名"
 SUMMARY_MATCH_COMPANY_COL = "会社名比較"
 LEGACY_COMPANY_READ_LONG_COL = "会社名（読み取）"
 LEGACY_COMPANY_COL = "会社名1"
 LEGACY_COMPANY_NAME_COL = "会社名"
-SUMMARY_YEAR_COL = "年（読取）"
-SUMMARY_MONTH_COL = "月（読取）"
+SUMMARY_YEAR_COL = "(読取)年"
+SUMMARY_MONTH_COL = "(読取)月"
 LEGACY_YEAR_COL = "年"
 LEGACY_MONTH_COL = "月"
-SUMMARY_PERSON_COL = "氏名（読取）"
+SUMMARY_PERSON_COL = "(読取)氏名"
 SUMMARY_MATCH_PERSON_COL = "氏名比較"
 SUMMARY_MATCH_DOC_TYPE_COL = "種別照合"
 LEGACY_PERSON_COL = "氏名"
@@ -94,10 +103,9 @@ BILLING_TS_COL_NORMAL_HOURS = 8  # H列: 通常請求時間
 BILLING_TS_COL_TRANSPORT_AMOUNT = 15  # O列: 旅費交通費請求金額
 
 COMPANY_ALIAS_TABLE_FILENAME = "会社名対応表.json"
+USER_SETTINGS_FILENAME = "kintai_user_settings.json"
 
-#TARGET_ASSISTANT_NAME = "GPT-5.2(高性能)"
-TARGET_ASSISTANT_NAME = "GPT-5.4-mini(高速)"
-#TARGET_ASSISTANT_NAME = "Gemini 3.1 Pro(高性能)"
+TARGET_ASSISTANT_NAME = "Gemini 3.1 Pro(高性能)"
 
 def _process_sse_response_no_print(self, response) -> str:
     full_response = ""
@@ -2083,6 +2091,36 @@ def default_company_alias_table_path(project_root: Path | None = None) -> Path:
     return root / COMPANY_ALIAS_TABLE_FILENAME
 
 
+def default_user_settings_path(project_root: Path | None = None) -> Path:
+    """ユーザー設定 JSON の既定パス（プロジェクト直下）。"""
+    root = project_root if project_root is not None else Path(__file__).resolve().parent.parent
+    return root / USER_SETTINGS_FILENAME
+
+
+def load_user_settings(path: Path) -> dict:
+    """ユーザー設定を読み込む。失敗時は空 dict。"""
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_last_assistant_name(path: Path, name: str) -> None:
+    """前回選択したアシスタント名を保存する（他キーは維持）。"""
+    t = (name or "").strip()
+    if not t:
+        return
+    data = load_user_settings(path)
+    data["last_assistant_name"] = t
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def company_alias_lookup_key(file_co: str, doc_co: str) -> tuple[str, str]:
     """対応表の照合キー（正規化後のファイル名会社・文書会社）。"""
     return (_company_core_for_match(file_co), _company_core_for_match(doc_co))
@@ -2649,6 +2687,7 @@ def _enrich_with_match_scores(
         "（なし）",
     ):
         row["transport_expense_raw"] = te_raw
+    sync_row_ai_read_states(row)
     _apply_parsed_auto_judgment(row)
 
 
@@ -2701,12 +2740,20 @@ SUMMARY_MD_HEADER = (
     f"{SUMMARY_YEAR_COL} | {SUMMARY_MONTH_COL} | "
     f"{SUMMARY_COMPANY_COL} | {SUMMARY_MATCH_COMPANY_COL} | {SUMMARY_PERSON_COL} | {SUMMARY_MATCH_PERSON_COL} | {SUMMARY_MATCH_DOC_TYPE_COL} | {SUMMARY_EMPLOYEE_NO_COL} | "
     f"{SUMMARY_BILLING_UPDATE_HOURS_COL} | "
-    "合計勤務時間（10進） | 合計勤務時間（読取） | "
+    f"合計勤務時間（10進） | {SUMMARY_TOTAL_HOURS_RAW_COL} | "
+    f"{SUMMARY_LABOR_AI_READ_STATE_COL} | "
     f"{SUMMARY_BILLING_UPDATE_TRANSPORT_COL} | {SUMMARY_TRANSPORT_EXPENSE_COL} | "
+    f"{SUMMARY_TRANSPORT_AI_READ_STATE_COL} | "
     "押印有無 |"
 )
 
 # 旧UI列名（JSON読み込み互換）
+LEGACY_SUFFIX_READ_COMPANY_COL = "会社名（読取）"
+LEGACY_SUFFIX_READ_YEAR_COL = "年（読取）"
+LEGACY_SUFFIX_READ_MONTH_COL = "月（読取）"
+LEGACY_SUFFIX_READ_PERSON_COL = "氏名（読取）"
+LEGACY_SUFFIX_READ_TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
+LEGACY_SUFFIX_READ_TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
 LEGACY_MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
 MATCH_COMPANY_ALIAS_OK_SYMBOL = "〇（対応表）"
 
@@ -2790,6 +2837,7 @@ def auto_judgment_symbol(row: dict[str, str]) -> str:
             "name_person_from_doc": (
                 (row.get("name_person_from_doc") or "").strip()
                 or (row.get(SUMMARY_PERSON_COL) or "").strip()
+                or (row.get(LEGACY_SUFFIX_READ_PERSON_COL) or "").strip()
                 or (row.get(LEGACY_PERSON_COL) or "").strip()
             ),
             "file_name": (
@@ -2803,12 +2851,14 @@ def auto_judgment_symbol(row: dict[str, str]) -> str:
             "year": (
                 row.get("year")
                 or row.get(SUMMARY_YEAR_COL)
+                or row.get(LEGACY_SUFFIX_READ_YEAR_COL)
                 or row.get(LEGACY_YEAR_COL)
                 or ""
             ).strip(),
             "month": (
                 row.get("month")
                 or row.get(SUMMARY_MONTH_COL)
+                or row.get(LEGACY_SUFFIX_READ_MONTH_COL)
                 or row.get(LEGACY_MONTH_COL)
                 or ""
             ).strip(),
@@ -2920,7 +2970,8 @@ def _is_billing_aggregated_marker(value: str) -> bool:
 def _row_total_hours_raw(row: dict[str, str]) -> str:
     return (
         row.get("total_hours_raw")
-        or row.get("合計勤務時間（読取）")
+        or row.get(SUMMARY_TOTAL_HOURS_RAW_COL)
+        or row.get(LEGACY_SUFFIX_READ_TOTAL_HOURS_RAW_COL)
         or ""
     ).strip()
 
@@ -3014,6 +3065,7 @@ def _row_transport_expense_raw(row: dict[str, str]) -> str:
     return (
         row.get("transport_expense_raw")
         or row.get(SUMMARY_TRANSPORT_EXPENSE_COL)
+        or row.get(LEGACY_SUFFIX_READ_TRANSPORT_EXPENSE_COL)
         or ""
     ).strip()
 
@@ -3122,6 +3174,99 @@ def _transport_read_value_usable(raw: str) -> bool:
         return False
     _, ok = _transport_amount_for_excel(t)
     return ok
+
+
+_AI_READ_NO_DATA_MARKERS = frozenset(
+    {
+        "（データなし）",
+        "(データなし)",
+        "データなし",
+        "（なし）",
+        "(なし)",
+        "不明",
+        "（不明）",
+        "(不明)",
+    }
+)
+
+
+def _labor_hours_float(raw: str, decimal: str) -> float | None:
+    dec = (decimal or "").strip()
+    if dec and _is_valid_total_hours_decimal(dec):
+        try:
+            return float(dec)
+        except ValueError:
+            pass
+    return _work_hours_raw_to_hours_float(raw)
+
+
+def labor_ai_read_state_label(raw: str, decimal: str) -> str:
+    """合計勤務時間（読取）の AI読取状態ラベル。"""
+    t = unicodedata.normalize("NFKC", (raw or "").strip())
+    if not t or t in _AI_READ_NO_DATA_MARKERS:
+        return AI_READ_STATE_LABEL_NO_DATA
+    if t == "（データ異常）":
+        return AI_READ_STATE_LABEL_ABNORMAL
+    hours = _labor_hours_float(raw, decimal)
+    if hours is not None:
+        if abs(hours) < 1e-9:
+            return AI_READ_STATE_LABEL_ZERO
+        return AI_READ_STATE_LABEL_VALUE
+    return AI_READ_STATE_LABEL_ABNORMAL
+
+
+def transport_ai_read_state_label(raw: str, file_name: str) -> str:
+    """交通費合計（読取）の AI読取状態ラベル。"""
+    t = unicodedata.normalize("NFKC", (raw or "").strip())
+    if not t or t in _AI_READ_NO_DATA_MARKERS:
+        return AI_READ_STATE_LABEL_NO_DATA
+    if t == "（データ異常）":
+        return AI_READ_STATE_LABEL_ABNORMAL
+    if t in ("不明", "（不明）", "(不明)") and _filename_has_transport_expense_marker(
+        file_name
+    ):
+        return AI_READ_STATE_LABEL_ABNORMAL
+    kind, amount = _transport_for_billing_excel(raw)
+    if kind == "invalid":
+        return AI_READ_STATE_LABEL_ABNORMAL
+    if kind == "empty":
+        return AI_READ_STATE_LABEL_NO_DATA
+    if kind == "amount":
+        if amount is not None and abs(amount) < 1e-9:
+            return AI_READ_STATE_LABEL_ZERO
+        return AI_READ_STATE_LABEL_VALUE
+    return AI_READ_STATE_LABEL_ABNORMAL
+
+
+def sync_row_ai_read_states(row: dict[str, str]) -> None:
+    """読取列の正規化と AI読取状態列を更新する（in-place）。"""
+    is_excel = _row_is_excel(row)
+    fn = _row_file_name(row)
+
+    raw_l = _row_total_hours_raw(row)
+    dec_l = _row_total_hours_decimal(row)
+    label_l = labor_ai_read_state_label(raw_l, dec_l)
+    if label_l == AI_READ_STATE_LABEL_NO_DATA and not is_excel:
+        row["total_hours_raw"] = "（データなし）"
+    elif label_l == AI_READ_STATE_LABEL_ABNORMAL and not is_excel:
+        if not (raw_l or "").strip() or unicodedata.normalize(
+            "NFKC", (raw_l or "").strip()
+        ) in _AI_READ_NO_DATA_MARKERS:
+            row["total_hours_raw"] = (raw_l or "").strip() or "（データ異常）"
+    row["labor_ai_read_state"] = label_l
+    row[SUMMARY_LABOR_AI_READ_STATE_COL] = label_l
+
+    raw_t = _row_transport_expense_raw(row)
+    label_t = transport_ai_read_state_label(raw_t, fn)
+    if label_t == AI_READ_STATE_LABEL_NO_DATA and not is_excel:
+        row["transport_expense_raw"] = "（データなし）"
+        row[SUMMARY_TRANSPORT_EXPENSE_COL] = "（データなし）"
+    elif label_t == AI_READ_STATE_LABEL_ABNORMAL and not is_excel:
+        if not (raw_t or "").strip():
+            row["transport_expense_raw"] = "（データ異常）"
+            row[SUMMARY_TRANSPORT_EXPENSE_COL] = "（データ異常）"
+    row["transport_ai_read_state"] = label_t
+    row[SUMMARY_TRANSPORT_AI_READ_STATE_COL] = label_t
 
 
 def _row_has_kintai_data(row: dict[str, str]) -> bool:
@@ -3615,11 +3760,22 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
             _decimal_for_table_display((r.get("total_hours_decimal") or "").strip())
         ) if (r.get("total_hours_decimal") or "").strip() else ("" if is_excel else "（なし）"))
     )
+    sync_row_ai_read_states(r)
     lr = _escape_md_table_cell(
         ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
     )
+    las = _escape_md_table_cell(
+        (r.get("labor_ai_read_state") or r.get(SUMMARY_LABOR_AI_READ_STATE_COL) or "")
+    )
     but = _escape_md_table_cell(_row_billing_update_transport(r))
     te = _escape_md_table_cell((r.get("transport_expense_raw") or "").strip())
+    tas = _escape_md_table_cell(
+        (
+            r.get("transport_ai_read_state")
+            or r.get(SUMMARY_TRANSPORT_AI_READ_STATE_COL)
+            or ""
+        )
+    )
     mc = _escape_md_table_cell((r.get("match_company") or ("" if is_excel else "✖")))
     se = _escape_md_table_cell(
         "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
@@ -3627,7 +3783,8 @@ def _one_summary_data_line(r: dict[str, str], *, row_no: int | None = None) -> s
     no = _escape_md_table_cell(str(row_no) if row_no is not None else "")
     return (
         f"| {no} | {u_sym} | {ts} | {fn} | {uj} | {bur} | {aj} | {yy} | {mm} | "
-        f"{co1} | {mc} | {pe} | {mpe} | {mdt} | {emp} | {buh} | {th} | {lr} | {but} | {te} | {se} |"
+        f"{co1} | {mc} | {pe} | {mpe} | {mdt} | {emp} | {buh} | {th} | {lr} | {las} | "
+        f"{but} | {te} | {tas} | {se} |"
     )
 
 
@@ -3707,6 +3864,7 @@ def row_display_values(
     row_no: int | None = None,
 ) -> tuple[str, ...]:
     """グリッド表示用（Markdown エスケープなし）。 _one_summary_data_line と同一ルール。"""
+    sync_row_ai_read_states(r)
     is_excel = _row_is_excel(r)
     up_sym = _upload_ok_symbol(r)
     ts = _target_sheet_ok_symbol(r)
@@ -3748,8 +3906,12 @@ def row_display_values(
         else ("" if is_excel else "（なし）")
     )
     lr = ((r.get("total_hours_raw") or "").strip() or ("" if is_excel else "（なし）"))
+    las = (r.get("labor_ai_read_state") or r.get(SUMMARY_LABOR_AI_READ_STATE_COL) or "")
     but = _row_billing_update_transport(r)
     te = (r.get("transport_expense_raw") or "").strip()
+    tas = (
+        r.get("transport_ai_read_state") or r.get(SUMMARY_TRANSPORT_AI_READ_STATE_COL) or ""
+    )
     mc = (r.get("match_company") or ("" if is_excel else "✖"))
     se = "" if is_excel else ((r.get("seal_in_doc") or "").strip() or "不明")
     no = str(row_no) if row_no is not None else ""
@@ -3772,8 +3934,10 @@ def row_display_values(
         buh,
         th,
         lr,
+        las,
         but,
         te,
+        tas,
         se,
     )
 

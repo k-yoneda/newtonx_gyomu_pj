@@ -32,12 +32,20 @@ from kintai_core import (
     LEGACY_PERSON_COL,
     LEGACY_TARGET_FILE_NAME_COL,
     LEGACY_YEAR_COL,
+    LEGACY_SUFFIX_READ_YEAR_COL,
+    LEGACY_SUFFIX_READ_MONTH_COL,
+    LEGACY_SUFFIX_READ_COMPANY_COL,
+    LEGACY_SUFFIX_READ_PERSON_COL,
+    LEGACY_SUFFIX_READ_TOTAL_HOURS_RAW_COL,
+    LEGACY_SUFFIX_READ_TRANSPORT_EXPENSE_COL,
     PARALLEL_WORKERS_MAX,
     LEGACY_USER_JUDGMENT_COL,
     LEGACY_BILLING_UPDATE_HOURS_COL,
     SUMMARY_BILLING_UPDATE_RESULT_COL,
     SUMMARY_BILLING_UPDATE_HOURS_COL,
     SUMMARY_BILLING_UPDATE_TRANSPORT_COL,
+    SUMMARY_TOTAL_HOURS_RAW_COL,
+    SUMMARY_TRANSPORT_EXPENSE_COL,
     SUMMARY_COMPANY_COL,
     SUMMARY_EMPLOYEE_NO_COL,
     SUMMARY_FINAL_JUDGMENT_COL,
@@ -60,6 +68,10 @@ from kintai_core import (
     clear_billing_update_hours_column,
     populate_billing_update_columns,
     row_display_values,
+    sync_row_ai_read_states,
+    SUMMARY_LABOR_AI_READ_STATE_COL,
+    SUMMARY_TRANSPORT_AI_READ_STATE_COL,
+    AI_READ_STATE_COLUMN_HEADING,
     run_analysis,
     summary_header_cells,
     BillingTsWriteItem,
@@ -71,6 +83,9 @@ from kintai_core import (
     add_company_alias,
     company_alias_lookup_key,
     default_company_alias_table_path,
+    default_user_settings_path,
+    load_user_settings,
+    save_last_assistant_name,
     load_company_aliases,
     is_match_company_ok_for_ratio,
     is_match_person_manual,
@@ -236,8 +251,10 @@ class KintaiApp(tk.Frame):
     MATCH_PERSON_COL = SUMMARY_MATCH_PERSON_COL
     MATCH_DOC_TYPE_COL = SUMMARY_MATCH_DOC_TYPE_COL
     TOTAL_HOURS_DECIMAL_COL = "合計勤務時間（10進）"
-    TOTAL_HOURS_RAW_COL = "合計勤務時間（読取）"
-    TRANSPORT_EXPENSE_COL = "交通費合計（読取）"
+    TOTAL_HOURS_RAW_COL = SUMMARY_TOTAL_HOURS_RAW_COL
+    TRANSPORT_EXPENSE_COL = SUMMARY_TRANSPORT_EXPENSE_COL
+    LABOR_AI_READ_STATE_COL = SUMMARY_LABOR_AI_READ_STATE_COL
+    TRANSPORT_AI_READ_STATE_COL = SUMMARY_TRANSPORT_AI_READ_STATE_COL
     MATCH_COMPANY_COL = "会社名比較"
     LEGACY_MATCH_COMPANY_COL = "会社名比較（ファイル名✖文書）"
     COMPANY_COL = SUMMARY_COMPANY_COL
@@ -263,6 +280,8 @@ class KintaiApp(tk.Frame):
         MATCH_COMPANY_COL: 100,
         MATCH_PERSON_COL: 72,
         MATCH_DOC_TYPE_COL: 72,
+        LABOR_AI_READ_STATE_COL: 88,
+        TRANSPORT_AI_READ_STATE_COL: 88,
         "押印有無": 72,
     }
     _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
@@ -292,11 +311,8 @@ class KintaiApp(tk.Frame):
             for a in self._assistants
             if str(a.get("name") or "").strip()
         ]
-        default_name = (
-            TARGET_ASSISTANT_NAME
-            if TARGET_ASSISTANT_NAME in assistant_names
-            else (assistant_names[0] if assistant_names else "")
-        )
+        self._user_settings_path = default_user_settings_path(_ROOT)
+        default_name = self._initial_assistant_name(assistant_names)
         self._assistant_var = tk.StringVar(value=default_name)
         self._workers_var = tk.StringVar(value=str(DEFAULT_PARALLEL_ANALYSIS_CHATS))
         self._data_dir: Path | None = None
@@ -335,6 +351,45 @@ class KintaiApp(tk.Frame):
             return tkfont.Font(root=self._root, font=spec)
         return tkfont.nametofont("TkDefaultFont")
 
+    def _tree_body_font(self) -> tkfont.Font:
+        spec = ttk.Style().lookup("Treeview", "font")
+        if spec:
+            return tkfont.Font(root=self._root, font=spec)
+        return tkfont.nametofont("TkDefaultFont")
+
+    def _column_width_for_cell_text(
+        self, text: str, *, font: tkfont.Font | None = None
+    ) -> int:
+        """セル文字列の描画幅に合わせた列幅（px）を返す（見出しは含めない）。"""
+        f = font or self._tree_body_font()
+        padding_px = 20
+        min_px = 48
+        return max(f.measure(str(text or "")) + padding_px, min_px)
+
+    def _autofit_grid_column_widths(self) -> None:
+        """表示中のデータ行に合わせて各列幅を調整する（見出し幅は使わない）。"""
+        cols = list(self._tree["columns"])
+        if not cols:
+            return
+        font = self._tree_body_font()
+        max_px = [48] * len(cols)
+        for iid in self._tree.get_children():
+            vals = tuple(self._tree.item(iid, "values") or ())
+            for i, _h in enumerate(cols):
+                cell = vals[i] if i < len(vals) else ""
+                max_px[i] = max(
+                    max_px[i], self._column_width_for_cell_text(cell, font=font)
+                )
+        for h, w_px in zip(cols, max_px, strict=True):
+            self._tree.column(h, width=w_px, minwidth=48, stretch=tk.NO)
+        self.update_idletasks()
+        if self._grid_y_scroll is not None:
+            new_w = self._window_width_for_columns(max_px, y_scroll=self._grid_y_scroll)
+            h = self._root.winfo_height()
+            if h <= 1:
+                h = 680
+            self._root.geometry(f"{new_w}x{h}")
+
     def _column_width_for_heading(
         self, heading: str, *, font: tkfont.Font | None = None
     ) -> int:
@@ -365,6 +420,16 @@ class KintaiApp(tk.Frame):
         except (TypeError, ValueError):
             nw = DEFAULT_PARALLEL_ANALYSIS_CHATS
         return max(1, min(nw, PARALLEL_WORKERS_MAX))
+
+    @staticmethod
+    def _initial_assistant_name(assistant_names: list[str]) -> str:
+        path = default_user_settings_path(_ROOT)
+        saved = (load_user_settings(path).get("last_assistant_name") or "").strip()
+        if saved and saved in assistant_names:
+            return saved
+        if TARGET_ASSISTANT_NAME in assistant_names:
+            return TARGET_ASSISTANT_NAME
+        return assistant_names[0] if assistant_names else ""
 
     def _assistant_uid_for_name(self, name: str) -> str:
         selected_name = (name or "").strip()
@@ -579,6 +644,12 @@ class KintaiApp(tk.Frame):
         )
         self._restore_excluded_btn.pack(side=tk.LEFT, padx=(4, 0))
 
+        ttk.Button(
+            data_lf,
+            text="グリッド幅調整",
+            command=self._autofit_grid_column_widths,
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
 
@@ -604,6 +675,7 @@ class KintaiApp(tk.Frame):
         headings = summary_header_cells()
         self._tree_column_headings = headings
         y_scroll = ttk.Scrollbar(grid_frame)
+        self._grid_y_scroll = y_scroll
         x_scroll = ttk.Scrollbar(grid_frame, orient=tk.HORIZONTAL)
 
         heading_font = self._tree_heading_font()
@@ -633,7 +705,7 @@ class KintaiApp(tk.Frame):
             )
             self._tree.heading(
                 h,
-                text=h,
+                text=self._column_heading_display_text(h),
                 anchor="w",
                 command=lambda col=h: self._sort_grid_by_column(col),
             )
@@ -1626,9 +1698,17 @@ class KintaiApp(tk.Frame):
                     pass
         return (1, t.casefold())
 
+    def _column_heading_display_text(self, column_id: str) -> str:
+        if column_id in (
+            self.LABOR_AI_READ_STATE_COL,
+            self.TRANSPORT_AI_READ_STATE_COL,
+        ):
+            return AI_READ_STATE_COLUMN_HEADING
+        return column_id
+
     def _update_column_heading_labels(self) -> None:
         for h in self._tree_column_headings:
-            text = h
+            text = self._column_heading_display_text(h)
             if h == self._sort_column:
                 text += " ▲" if not self._sort_reverse else " ▼"
             try:
@@ -1784,8 +1864,10 @@ class KintaiApp(tk.Frame):
             (LEGACY_BILLING_UPDATE_HOURS_COL, "billing_update_hours_decimal"),
             (self.TOTAL_HOURS_DECIMAL_COL, "total_hours_decimal"),
             (self.TOTAL_HOURS_RAW_COL, "total_hours_raw"),
+            (self.LABOR_AI_READ_STATE_COL, "labor_ai_read_state"),
             (self.BILLING_UPDATE_TRANSPORT_COL, "billing_update_transport"),
             (self.TRANSPORT_EXPENSE_COL, "transport_expense_raw"),
+            (self.TRANSPORT_AI_READ_STATE_COL, "transport_ai_read_state"),
             (self.MATCH_COMPANY_COL, "match_company"),
             ("押印有無", "seal_in_doc"),
         )
@@ -1800,6 +1882,7 @@ class KintaiApp(tk.Frame):
                 else:
                     val = str(
                         row.get(self.YEAR_COL)
+                        or row.get(LEGACY_SUFFIX_READ_YEAR_COL)
                         or row.get(self.LEGACY_YEAR_COL)
                         or self._year_var.get()
                         or ""
@@ -1810,6 +1893,7 @@ class KintaiApp(tk.Frame):
                 else:
                     val = str(
                         row.get(self.MONTH_COL)
+                        or row.get(LEGACY_SUFFIX_READ_MONTH_COL)
                         or row.get(self.LEGACY_MONTH_COL)
                         or self._month_var.get()
                         or ""
@@ -1838,6 +1922,7 @@ class KintaiApp(tk.Frame):
                 val = _document_company_for_display(
                     str(
                         row.get(self.COMPANY_COL)
+                        or row.get(LEGACY_SUFFIX_READ_COMPANY_COL)
                         or row.get(self.LEGACY_COMPANY_READ_LONG_COL)
                         or row.get(self.LEGACY_COMPANY_NAME_COL)
                         or row.get(self.LEGACY_COMPANY_COL)
@@ -1848,8 +1933,23 @@ class KintaiApp(tk.Frame):
             elif core_key == "name_person_from_doc":
                 val = str(
                     row.get(self.PERSON_COL)
+                    or row.get(LEGACY_SUFFIX_READ_PERSON_COL)
                     or row.get(self.LEGACY_PERSON_COL)
                     or row.get(core_key)
+                    or ""
+                ).strip()
+            elif core_key == "total_hours_raw":
+                val = str(
+                    row.get("total_hours_raw")
+                    or row.get(self.TOTAL_HOURS_RAW_COL)
+                    or row.get(LEGACY_SUFFIX_READ_TOTAL_HOURS_RAW_COL)
+                    or ""
+                ).strip()
+            elif core_key == "transport_expense_raw":
+                val = str(
+                    row.get("transport_expense_raw")
+                    or row.get(self.TRANSPORT_EXPENSE_COL)
+                    or row.get(LEGACY_SUFFIX_READ_TRANSPORT_EXPENSE_COL)
                     or ""
                 ).strip()
             elif core_key == "employee_no":
@@ -2483,6 +2583,7 @@ class KintaiApp(tk.Frame):
             or core.get(self.MATCH_DOC_TYPE_COL)
             or ""
         )
+        sync_row_ai_read_states(core)
         self._replace_row_with_result(
             rid, core, sync_user_judgment_to_auto=True
         )
@@ -2532,14 +2633,14 @@ class KintaiApp(tk.Frame):
         # 合計勤務時間（読取）列: 右クリックで入力し、10進列も更新
         if cols[ci] == self.TOTAL_HOURS_RAW_COL:
             menu.add_command(
-                label="合計勤務時間（読取）を編集",
+                label=f"{self.TOTAL_HOURS_RAW_COL}を編集",
                 command=lambda: self._prompt_edit_total_hours_raw(rid),
             )
             menu.add_separator()
 
         if cols[ci] == self.TRANSPORT_EXPENSE_COL:
             menu.add_command(
-                label="交通費合計（読取）を編集",
+                label=f"{self.TRANSPORT_EXPENSE_COL}を編集",
                 command=lambda: self._prompt_edit_transport_expense_raw(rid),
             )
             menu.add_separator()
@@ -3167,16 +3268,17 @@ class KintaiApp(tk.Frame):
         cur = vals[raw_ci] if raw_ci < len(vals) else ""
 
         top = tk.Toplevel(self)
-        top.title("合計勤務時間（読取）を編集")
+        top.title(f"{self.TOTAL_HOURS_RAW_COL}を編集")
         top.transient(self)
         top.grab_set()
 
         ttk.Label(
             top,
             text=(
-                "合計勤務時間（読取）を入力してください。\n"
-                "例: 8:20 / 8時間20分 / 8.20 / 101_10H / 86.17H\n"
-                "入力後、同じ規則で10進数へ変換して右列へ反映します。"
+                f"{self.TOTAL_HOURS_RAW_COL}を入力してください。\n"
+                "例: 8:20 / 8時間20分 / 8.20 / 101_10H / 86.17H / 0 / 0時間\n"
+                "空欄は（データなし）として保存します（AI読取状態: データなし）。\n"
+                "入力後、10進列・AI読取状態を同じ規則で自動更新します。"
             ),
             justify="left",
         ).pack(fill=tk.X, padx=10, pady=(10, 6))
@@ -3197,7 +3299,7 @@ class KintaiApp(tk.Frame):
                 _decimal_for_table_display(dec_str) if dec_str else "（なし）"
             )
             row = self._row_dict_to_core(self._current_row_dict_from_iid(rid))
-            row["total_hours_raw"] = new_raw or "（なし）"
+            row["total_hours_raw"] = new_raw or "（データなし）"
             row[self.TOTAL_HOURS_RAW_COL] = row["total_hours_raw"]
             row["total_hours_decimal"] = dec_str if dec_str else ""
             row[self.TOTAL_HOURS_DECIMAL_COL] = new_dec
@@ -3224,17 +3326,19 @@ class KintaiApp(tk.Frame):
         cur = vals[te_ci] if te_ci < len(vals) else ""
 
         top = tk.Toplevel(self)
-        top.title("交通費合計（読取）を編集")
+        top.title(f"{self.TRANSPORT_EXPENSE_COL}を編集")
         top.transient(self)
         top.grab_set()
 
         ttk.Label(
             top,
             text=(
-                "交通費合計（読取）を入力してください。\n"
-                "例: 12,345円 / 0 / 5000\n"
-                "記載がない場合は（データなし）または（なし）。空欄は（なし）として保存します。\n"
-                "更新用交通費合計も同じ規則で自動反映します（更新用勤務時間は変更しません）。"
+                f"{self.TRANSPORT_EXPENSE_COL}を入力してください。\n"
+                "例: 12,345円 / 5000 / 0 / 0円\n"
+                "記載がない場合は（データなし）と入力するか、空欄のまま OK してください。\n"
+                "（保存時は（データなし）、AI読取状態: データなし）。\n"
+                "0・0円はゼロとして扱います。更新用交通費合計・AI読取状態を自動反映します"
+                "（更新用勤務時間は変更しません）。"
             ),
             justify="left",
         ).pack(fill=tk.X, padx=10, pady=(10, 6))
@@ -3250,7 +3354,7 @@ class KintaiApp(tk.Frame):
 
         def on_ok() -> None:
             new_raw = (var.get() or "").strip()
-            stored = new_raw or "（なし）"
+            stored = new_raw or "（データなし）"
             row = self._row_dict_to_core(self._current_row_dict_from_iid(rid))
             row["transport_expense_raw"] = stored
             row[self.TRANSPORT_EXPENSE_COL] = stored
@@ -3535,6 +3639,9 @@ class KintaiApp(tk.Frame):
                     messagebox.showerror("保存失敗", str(e))
                     return
         self._close_row_file()
+        save_last_assistant_name(
+            self._user_settings_path, (self._assistant_var.get() or "").strip()
+        )
         self._root.destroy()
 
     def _confirm_clear_grid_for_new_analysis(self) -> bool:
