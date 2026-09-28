@@ -474,108 +474,123 @@ class KintaiApp(tk.Frame):
         ctrl = ttk.Frame(self, padding=(8, 0, 8, 8))
         ctrl.pack(fill=tk.X)
 
+        analysis_lf = ttk.LabelFrame(ctrl, text="解析", padding=(6, 4))
+        analysis_lf.pack(side=tk.LEFT, anchor="n", padx=(0, 8))
+
         self._new_btn = ttk.Button(
-            ctrl, text="新規解析", command=self._start_new_analysis, state=tk.DISABLED
+            analysis_lf,
+            text="新規解析",
+            command=self._start_new_analysis,
+            state=tk.DISABLED,
         )
-        self._new_btn.grid(row=0, column=0, sticky="w")
+        self._new_btn.pack(side=tk.LEFT)
 
         self._new_plus_error_btn = ttk.Button(
-            ctrl,
+            analysis_lf,
             text="新規解析＋エラー再解析",
             command=self._start_new_analysis_then_error_reanalysis,
             state=tk.DISABLED,
         )
-        self._new_plus_error_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self._new_plus_error_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self._cont_btn = ttk.Button(
-            ctrl, text="追加継続解析", command=self._start_continue_analysis, state=tk.DISABLED
+            analysis_lf,
+            text="追加継続解析",
+            command=self._start_continue_analysis,
+            state=tk.DISABLED,
         )
-        self._cont_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self._cont_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self._selected_reanalysis_btn = ttk.Button(
-            ctrl,
+            analysis_lf,
             text="選択行解析",
             command=self._start_selected_rows_reanalysis,
             state=tk.DISABLED,
         )
-        self._selected_reanalysis_btn.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self._selected_reanalysis_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self._error_reanalysis_btn = ttk.Button(
-            ctrl,
+            analysis_lf,
             text="エラー再解析",
             command=self._start_error_reanalysis,
             state=tk.DISABLED,
         )
-        self._error_reanalysis_btn.grid(row=0, column=4, sticky="w", padx=(8, 0))
+        self._error_reanalysis_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        self._cancel_btn = ttk.Button(
+            analysis_lf,
+            text="中断",
+            command=self._cancel_analysis,
+            state=tk.DISABLED,
+        )
+        self._cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        billing_lf = ttk.LabelFrame(ctrl, text="請求", padding=(6, 4))
+        billing_lf.pack(side=tk.LEFT, anchor="n", padx=(0, 8))
 
         self._billing_prepare_btn = ttk.Button(
-            ctrl,
+            billing_lf,
             text="請求データ作成",
             command=self._create_billing_data,
             state=tk.DISABLED,
         )
-        self._billing_prepare_btn.grid(row=0, column=5, sticky="w", padx=(8, 0))
+        self._billing_prepare_btn.pack(side=tk.LEFT)
 
         self._billing_delete_btn = ttk.Button(
-            ctrl,
+            billing_lf,
             text="請求データ削除",
             command=self._delete_billing_data,
             state=tk.DISABLED,
         )
-        self._billing_delete_btn.grid(row=0, column=6, sticky="w", padx=(8, 0))
+        self._billing_delete_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self._billing_update_btn = ttk.Button(
-            ctrl,
+            billing_lf,
             text="請求ファイル更新",
             command=self._update_billing_file,
             state=tk.DISABLED,
         )
-        self._billing_update_btn.grid(row=0, column=7, sticky="w", padx=(8, 0))
+        self._billing_update_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        data_lf = ttk.LabelFrame(ctrl, text="データ", padding=(6, 4))
+        data_lf.pack(side=tk.LEFT, anchor="n", padx=(0, 8))
 
         self._save_btn = ttk.Button(
-            ctrl, text="保存", command=self._save_json, state=tk.DISABLED
+            data_lf, text="保存", command=self._save_json, state=tk.DISABLED
         )
-        self._save_btn.grid(row=0, column=8, sticky="w", padx=(8, 0))
+        self._save_btn.pack(side=tk.LEFT)
 
         self._load_btn = ttk.Button(
-            ctrl, text="読み込み", command=self._load_json, state=tk.NORMAL
+            data_lf, text="読み込み", command=self._load_json, state=tk.NORMAL
         )
-        self._load_btn.grid(row=0, column=9, sticky="w", padx=(8, 0))
+        self._load_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self._restore_excluded_btn = ttk.Button(
-            ctrl,
+            data_lf,
             text="削除データ復帰",
             command=self._prompt_restore_excluded_files,
             state=tk.DISABLED,
         )
-        self._restore_excluded_btn.grid(row=0, column=10, sticky="w", padx=(8, 0))
-
-        self._cancel_btn = ttk.Button(
-            ctrl, text="中断", command=self._cancel_analysis, state=tk.DISABLED
-        )
-        self._cancel_btn.grid(row=0, column=11, sticky="w", padx=(16, 0))
+        self._restore_excluded_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
-        # 「実行済 100 / 対象 120」など3桁になっても欠けないよう、表示幅を広げる
-        # ttk.Label の width は“文字数”ベースなので、minsize と合わせて余裕を持たせる。
-        # （環境によってフォントが少し太く、26文字だと末尾が欠けるケースがあったため更に増やす）
-        ttk.Label(ctrl, textvariable=self._progress_var, width=30).grid(
-            row=0, column=12, sticky="w", padx=(16, 0)
-        )
-        # 進捗表示（実行済/対象）は桁数により伸びるため、最低幅を確保して欠けを防ぐ
-        ctrl.columnconfigure(12, minsize=240)
 
+        status_area = ttk.Frame(ctrl)
+        status_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        # 「実行済 100 / 対象 120」など3桁になっても欠けないよう、表示幅を広げる
+        ttk.Label(status_area, textvariable=self._progress_var, width=30).pack(
+            side=tk.LEFT, anchor="n", padx=(0, 12)
+        )
         self._status_label = ttk.Label(
-            ctrl,
+            status_area,
             textvariable=self._status_var,
             anchor="w",
             width=70,
             wraplength=900,
             justify="left",
         )
-        self._status_label.grid(row=0, column=13, sticky="ew", padx=(12, 0))
-        ctrl.columnconfigure(13, weight=1)
+        self._status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, anchor="n")
 
         grid_frame = ttk.Frame(self, padding=(8, 0, 8, 8))
         grid_frame.pack(fill=tk.BOTH, expand=True)
