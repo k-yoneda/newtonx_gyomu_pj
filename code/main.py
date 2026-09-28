@@ -89,6 +89,9 @@ from kintai_core import (
     _row_billing_update_transport,
     _company_text_contains_seraku,
     _document_company_for_display,
+    _is_valid_employee_no,
+    _row_employee_no,
+    _normalize_employee_no_cell_value,
 )
 from newtonx_adk.exceptions import APIError
 
@@ -261,6 +264,7 @@ class KintaiApp(tk.Frame):
         "押印有無": 72,
     }
     _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
+    _TAG_DUP_EMPLOYEE_NO = "dup_employee_no"
     _ROW_EXTRA_KEYS = (
         "name_company_from_file",
         "name_company_from_doc",
@@ -617,6 +621,7 @@ class KintaiApp(tk.Frame):
         # 再解析中の行を反転表示（背景/文字色）
         # OSテーマにより見え方が変わるため、強めのコントラストにする。
         self._tree.tag_configure(self._TAG_REANALYSIS_ACTIVE, background="#1f2937", foreground="#ffffff")
+        self._tree.tag_configure(self._TAG_DUP_EMPLOYEE_NO, foreground="#c00000")
         y_scroll.configure(command=self._tree.yview)
         x_scroll.configure(command=self._tree.xview)
 
@@ -1661,6 +1666,7 @@ class KintaiApp(tk.Frame):
             self._tree.move(iid, "", index)
 
         self._update_column_heading_labels()
+        self._refresh_duplicate_employee_no_highlight()
 
     def _resolve_file_path_for_row(self, rid: str) -> Path | None:
         """行に対応する画像/PDF/Excel の絶対パスを返す。"""
@@ -1962,6 +1968,42 @@ class KintaiApp(tk.Frame):
             self._tree.item(iid, values=tuple(vals))
 
         self._grid_row_no_seq = len(children)
+        self._refresh_duplicate_employee_no_highlight()
+
+    def _refresh_duplicate_employee_no_highlight(self) -> None:
+        """有効社員番号が2行以上あるとき、該当行全体の文字色を赤にする。"""
+        tag_dup = self._TAG_DUP_EMPLOYEE_NO
+        tag_reanalysis = self._TAG_REANALYSIS_ACTIVE
+        counts: dict[str, int] = {}
+        for iid in self._tree.get_children():
+            row = self._row_dict_to_core(
+                self._merge_row_extra(iid, self._current_row_dict_from_iid(iid))
+            )
+            key = _normalize_employee_no_cell_value(_row_employee_no(row))
+            if not _is_valid_employee_no(key):
+                continue
+            counts[key] = counts.get(key, 0) + 1
+        dup_keys = {k for k, v in counts.items() if v >= 2}
+
+        for iid in self._tree.get_children():
+            try:
+                cur = tuple(self._tree.item(iid, "tags") or ())
+            except tk.TclError:
+                continue
+            row = self._row_dict_to_core(
+                self._merge_row_extra(iid, self._current_row_dict_from_iid(iid))
+            )
+            key = _normalize_employee_no_cell_value(_row_employee_no(row))
+            is_dup = _is_valid_employee_no(key) and key in dup_keys
+            without_dup = tuple(t for t in cur if t != tag_dup)
+            other = tuple(t for t in without_dup if t != tag_reanalysis)
+            has_reanalysis = tag_reanalysis in without_dup
+            if is_dup:
+                new_tags = (tag_dup,) + other + ((tag_reanalysis,) if has_reanalysis else ())
+            else:
+                new_tags = other + ((tag_reanalysis,) if has_reanalysis else ())
+            if new_tags != cur:
+                self._tree.item(iid, tags=new_tags)
 
     def _user_judgment_column_index(self) -> int:
         return list(self._tree["columns"]).index(self.FINAL_JUDGMENT_COL)
@@ -2695,6 +2737,7 @@ class KintaiApp(tk.Frame):
                 ratio_text = self._company_match_ratio_text(self._loaded_rows)
                 self._status_var.set(f"再解析完了: {file_name} / {ratio_text}")
                 self._refresh_reanalysis_buttons_state()
+                self._refresh_duplicate_employee_no_highlight()
                 messagebox.showinfo("再解析完了", f"選択行の再解析が完了しました。\n{file_name}")
 
             self.after(0, finish)
@@ -2854,6 +2897,7 @@ class KintaiApp(tk.Frame):
                 self._loaded_rows = self._current_grid_rows()
                 self._progress_var.set(f"{label}完了 {total} / {total}")
                 ratio_text = self._company_match_ratio_text(self._loaded_rows)
+                self._refresh_duplicate_employee_no_highlight()
 
                 if err is not None:
                     messagebox.showerror(f"{label}エラー", str(err))
@@ -2979,6 +3023,7 @@ class KintaiApp(tk.Frame):
             row["employee_no"] = new_v
             row[self.EMPLOYEE_NO_COL] = new_v
             self._recalculate_auto_judgment_for_row(rid, row)
+            self._refresh_duplicate_employee_no_highlight()
             top.destroy()
 
         def on_cancel() -> None:
@@ -3383,6 +3428,7 @@ class KintaiApp(tk.Frame):
             else:
                 self._assign_row_no_to_iid(iid)
         self._sync_grid_row_no_seq_from_tree()
+        self._refresh_duplicate_employee_no_highlight()
 
     def _update_title(self) -> None:
         base = "勤務表解析"
@@ -3668,6 +3714,8 @@ class KintaiApp(tk.Frame):
                 except Exception:
                     # snapshot 失敗は致命ではない
                     self._last_saved_snapshot = ""
+
+                self._refresh_duplicate_employee_no_highlight()
 
                 # --- UIボタン復帰 ---
                 self._update_data_dir_dependent_buttons()
