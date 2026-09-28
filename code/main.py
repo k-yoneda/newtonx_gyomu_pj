@@ -62,6 +62,11 @@ from kintai_core import (
     row_display_values,
     run_analysis,
     summary_header_cells,
+    BillingTsWriteItem,
+    BILLING_UPDATE_SKIP,
+    apply_billing_ts_writes,
+    merge_billing_ts_plan_results,
+    plan_billing_ts_writes,
     update_billing_engineer_ts_sheet,
     add_company_alias,
     company_alias_lookup_key,
@@ -75,7 +80,6 @@ from kintai_core import (
     rename_file_to_excluded,
     save_company_aliases,
     _parse_filename_company_and_person,
-    _billing_aggregated_marker,
     _is_billing_aggregated_marker,
     _row_billing_update_hours_decimal,
     _row_billing_update_transport,
@@ -937,7 +941,7 @@ class KintaiApp(tk.Frame):
             lines.append("残り行の No を 1 から振り直しました。")
         lines.append("")
         lines.append(
-            "請求データの合算がある場合は「請求データ作成」を再実行してください。"
+            "請求用列を直すときは「請求データ作成」を再実行してください。"
         )
         if failed:
             messagebox.showwarning(
@@ -960,9 +964,8 @@ class KintaiApp(tk.Frame):
         if not messagebox.askokcancel(
             "請求データ作成",
             f"対象: {scope}\n\n"
-            "社員番号ごとに更新用合計勤務時間（10進）・更新用交通費合計を作成します。\n"
-            "同一社員番号が複数ある場合は、No順の先頭行に合算値を設定し、\n"
-            "他行には「No.XXのレコードに合算済」と表示します（請求ファイル更新の対象外）。",
+            "各行について、更新用合計勤務時間（10進）・更新用交通費合計を\n"
+            "その行の読取値から作成します（同一社員番号の行も合算しません）。",
             parent=self._root,
         ):
             return
@@ -972,17 +975,17 @@ class KintaiApp(tk.Frame):
             ordered.append((iid, self._row_dict_to_core(self._current_row_dict_from_iid(iid))))
 
         cores = [core for _, core in ordered]
-        group_count = populate_billing_update_columns(cores)
+        updated_count = populate_billing_update_columns(cores)
         for (iid, _), core in zip(ordered, cores, strict=True):
             self._replace_row_with_result(iid, core)
 
         self._loaded_rows = self._current_grid_rows()
         self._status_var.set(
-            f"請求データ作成完了（{scope}）: {group_count} グループに更新用列を設定しました"
+            f"請求データ作成完了（{scope}）: {updated_count} 行に更新用列を設定しました"
         )
         messagebox.showinfo(
             "請求データ作成",
-            f"対象: {scope}\n更新用列を設定しました（{group_count} グループ）。",
+            f"対象: {scope}\n更新用列を設定しました（{updated_count} 行）。",
             parent=self._root,
         )
 
@@ -1026,6 +1029,109 @@ class KintaiApp(tk.Frame):
             parent=self._root,
         )
 
+    def _billing_ts_cell_label(self, value: str) -> str:
+        t = (value or "").strip()
+        return t if t else "（空）"
+
+    def _prompt_billing_ts_overwrite_confirm(
+        self, items: list[BillingTsWriteItem]
+    ) -> bool:
+        top = tk.Toplevel(self._root)
+        top.title("請求ファイル更新 — 上書き確認")
+        top.transient(self._root)
+        top.geometry("980x440")
+        top.minsize(720, 280)
+
+        outer = ttk.Frame(top, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text="Excel に既存値がある行です。上書きする列を選択してください。",
+        ).pack(anchor="w", pady=(0, 8))
+
+        table_wrap = ttk.Frame(outer)
+        table_wrap.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(table_wrap, highlightthickness=0)
+        y_scroll = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind(
+            "<Configure>",
+            lambda _e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=y_scroll.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        headers = (
+            "対象ファイル名",
+            "Excel行",
+            "通常請求時間（現在）",
+            "通常請求時間（更新後）",
+            "旅費交通費（現在）",
+            "旅費交通費（更新後）",
+            "勤務時間を上書き",
+            "交通費を上書き",
+        )
+        for col, title in enumerate(headers):
+            ttk.Label(inner, text=title, font=("", 9, "bold")).grid(
+                row=0, column=col, sticky="w", padx=4, pady=2
+            )
+
+        hour_vars: list[tk.BooleanVar] = []
+        transport_vars: list[tk.BooleanVar] = []
+        for row_i, item in enumerate(items, start=1):
+            vh = tk.BooleanVar(value=True)
+            vt = tk.BooleanVar(value=True)
+            hour_vars.append(vh)
+            transport_vars.append(vt)
+            fn = item.file_name
+            if len(fn) > 42:
+                fn = fn[:39] + "..."
+            row_nums = ",".join(str(n) for n in item.sheet_row_indices)
+            values = (
+                fn,
+                row_nums,
+                self._billing_ts_cell_label(item.old_hours_display),
+                self._billing_ts_cell_label(item.new_hours_display),
+                self._billing_ts_cell_label(item.old_transport_display),
+                self._billing_ts_cell_label(item.new_transport_display),
+            )
+            for col, text in enumerate(values):
+                ttk.Label(inner, text=text).grid(
+                    row=row_i, column=col, sticky="w", padx=4, pady=2
+                )
+            ttk.Checkbutton(inner, variable=vh).grid(
+                row=row_i, column=6, padx=4, pady=2
+            )
+            ttk.Checkbutton(inner, variable=vt).grid(
+                row=row_i, column=7, padx=4, pady=2
+            )
+
+        result = {"ok": False}
+
+        def on_ok() -> None:
+            for idx, item in enumerate(items):
+                item.write_hours = hour_vars[idx].get()
+                item.write_transport = transport_vars[idx].get()
+            result["ok"] = True
+            top.destroy()
+
+        def on_cancel() -> None:
+            top.destroy()
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btns, text="キャンセル", command=on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="選択した内容で実行", command=on_ok).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+        top.protocol("WM_DELETE_WINDOW", on_cancel)
+        top.grab_set()
+        self._root.wait_window(top)
+        return result["ok"]
+
     def _update_billing_file(self) -> None:
         if self._busy:
             return
@@ -1036,8 +1142,9 @@ class KintaiApp(tk.Frame):
                 parent=self._root,
             )
             return
+        scope = self._billing_target_scope_label()
         targets: list[tuple[str, dict[str, str]]] = []
-        for iid in self._tree.get_children():
+        for iid in self._billing_target_iids():
             ui_row = self._current_row_dict_from_iid(iid)
             if self._final_judgment_symbol_from_row(ui_row) != "〇":
                 continue
@@ -1049,23 +1156,57 @@ class KintaiApp(tk.Frame):
         if not targets:
             messagebox.showinfo(
                 "請求ファイル更新",
-                "最終判断が「〇」かつ更新用合計勤務時間（10進）が設定された行がありません。\n"
+                f"対象: {scope}\n\n"
+                "この範囲のうち、最終判断が「〇」かつ更新用合計勤務時間（10進）が"
+                "設定された行がありません。\n"
                 "先に「請求データ作成」を実行してください。",
                 parent=self._root,
             )
             return
         if not messagebox.askokcancel(
             "請求ファイル更新",
+            f"対象: {scope}\n\n"
             "最終判断が「〇」のレコードについて、更新用合計勤務時間（10進）・"
             "更新用交通費合計を請求用ファイルへ反映します。",
             parent=self._root,
         ):
             return
+        core_rows = [core_row for _, core_row in targets]
         try:
-            results = update_billing_engineer_ts_sheet(
-                self._billing_file_path,
-                [core_row for _, core_row in targets],
+            planned = plan_billing_ts_writes(self._billing_file_path, core_rows)
+        except OSError as e:
+            messagebox.showerror(
+                "請求ファイル更新",
+                f"請求用ファイルを開けませんでした。\n\n{e}",
+                parent=self._root,
             )
+            return
+        except Exception as e:
+            messagebox.showerror(
+                "請求ファイル更新",
+                f"請求用ファイルの読み込みに失敗しました。\n\n{e}",
+                parent=self._root,
+            )
+            return
+
+        confirm_items = [
+            x
+            for x in planned
+            if isinstance(x, BillingTsWriteItem) and x.needs_confirm
+        ]
+        if confirm_items and not self._prompt_billing_ts_overwrite_confirm(
+            confirm_items
+        ):
+            return
+
+        write_items = [x for x in planned if isinstance(x, BillingTsWriteItem)]
+        try:
+            apply_results = (
+                apply_billing_ts_writes(self._billing_file_path, write_items)
+                if write_items
+                else []
+            )
+            results = merge_billing_ts_plan_results(planned, apply_results)
         except OSError as e:
             messagebox.showerror(
                 "請求ファイル更新",
@@ -1081,22 +1222,37 @@ class KintaiApp(tk.Frame):
             )
             return
         ok_count = 0
-        for (iid, _), symbol in zip(targets, results, strict=True):
+        skip_count = 0
+        detail_lines: list[str] = []
+        for (iid, core_row), symbol in zip(targets, results, strict=True):
             self._set_billing_update_result_cell(iid, symbol)
             if symbol == "〇":
                 ok_count += 1
-        fail_count = len(targets) - ok_count
+            elif symbol == BILLING_UPDATE_SKIP:
+                skip_count += 1
+            else:
+                fn = (core_row.get("file_name") or "").strip() or "（ファイル名なし）"
+                if len(fn) > 36:
+                    fn = fn[:33] + "..."
+                detail_lines.append(f"・{fn}: {symbol}")
+        fail_count = len(targets) - ok_count - skip_count
         self._loaded_rows = self._current_grid_rows()
         self._status_var.set(
-            f"請求ファイル更新完了: 成功 {ok_count} 件 / 失敗 {fail_count} 件 "
-            f"（対象 {len(targets)} 件）"
+            f"請求ファイル更新完了（{scope}）: 成功 {ok_count} 件 / 失敗 {fail_count} 件 "
+            f"/ スキップ {skip_count} 件（対象 {len(targets)} 件）"
         )
+        body = (
+            f"対象: {scope}\n"
+            f"請求用ファイル:\n{self._billing_file_path.name}\n\n"
+            f"成功: {ok_count} 件\n失敗: {fail_count} 件\nスキップ: {skip_count} 件"
+        )
+        if detail_lines:
+            body += "\n\n" + "\n".join(detail_lines[:12])
+            if len(detail_lines) > 12:
+                body += f"\n... 他 {len(detail_lines) - 12} 件"
         messagebox.showinfo(
             "請求ファイル更新",
-            (
-                f"請求用ファイル:\n{self._billing_file_path.name}\n\n"
-                f"成功: {ok_count} 件\n失敗: {fail_count} 件"
-            ),
+            body,
             parent=self._root,
         )
 
@@ -1543,51 +1699,19 @@ class KintaiApp(tk.Frame):
                 max_no = max(max_no, int(no_s))
         self._grid_row_no_seq = max_no
 
-    def _remap_billing_aggregated_marker(
-        self, value: str, old_to_new: dict[str, str]
-    ) -> str:
-        t = (value or "").strip()
-        if not _is_billing_aggregated_marker(t):
-            return value
-        m = re.match(r"^No\.(\d+)", t)
-        if not m:
-            return value
-        rep_new = old_to_new.get(m.group(1), m.group(1))
-        if not rep_new.isdigit():
-            return value
-        return _billing_aggregated_marker(int(rep_new))
-
     def _renumber_grid_rows(self) -> None:
-        """表示順に No を 1…N に振り直し、合算済マーカー内の代表 No も追随する。"""
+        """表示順に No を 1…N に振り直す。"""
         children = list(self._tree.get_children())
         if not children:
             self._grid_row_no_seq = 0
             return
 
-        old_no_by_iid = {iid: self._tree_row_no(iid) for iid in children}
-        old_to_new: dict[str, str] = {}
-        for n, iid in enumerate(children, start=1):
-            old = old_no_by_iid.get(iid, "")
-            if old:
-                old_to_new[old] = str(n)
-
         ci_no = self._row_no_column_index()
-        cols = list(self._tree["columns"])
-        billing_col_indices: list[int] = []
-        for col in (self.BILLING_UPDATE_HOURS_COL, self.BILLING_UPDATE_TRANSPORT_COL):
-            if col in cols:
-                billing_col_indices.append(cols.index(col))
-
         for n, iid in enumerate(children, start=1):
             vals = list(self._tree.item(iid, "values") or ())
             while len(vals) <= ci_no:
                 vals.append("")
             vals[ci_no] = str(n)
-            for bci in billing_col_indices:
-                if bci < len(vals):
-                    vals[bci] = self._remap_billing_aggregated_marker(
-                        str(vals[bci]), old_to_new
-                    )
             self._tree.item(iid, values=tuple(vals))
 
         self._grid_row_no_seq = len(children)

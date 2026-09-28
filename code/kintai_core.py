@@ -18,6 +18,7 @@ import unicodedata
 from datetime import datetime as DTDateTime, time as DTTime, timedelta as DTTimeDelta
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -78,6 +79,12 @@ LEGACY_USER_JUDGMENT_COL = "ユーザ判断"
 SUMMARY_BILLING_UPDATE_RESULT_COL = "請求用ファイル更新"
 LEGACY_BILLING_UPDATE_RESULT_COL = "請求量ファイル更新結果"
 BILLING_UPDATE_NO_TARGET_RECORD = "（対象レコードなし）"
+BILLING_UPDATE_SKIP = "スキップ"
+BILLING_UPDATE_SHEET_MISSING = "（エンジニアTS一覧なし）"
+BILLING_UPDATE_OPEN_FAILED = "（ファイルを開けません）"
+BILLING_UPDATE_INVALID_HOURS = "（勤務時間不正）"
+BILLING_UPDATE_INVALID_TRANSPORT = "（交通費不正）"
+BILLING_UPDATE_SAVE_FAILED = "（Excel保存失敗）"
 BILLING_AGGREGATED_MARKER_SUFFIX = "のレコードに合算済"
 BILLING_ENGINEER_TS_SHEET_NAME = "エンジニアTS一覧"
 BILLING_TS_COL_EMPLOYEE_NO = 1  # A列
@@ -2908,9 +2915,9 @@ def _row_grid_no(row: dict[str, str]) -> int:
 def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
     """表示順の行リストについて更新用列を設定する（in-place）。
 
-    社員番号が1件のみ: 合計勤務時間（10進）・交通費合計（読取）をコピー。
-    複数件: No順先頭行に読取合算値を設定し、他行には「No.XXのレコードに合算済」を設定する。
-    戻り値: 更新用値を設定したグループ数。
+    有効な社員番号の各行について、合計勤務時間（10進）・交通費合計（読取）を
+    その行の更新用列にコピーする（同一社員番号の複数行は合算しない）。
+    戻り値: 更新用値を設定した行数。
     """
     if not rows:
         return 0
@@ -2918,67 +2925,23 @@ def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
     for row in rows:
         _clear_billing_update_columns(row)
 
-    groups: dict[str, list[int]] = {}
-    for idx, row in enumerate(rows):
+    updated_rows = 0
+    for row in rows:
         emp = _row_employee_no(row)
         if not _is_valid_employee_no(emp):
             continue
-        groups.setdefault(emp, []).append(idx)
-
-    updated_groups = 0
-    for indices in groups.values():
-        if len(indices) == 1:
-            row = rows[indices[0]]
-            hours = _row_total_hours_decimal(row)
-            transport = _row_transport_expense_raw(row)
-            if not hours and not transport:
-                continue
-            _set_billing_update_columns(
-                row,
-                hours=hours,
-                transport=transport,
-            )
-            updated_groups += 1
-            continue
-
-        first_idx = min(indices, key=lambda i: _row_grid_no(rows[i]))
-        hour_sum = 0.0
-        hours_ok = True
-        for idx in indices:
-            raw_hours = _row_total_hours_raw(rows[idx])
-            parsed = _work_hours_raw_to_hours_float(raw_hours)
-            if parsed is None:
-                hours_ok = False
-                break
-            hour_sum += parsed
-
-        transport_sum = 0.0
-        transport_ok = True
-        for idx in indices:
-            amount, ok = _transport_amount_for_excel(_row_transport_expense_raw(rows[idx]))
-            if not ok or amount is None:
-                transport_ok = False
-                break
-            transport_sum += amount
-
-        hours_str = _format_decimal_str(hour_sum) if hours_ok else ""
-        transport_str = _format_transport_sum(transport_sum) if transport_ok else ""
-        if not hours_str and not transport_str:
+        hours = _normalize_billing_update_copy(_row_total_hours_decimal(row))
+        transport = _normalize_billing_update_copy(_row_transport_expense_raw(row))
+        if not hours and not transport:
             continue
         _set_billing_update_columns(
-            rows[first_idx],
-            hours=hours_str,
-            transport=transport_str,
+            row,
+            hours=hours,
+            transport=transport,
         )
-        rep_no = _row_grid_no(rows[first_idx])
-        if rep_no < 10**9:
-            marker = _billing_aggregated_marker(rep_no)
-            for idx in indices:
-                if idx != first_idx:
-                    _set_billing_update_columns(rows[idx], hours=marker, transport=marker)
-        updated_groups += 1
+        updated_rows += 1
 
-    return updated_groups
+    return updated_rows
 
 
 def _row_transport_expense_raw(row: dict[str, str]) -> str:
@@ -3024,22 +2987,63 @@ def _hours_decimal_for_excel(value: str) -> float | None:
         return None
 
 
-def _transport_amount_for_excel(value: str) -> tuple[float | None, bool]:
-    """旅費交通費請求金額（O列）用。空欄は 0 として扱う。(金額, 解析成功)"""
+_BILLING_NO_DATA_MARKERS = frozenset(
+    {
+        "（データなし）",
+        "(データなし)",
+        "データなし",
+    }
+)
+
+_TRANSPORT_ZERO_FOR_EXCEL = frozenset(
+    {
+        "（なし）",
+        "(なし)",
+        "不明",
+        "（不明）",
+        "(不明)",
+    }
+)
+
+
+def _billing_value_is_no_data(value: str) -> bool:
+    nfkc = unicodedata.normalize("NFKC", (value or "").strip())
+    return nfkc in _BILLING_NO_DATA_MARKERS
+
+
+def _normalize_billing_update_copy(value: str) -> str:
+    """請求用更新列へコピーする値（データなしは空文字）。"""
+    if _billing_value_is_no_data(value):
+        return ""
+    return (value or "").strip()
+
+
+def _transport_for_billing_excel(value: str) -> tuple[str, float | None]:
+    """O列書き込み値。(kind, amount)。kind は amount / empty / invalid。"""
     t = (value or "").strip()
     if _is_billing_aggregated_marker(t):
-        return None, False
-    if not t or t in ("（なし）", "不明", "（不明）"):
-        return 0.0, True
+        return "invalid", None
     nfkc = unicodedata.normalize("NFKC", t)
+    if not nfkc or _billing_value_is_no_data(t):
+        return "empty", None
+    if nfkc in _TRANSPORT_ZERO_FOR_EXCEL:
+        return "amount", 0.0
     nfkc = nfkc.replace("，", "").replace(",", "").replace("、", "").replace("円", "")
     m = re.search(r"(\d+(?:\.\d+)?)", nfkc)
     if not m:
-        return None, False
+        return "invalid", None
     try:
-        return float(m.group(1)), True
+        return "amount", float(m.group(1))
     except ValueError:
-        return None, False
+        return "invalid", None
+
+
+def _transport_amount_for_excel(value: str) -> tuple[float | None, bool]:
+    """旅費交通費の数値解析（金額がある場合のみ成功）。データなし・空欄は別経路。"""
+    kind, amount = _transport_for_billing_excel(value)
+    if kind == "amount":
+        return amount, True
+    return None, False
 
 
 def _transport_read_value_usable(raw: str) -> bool:
@@ -3119,16 +3123,219 @@ def _hours_check_blocks_auto_judgment(row: dict[str, str], file_name: str) -> bo
     return True
 
 
-def _build_employee_no_row_index(ws) -> dict[str, list[int]]:
-    """シート A列の社員番号 → 行番号リスト（1始まり）。"""
-    index: dict[str, list[int]] = {}
+@dataclass
+class BillingTsWriteItem:
+    """請求 Excel 1グリッド行分の書き込み計画（apply 前に write_* を GUI で変更可）。"""
+
+    file_name: str
+    sheet_row_indices: list[int]
+    new_hours: float
+    new_transport: float | None
+    old_hours_display: str
+    old_transport_display: str
+    new_hours_display: str
+    new_transport_display: str
+    needs_confirm: bool
+    write_hours: bool = True
+    write_transport: bool = True
+
+
+def _billing_ts_cell_display(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        if math.isclose(value, round(value), abs_tol=1e-9):
+            return str(int(round(value)))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    t = _excel_cell_value_to_raw_text(value).strip()
+    return t
+
+
+def _billing_ts_cell_nonempty(value: object) -> bool:
+    return bool(_billing_ts_cell_display(value))
+
+
+def _billing_ts_old_values_for_targets(ws, targets: list[int]) -> tuple[str, str, bool]:
+    """代表行（先頭）の H/O 表示値と、上書き確認が必要か（既存セルに値がある列がある）。"""
+    if not targets:
+        return "", "", False
+    rep = targets[0]
+    old_h = _billing_ts_cell_display(
+        ws.cell(row=rep, column=BILLING_TS_COL_NORMAL_HOURS).value
+    )
+    old_t = _billing_ts_cell_display(
+        ws.cell(row=rep, column=BILLING_TS_COL_TRANSPORT_AMOUNT).value
+    )
+    needs = False
+    for row_idx in targets:
+        h_val = ws.cell(row=row_idx, column=BILLING_TS_COL_NORMAL_HOURS).value
+        t_val = ws.cell(row=row_idx, column=BILLING_TS_COL_TRANSPORT_AMOUNT).value
+        if _billing_ts_cell_nonempty(h_val) or _billing_ts_cell_nonempty(t_val):
+            needs = True
+            break
+    return old_h, old_t, needs
+
+
+def _find_billing_ts_write_row_indices(ws, file_name: str) -> list[int]:
+    """ファイル名の取引先名（様除去）・氏名と D/E 列が一致するシート行番号（1始まり）。"""
+    file_co, file_pe_seg = _parse_filename_company_and_person(file_name)
+    if not (file_co.strip() and file_pe_seg.strip()):
+        return []
+    indices: list[int] = []
     max_row = ws.max_row or 0
     for row_idx in range(1, max_row + 1):
-        key = _normalize_employee_no_cell_value(ws.cell(row=row_idx, column=BILLING_TS_COL_EMPLOYEE_NO).value)
-        if not key:
+        emp = _normalize_employee_no_cell_value(
+            ws.cell(row=row_idx, column=BILLING_TS_COL_EMPLOYEE_NO).value
+        )
+        if not _is_valid_employee_no(emp):
             continue
-        index.setdefault(key, []).append(row_idx)
-    return index
+        client = _excel_cell_value_to_raw_text(
+            ws.cell(row=row_idx, column=BILLING_TS_COL_CLIENT_NAME).value
+        )
+        person = _excel_cell_value_to_raw_text(
+            ws.cell(row=row_idx, column=BILLING_TS_COL_PERSON_NAME).value
+        )
+        if not (client.strip() and person.strip()):
+            continue
+        if _billing_sheet_row_matches_filename(file_co, file_pe_seg, client, person):
+            indices.append(row_idx)
+    return indices
+
+
+def plan_billing_ts_writes(
+    billing_path: Path,
+    rows: list[dict[str, str]],
+) -> list[str | BillingTsWriteItem]:
+    """書き込み計画を作成する。失敗時は結果文字列、成功時は BillingTsWriteItem。"""
+    if not rows:
+        return []
+    path = billing_path.resolve()
+    suffix = path.suffix.lower()
+    keep_vba = suffix in (".xlsm", ".xltm")
+    try:
+        # data_only で表示値を読む。read_only は cell 走査で行漏れがあり得るため使わない。
+        wb = load_workbook(path, read_only=False, data_only=True, keep_vba=keep_vba)
+    except Exception:
+        return [BILLING_UPDATE_OPEN_FAILED] * len(rows)
+    try:
+        if BILLING_ENGINEER_TS_SHEET_NAME not in wb.sheetnames:
+            return [BILLING_UPDATE_SHEET_MISSING] * len(rows)
+        ws = wb[BILLING_ENGINEER_TS_SHEET_NAME]
+        planned: list[str | BillingTsWriteItem] = []
+        for row in rows:
+            file_name = (row.get("file_name") or "").strip()
+            if not file_name:
+                planned.append("✖")
+                continue
+            targets = _find_billing_ts_write_row_indices(ws, file_name)
+            if not targets:
+                planned.append(BILLING_UPDATE_NO_TARGET_RECORD)
+                continue
+            hours_raw = _row_billing_update_hours_decimal(row)
+            if _is_billing_aggregated_marker(hours_raw):
+                planned.append("✖")
+                continue
+            hours = _hours_decimal_for_excel(hours_raw)
+            if hours is None:
+                planned.append(BILLING_UPDATE_INVALID_HOURS)
+                continue
+            t_kind, t_amount = _transport_for_billing_excel(
+                _row_billing_update_transport(row)
+            )
+            if t_kind == "invalid":
+                planned.append(BILLING_UPDATE_INVALID_TRANSPORT)
+                continue
+            transport_write: float | None = t_amount if t_kind == "amount" else None
+            old_h, old_t, needs_confirm = _billing_ts_old_values_for_targets(ws, targets)
+            new_h_disp = _billing_ts_cell_display(hours)
+            new_t_disp = (
+                ""
+                if transport_write is None
+                else _billing_ts_cell_display(transport_write)
+            )
+            planned.append(
+                BillingTsWriteItem(
+                    file_name=file_name,
+                    sheet_row_indices=list(targets),
+                    new_hours=hours,
+                    new_transport=transport_write,
+                    old_hours_display=old_h,
+                    old_transport_display=old_t,
+                    new_hours_display=new_h_disp,
+                    new_transport_display=new_t_disp,
+                    needs_confirm=needs_confirm,
+                    write_hours=True,
+                    write_transport=True,
+                )
+            )
+        return planned
+    finally:
+        wb.close()
+
+
+def apply_billing_ts_writes(
+    billing_path: Path,
+    items: list[BillingTsWriteItem],
+) -> list[str]:
+    """計画に従い Excel に書き込む（items と同順の結果符号）。"""
+    if not items:
+        return []
+    path = billing_path.resolve()
+    suffix = path.suffix.lower()
+    keep_vba = suffix in (".xlsm", ".xltm")
+    try:
+        wb = load_workbook(path, keep_vba=keep_vba)
+    except Exception:
+        return [BILLING_UPDATE_OPEN_FAILED] * len(items)
+    try:
+        if BILLING_ENGINEER_TS_SHEET_NAME not in wb.sheetnames:
+            return [BILLING_UPDATE_SHEET_MISSING] * len(items)
+        ws = wb[BILLING_ENGINEER_TS_SHEET_NAME]
+        results: list[str] = []
+        for item in items:
+            if not item.write_hours and not item.write_transport:
+                results.append(BILLING_UPDATE_SKIP)
+                continue
+            try:
+                for row_idx in item.sheet_row_indices:
+                    if item.write_hours:
+                        ws.cell(
+                            row=row_idx, column=BILLING_TS_COL_NORMAL_HOURS
+                        ).value = item.new_hours
+                    if item.write_transport:
+                        ws.cell(
+                            row=row_idx, column=BILLING_TS_COL_TRANSPORT_AMOUNT
+                        ).value = item.new_transport
+                results.append("〇")
+            except Exception:
+                results.append(BILLING_UPDATE_SAVE_FAILED)
+        try:
+            wb.save(path)
+        except OSError:
+            results = [
+                BILLING_UPDATE_SAVE_FAILED if r == "〇" else r for r in results
+            ]
+        return results
+    finally:
+        wb.close()
+
+
+def merge_billing_ts_plan_results(
+    planned: list[str | BillingTsWriteItem],
+    apply_results: list[str],
+) -> list[str]:
+    """plan 結果と apply 結果を入力 rows 順の結果リストに戻す。"""
+    out: list[str] = []
+    apply_i = 0
+    for entry in planned:
+        if isinstance(entry, str):
+            out.append(entry)
+        else:
+            out.append(apply_results[apply_i])
+            apply_i += 1
+    return out
 
 
 def update_billing_engineer_ts_sheet(
@@ -3138,70 +3345,14 @@ def update_billing_engineer_ts_sheet(
     """最終判断〇行分のデータを請求用 Excel「エンジニアTS一覧」に反映する。
 
     各行について「〇」（更新成功）または「✖」（失敗）を返す（rows と同順）。
-    更新前にファイル名の会社・氏名と請求シート（D/E列）の一致を確認する。
+    確認ダイアログなしで全列上書き（GUI は plan / apply を直接利用）。
     """
-    if not rows:
-        return []
-    path = billing_path.resolve()
-    try:
-        sheet_rows = _load_billing_engineer_ts_rows(path)
-    except Exception:
-        return ["✖"] * len(rows)
-    if not sheet_rows:
-        return ["✖"] * len(rows)
-    suffix = path.suffix.lower()
-    keep_vba = suffix in (".xlsm", ".xltm")
-    wb = load_workbook(path, keep_vba=keep_vba)
-    try:
-        if BILLING_ENGINEER_TS_SHEET_NAME not in wb.sheetnames:
-            return ["✖"] * len(rows)
-        ws = wb[BILLING_ENGINEER_TS_SHEET_NAME]
-        emp_rows = _build_employee_no_row_index(ws)
-        results: list[str] = []
-        for row in rows:
-            file_name = (row.get("file_name") or "").strip()
-            if not file_name:
-                results.append("✖")
-                continue
-            billing_emp = lookup_employee_no_in_billing_file(
-                path, file_name, sheet_rows=sheet_rows
-            )
-            if not billing_emp:
-                results.append(BILLING_UPDATE_NO_TARGET_RECORD)
-                continue
-            emp = _normalize_employee_no_cell_value(billing_emp)
-            if not _is_valid_employee_no(emp):
-                results.append(BILLING_UPDATE_NO_TARGET_RECORD)
-                continue
-            targets = emp_rows.get(emp)
-            if not targets:
-                results.append(BILLING_UPDATE_NO_TARGET_RECORD)
-                continue
-            hours_raw = _row_billing_update_hours_decimal(row)
-            if _is_billing_aggregated_marker(hours_raw):
-                results.append("✖")
-                continue
-            hours = _hours_decimal_for_excel(hours_raw)
-            if hours is None:
-                results.append("✖")
-                continue
-            transport, transport_ok = _transport_amount_for_excel(
-                _row_billing_update_transport(row)
-            )
-            if not transport_ok or transport is None:
-                results.append("✖")
-                continue
-            try:
-                for row_idx in targets:
-                    ws.cell(row=row_idx, column=BILLING_TS_COL_NORMAL_HOURS).value = hours
-                    ws.cell(row=row_idx, column=BILLING_TS_COL_TRANSPORT_AMOUNT).value = transport
-                results.append("〇")
-            except Exception:
-                results.append("✖")
-        wb.save(path)
-        return results
-    finally:
-        wb.close()
+    planned = plan_billing_ts_writes(billing_path, rows)
+    items = [x for x in planned if isinstance(x, BillingTsWriteItem)]
+    if not items:
+        return [x if isinstance(x, str) else "✖" for x in planned]
+    apply_results = apply_billing_ts_writes(billing_path, items)
+    return merge_billing_ts_plan_results(planned, apply_results)
 
 
 def _apply_parsed_auto_judgment(row: dict[str, str]) -> None:
