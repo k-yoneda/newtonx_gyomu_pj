@@ -303,6 +303,87 @@ def _compress_image_under_1mib(src: Path) -> Path:
     raise RuntimeError(f"1MiB未満に収められませんでした: {src}")
 
 
+BILLING_PREVIEW_PDF_DPI = 110
+
+
+def _fit_image_max_edge(img: Image.Image, max_edge_px: int) -> Image.Image:
+    w, h = img.size
+    if w <= max_edge_px and h <= max_edge_px:
+        return img
+    scale = min(max_edge_px / w, max_edge_px / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+
+def _billing_preview_pil_to_rgb(img: Image.Image) -> Image.Image:
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        return bg
+    if img.mode != "RGB":
+        return img.convert("RGB")
+    return img
+
+
+def load_billing_preview_pages(
+    path: Path, max_edge_px: int = 1200
+) -> list[Image.Image]:
+    """請求照合用プレビュー（PDF 全ページ、多ページ TIFF、その他は1枚）。失敗時 []。"""
+    if not path.is_file():
+        return []
+    suffix = path.suffix.lower()
+    pages: list[Image.Image] = []
+    try:
+        if suffix == PDF_SUFFIX:
+            try:
+                import fitz
+            except ImportError:
+                return []
+            doc = fitz.open(path)
+            try:
+                if doc.page_count < 1:
+                    return []
+                zoom = BILLING_PREVIEW_PDF_DPI / 72.0
+                mat = fitz.Matrix(zoom, zoom)
+                for page_index in range(doc.page_count):
+                    pix = doc[page_index].get_pixmap(matrix=mat, alpha=False)
+                    img = Image.frombytes(
+                        "RGB", (pix.width, pix.height), pix.samples
+                    )
+                    pages.append(_fit_image_max_edge(img, max_edge_px))
+            finally:
+                doc.close()
+        elif suffix in IMAGE_SUFFIXES:
+            with Image.open(path) as img:
+                frame_count = 1
+                if suffix in (".tif", ".tiff"):
+                    try:
+                        frame_count = int(getattr(img, "n_frames", 1))
+                    except (AttributeError, ValueError, OSError):
+                        frame_count = 1
+                for frame_index in range(frame_count):
+                    if frame_count > 1:
+                        img.seek(frame_index)
+                    frame = img.copy()
+                    frame.load()
+                    if frame_index == 0:
+                        frame = ImageOps.exif_transpose(frame)
+                    frame = _billing_preview_pil_to_rgb(frame)
+                    pages.append(_fit_image_max_edge(frame, max_edge_px))
+        else:
+            return []
+    except (OSError, UnidentifiedImageError, ValueError):
+        return []
+    return pages
+
+
+def load_billing_preview_image(path: Path, max_edge_px: int = 1200) -> Image.Image | None:
+    """請求照合用プレビュー画像（先頭ページのみ）。失敗時 None。"""
+    pages = load_billing_preview_pages(path, max_edge_px=max_edge_px)
+    return pages[0] if pages else None
+
+
 def _otsu_threshold(gray: Image.Image) -> int:
     """グレースケール画像のヒストグラムから大津の二値化閾値を求める。"""
     hist = gray.histogram()

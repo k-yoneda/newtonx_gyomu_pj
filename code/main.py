@@ -9,10 +9,13 @@ import sys
 import threading
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass
 from datetime import date
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
+
+from PIL import ImageTk
 
 _CODE_DIR = Path(__file__).resolve().parent
 _ROOT = _CODE_DIR.parent
@@ -67,6 +70,7 @@ from kintai_core import (
     normalize_judgment_symbol,
     clear_billing_update_hours_column,
     apply_billing_create_for_rows,
+    billing_duplicate_group_key,
     build_billing_duplicate_groups,
     BillingDuplicateResolution,
     BillingDuplicateGroupInfo,
@@ -120,8 +124,23 @@ from kintai_core import (
     _row_grid_no,
     _row_total_hours_decimal,
     _row_transport_expense_raw,
+    load_billing_preview_pages,
+    IMAGE_SUFFIXES,
+    PDF_SUFFIX,
 )
 from newtonx_adk.exceptions import APIError
+
+
+@dataclass(frozen=True)
+class BillingReviewEntry:
+    """請求前照合セッション用の行スナップショット。"""
+
+    iid: str
+    file_name: str
+    grid_no: int
+    employee_no: str
+    hours_write: str
+    transport_write: str
 
 _WIN32 = sys.platform == "win32"
 _STILL_ACTIVE = 259
@@ -296,6 +315,7 @@ class KintaiApp(tk.Frame):
         "押印有無": 72,
     }
     _TAG_REANALYSIS_ACTIVE = "reanalysis_active"
+    _TAG_BILLING_REVIEW_ACTIVE = "billing_review_active"
     _TAG_DUP_EMPLOYEE_NO = "dup_employee_no"
     _ROW_EXTRA_KEYS = (
         "name_company_from_file",
@@ -338,6 +358,8 @@ class KintaiApp(tk.Frame):
         self._preview_row_iid: str = ""
         self._preview_file_path: Path | None = None
         self._preview_process_handle: int | None = None
+        self._billing_review_photos: list[ImageTk.PhotoImage] = []
+        self._billing_review_highlighted_iids: list[str] = []
         self._cancel_event: threading.Event | None = None
 
         self._loaded_rows: list[dict[str, str]] = []
@@ -626,6 +648,14 @@ class KintaiApp(tk.Frame):
         )
         self._billing_delete_btn.pack(side=tk.LEFT, padx=(4, 0))
 
+        self._billing_review_btn = ttk.Button(
+            billing_lf,
+            text="画像とデータ照合",
+            command=self._open_billing_image_data_review,
+            state=tk.DISABLED,
+        )
+        self._billing_review_btn.pack(side=tk.LEFT, padx=(4, 0))
+
         self._billing_update_btn = ttk.Button(
             billing_lf,
             text="請求ファイル更新",
@@ -706,6 +736,11 @@ class KintaiApp(tk.Frame):
         # 再解析中の行を反転表示（背景/文字色）
         # OSテーマにより見え方が変わるため、強めのコントラストにする。
         self._tree.tag_configure(self._TAG_REANALYSIS_ACTIVE, background="#1f2937", foreground="#ffffff")
+        self._tree.tag_configure(
+            self._TAG_BILLING_REVIEW_ACTIVE,
+            background="#1f2937",
+            foreground="#ffffff",
+        )
         self._tree.tag_configure(self._TAG_DUP_EMPLOYEE_NO, foreground="#c00000")
         y_scroll.configure(command=self._tree.yview)
         x_scroll.configure(command=self._tree.xview)
@@ -732,6 +767,8 @@ class KintaiApp(tk.Frame):
         self._tree.bind("<Button-1>", self._on_tree_left_click, add="+")
         self._tree.bind("<Double-1>", self._on_row_double_click)
         self._tree.bind("<<TreeviewSelect>>", self._on_tree_selection_changed)
+        self._tree.bind("<Control-a>", self._on_tree_select_all)
+        self._tree.bind("<Control-A>", self._on_tree_select_all)
 
         initial_w = self._window_width_for_columns(col_px, y_scroll=y_scroll)
         min_w = min(960, initial_w)
@@ -846,6 +883,7 @@ class KintaiApp(tk.Frame):
         if self._busy:
             self._billing_prepare_btn.configure(state=tk.DISABLED)
             self._billing_delete_btn.configure(state=tk.DISABLED)
+            self._billing_review_btn.configure(state=tk.DISABLED)
             self._billing_update_btn.configure(state=tk.DISABLED)
             return
         has_rows = bool(self._tree.get_children())
@@ -853,6 +891,9 @@ class KintaiApp(tk.Frame):
             state=(tk.NORMAL if has_rows else tk.DISABLED)
         )
         self._billing_delete_btn.configure(
+            state=(tk.NORMAL if has_rows else tk.DISABLED)
+        )
+        self._billing_review_btn.configure(
             state=(tk.NORMAL if has_rows else tk.DISABLED)
         )
         enabled = (
@@ -867,6 +908,14 @@ class KintaiApp(tk.Frame):
 
     def _on_tree_selection_changed(self, _event: tk.Event | None = None) -> None:
         self._refresh_selected_rows_reanalysis_button_state()
+
+    def _on_tree_select_all(self, _event: tk.Event) -> str:
+        """Ctrl+A でグリッドの全行を選択する。"""
+        children = self._tree.get_children()
+        if children:
+            self._tree.selection_set(*children)
+            self._tree.focus(children[0])
+        return "break"
 
     def _on_year_month_changed(self, _event: tk.Event | None = None) -> None:
         self._refresh_year_month_combos()
@@ -1290,6 +1339,491 @@ class KintaiApp(tk.Frame):
     def _billing_cell_preview(self, value: str) -> str:
         t = (value or "").strip()
         return t if t else "（空）"
+
+    def _collect_billing_review_entries(self) -> list[BillingReviewEntry]:
+        entries: list[BillingReviewEntry] = []
+        for iid in self._billing_target_iids():
+            ui_row = self._current_row_dict_from_iid(iid)
+            if self._final_judgment_symbol_from_row(ui_row) != "〇":
+                continue
+            core = self._row_dict_to_core(ui_row)
+            hours_val = _row_billing_update_hours_decimal(core)
+            transport_val = _row_billing_update_transport(core)
+            if _is_billing_aggregated_marker(hours_val):
+                continue
+            if not (hours_val or "").strip() and not (transport_val or "").strip():
+                continue
+            entries.append(
+                BillingReviewEntry(
+                    iid=iid,
+                    file_name=self._file_name_from_row(ui_row),
+                    grid_no=_row_grid_no(core),
+                    employee_no=_row_employee_no(core),
+                    hours_write=(hours_val or "").strip(),
+                    transport_write=(transport_val or "").strip(),
+                )
+            )
+        return entries
+
+    def _billing_review_preview_iids(self, rep_iid: str) -> list[str]:
+        """照合プレビュー用。重複グループなら同一キーの全行 iid（No 昇順）。"""
+        rep_core = self._row_dict_to_core(self._current_row_dict_from_iid(rep_iid))
+        key = billing_duplicate_group_key(rep_core)
+        if key is None:
+            return [rep_iid]
+        matched: list[tuple[int, int, str]] = []
+        for order, iid in enumerate(self._billing_target_iids()):
+            core = self._row_dict_to_core(self._current_row_dict_from_iid(iid))
+            if billing_duplicate_group_key(core) != key:
+                continue
+            matched.append((_row_grid_no(core), order, iid))
+        if len(matched) < 2:
+            return [rep_iid]
+        matched.sort(key=lambda t: (t[0], t[1]))
+        return [iid for _, _, iid in matched]
+
+    def _billing_review_file_names_display(self, rep_iid: str) -> str:
+        iids = self._billing_review_preview_iids(rep_iid)
+        if len(iids) <= 1:
+            ui_row = self._current_row_dict_from_iid(rep_iid)
+            return self._file_name_from_row(ui_row) or "（なし）"
+        lines: list[str] = []
+        for iid in iids:
+            ui_row = self._current_row_dict_from_iid(iid)
+            core = self._row_dict_to_core(ui_row)
+            no = _row_grid_no(core)
+            fn = self._file_name_from_row(ui_row) or "（なし）"
+            lines.append(f"No.{no}: {fn}")
+        return "\n".join(lines)
+
+    def _set_row_billing_review_highlight(self, rid: str, active: bool) -> None:
+        try:
+            cur = tuple(self._tree.item(rid, "tags") or ())
+        except tk.TclError:
+            return
+        tag = self._TAG_BILLING_REVIEW_ACTIVE
+        if active:
+            if tag not in cur:
+                self._tree.item(rid, tags=cur + (tag,))
+        else:
+            if tag in cur:
+                self._tree.item(rid, tags=tuple(t for t in cur if t != tag))
+
+    def _clear_billing_review_grid_highlight(self) -> None:
+        for rid in self._billing_review_highlighted_iids:
+            self._set_row_billing_review_highlight(rid, False)
+        self._billing_review_highlighted_iids = []
+
+    def _apply_billing_review_grid_highlight(self, iids: list[str]) -> None:
+        self._clear_billing_review_grid_highlight()
+        for rid in iids:
+            self._set_row_billing_review_highlight(rid, True)
+        self._billing_review_highlighted_iids = list(iids)
+        if iids:
+            try:
+                self._tree.see(iids[0])
+            except tk.TclError:
+                pass
+
+    _BILLING_REVIEW_EXCEL_CANVAS_MSG = (
+        "Excel を開きました。内容は Excel ウィンドウで確認してください。"
+    )
+
+    def _open_excel_files_for_billing_review(self, iids: list[str]) -> None:
+        """照合件表示時にグループ内の Excel を既定アプリで開く。"""
+        self._close_row_file()
+        tracked = False
+        for iid in iids:
+            path = self._resolve_file_path_for_row(iid)
+            if path is None or path.suffix.lower() not in EXCEL_SUFFIXES:
+                continue
+            try:
+                if not tracked:
+                    self._open_row_file(iid, force=True)
+                    tracked = True
+                else:
+                    _win_shell_open_file(path)
+            except OSError as e:
+                messagebox.showerror(
+                    "起動できませんでした",
+                    str(e),
+                    parent=self._root,
+                )
+
+    def _open_billing_image_data_review(self) -> None:
+        if self._busy:
+            return
+        initial = self._collect_billing_review_entries()
+        if not initial:
+            scope = self._billing_target_scope_label()
+            messagebox.showinfo(
+                "画像とデータ照合",
+                f"対象: {scope}\n\n"
+                "最終判断が「〇」かつ更新用列（勤務時間または交通費）が"
+                "設定された行がありません。",
+                parent=self._root,
+            )
+            return
+
+        entries: list[BillingReviewEntry] = list(initial)
+        state = {"index": 0}
+
+        top = tk.Toplevel(self._root)
+        top.title("画像とデータ照合")
+        top.minsize(720, 520)
+        try:
+            top.state("zoomed")
+        except tk.TclError:
+            top.geometry("960x720")
+        top.grab_set()
+
+        outer = ttk.Frame(top, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text=(
+                "請求 Excel に書き込む更新用の値と、元ファイルの画像を照合します。"
+                "（空欄は Excel では空セルになります）"
+            ),
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        body = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        img_frame = ttk.LabelFrame(body, text="プレビュー", padding=4)
+        body.add(img_frame, weight=3)
+        img_inner = ttk.Frame(img_frame)
+        img_inner.pack(fill=tk.BOTH, expand=True)
+        preview_scroll = ttk.Frame(img_inner)
+        preview_scroll.pack(fill=tk.BOTH, expand=True, padx=4, pady=(4, 0))
+        preview_canvas = tk.Canvas(preview_scroll, highlightthickness=0)
+        preview_y_scroll = ttk.Scrollbar(
+            preview_scroll, orient=tk.VERTICAL, command=preview_canvas.yview
+        )
+        preview_x_scroll = ttk.Scrollbar(
+            preview_scroll, orient=tk.HORIZONTAL, command=preview_canvas.xview
+        )
+        preview_canvas.configure(
+            xscrollcommand=preview_x_scroll.set,
+            yscrollcommand=preview_y_scroll.set,
+        )
+        preview_canvas.grid(row=0, column=0, sticky="nsew")
+        preview_y_scroll.grid(row=0, column=1, sticky="ns")
+        preview_x_scroll.grid(row=1, column=0, sticky="ew")
+        preview_scroll.rowconfigure(0, weight=1)
+        preview_scroll.columnconfigure(0, weight=1)
+
+        def _on_preview_wheel(event: tk.Event) -> None:
+            delta = getattr(event, "delta", 0)
+            if not delta:
+                return
+            steps = int(-1 * (delta / 120))
+            if event.state & 0x1:
+                preview_canvas.xview_scroll(steps, "units")
+            else:
+                preview_canvas.yview_scroll(steps, "units")
+
+        def _on_preview_wheel_up(_event: tk.Event) -> None:
+            preview_canvas.yview_scroll(-1, "units")
+
+        def _on_preview_wheel_down(_event: tk.Event) -> None:
+            preview_canvas.yview_scroll(1, "units")
+
+        for _wheel_widget in (preview_canvas, preview_scroll):
+            _wheel_widget.bind("<MouseWheel>", _on_preview_wheel)
+            _wheel_widget.bind("<Button-4>", _on_preview_wheel_up)
+            _wheel_widget.bind("<Button-5>", _on_preview_wheel_down)
+
+        def _unbind_preview_wheel() -> None:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                try:
+                    top.unbind_all(seq)
+                except tk.TclError:
+                    pass
+
+        top.bind_all("<MouseWheel>", _on_preview_wheel)
+        top.bind_all("<Button-4>", _on_preview_wheel_up)
+        top.bind_all("<Button-5>", _on_preview_wheel_down)
+
+        open_file_btn = ttk.Button(img_inner, text="ファイルを開く")
+        open_file_btn.pack(pady=(4, 4))
+
+        info_frame = ttk.LabelFrame(body, text="書き込みデータ", padding=8)
+        body.add(info_frame, weight=2)
+
+        nav_var = tk.StringVar(value="")
+        ttk.Label(info_frame, textvariable=nav_var, font=("", 10, "bold")).pack(
+            anchor="w", pady=(0, 8)
+        )
+        no_var = tk.StringVar()
+        file_var = tk.StringVar()
+        emp_var = tk.StringVar()
+        hours_var = tk.StringVar()
+        transport_var = tk.StringVar()
+        for label, var in (
+            ("No", no_var),
+            ("ファイル名", file_var),
+            ("社員番号", emp_var),
+            (self.BILLING_UPDATE_HOURS_COL, hours_var),
+            (self.BILLING_UPDATE_TRANSPORT_COL, transport_var),
+        ):
+            row_f = ttk.Frame(info_frame)
+            row_f.pack(fill=tk.X, pady=2)
+            ttk.Label(row_f, text=f"{label}:", width=28).pack(side=tk.LEFT)
+            ttk.Label(row_f, textvariable=var, wraplength=320, justify="left").pack(
+                side=tk.LEFT, fill=tk.X, expand=True
+            )
+
+        nav_row = ttk.Frame(outer)
+        nav_row.pack(fill=tk.X, pady=(8, 0))
+        prev_btn = ttk.Button(nav_row, text="前へ")
+        prev_btn.pack(side=tk.LEFT)
+        next_btn = ttk.Button(nav_row, text="次へ")
+        next_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        action_row = ttk.Frame(outer)
+        action_row.pack(fill=tk.X, pady=(8, 0))
+        exclude_btn = ttk.Button(action_row, text="最終判断を ✖ にする")
+        exclude_btn.pack(side=tk.LEFT)
+        def _close_review_window() -> None:
+            _unbind_preview_wheel()
+            self._close_row_file()
+            self._clear_billing_review_grid_highlight()
+            top.destroy()
+
+        ttk.Button(action_row, text="閉じる", command=_close_review_window).pack(
+            side=tk.RIGHT
+        )
+        top.protocol("WM_DELETE_WINDOW", _close_review_window)
+
+        def current_entry() -> BillingReviewEntry:
+            return entries[state["index"]]
+
+        _PREVIEW_PAD_X = 8
+        _PREVIEW_TEXT_WIDTH = 520
+        _PREVIEW_CAPTION_H = 22
+        _PREVIEW_MSG_H = 56
+        _PREVIEW_SECTION_GAP = 16
+        _PREVIEW_PAGE_CAPTION_H = 18
+        _PREVIEW_PAGE_GAP = 8
+
+        def _clear_preview_canvas() -> None:
+            preview_canvas.delete("all")
+            self._billing_review_photos = []
+            preview_canvas.configure(scrollregion=(0, 0, 0, 0))
+
+        def _show_preview_message(text: str) -> None:
+            _clear_preview_canvas()
+
+            def _redraw(_event: tk.Event | None = None) -> None:
+                preview_canvas.delete("all")
+                w = preview_canvas.winfo_width()
+                h = preview_canvas.winfo_height()
+                if w <= 1 or h <= 1:
+                    return
+                preview_canvas.create_text(
+                    w / 2,
+                    h / 2,
+                    text=text,
+                    anchor="center",
+                    width=max(w - 24, 80),
+                    justify="center",
+                )
+                preview_canvas.configure(scrollregion=(0, 0, w, h))
+
+            preview_canvas.bind("<Configure>", _redraw)
+            _redraw()
+
+        def refresh_preview_image(entry: BillingReviewEntry) -> None:
+            _show_preview_message("読み込み中…")
+            top.update_idletasks()
+            preview_iids = self._billing_review_preview_iids(entry.iid)
+            any_openable = any(
+                self._resolve_file_path_for_row(iid) is not None for iid in preview_iids
+            )
+            open_file_btn.configure(state=tk.NORMAL if any_openable else tk.DISABLED)
+
+            if preview_iids and all(
+                self._resolve_file_path_for_row(iid) is None for iid in preview_iids
+            ):
+                _show_preview_message("ファイルが見つかりません")
+                return
+
+            preview_canvas.unbind("<Configure>")
+            _clear_preview_canvas()
+            y = _PREVIEW_PAD_X
+            max_w = _PREVIEW_TEXT_WIDTH + _PREVIEW_PAD_X
+
+            for iid in preview_iids:
+                ui_row = self._current_row_dict_from_iid(iid)
+                core = self._row_dict_to_core(ui_row)
+                grid_no = _row_grid_no(core)
+                file_name = self._file_name_from_row(ui_row) or "（なし）"
+                caption = f"No.{grid_no} — {file_name}"
+                preview_canvas.create_text(
+                    _PREVIEW_PAD_X,
+                    y,
+                    text=caption,
+                    anchor="nw",
+                    font=("", 9, "bold"),
+                )
+                y += _PREVIEW_CAPTION_H
+
+                path = self._resolve_file_path_for_row(iid)
+                if path is None:
+                    preview_canvas.create_text(
+                        _PREVIEW_PAD_X,
+                        y,
+                        text="ファイルが見つかりません",
+                        anchor="nw",
+                        width=_PREVIEW_TEXT_WIDTH,
+                        justify="left",
+                    )
+                    y += _PREVIEW_MSG_H
+                    y += _PREVIEW_SECTION_GAP
+                    continue
+
+                suffix = path.suffix.lower()
+                if suffix in EXCEL_SUFFIXES:
+                    preview_canvas.create_text(
+                        _PREVIEW_PAD_X,
+                        y,
+                        text=self._BILLING_REVIEW_EXCEL_CANVAS_MSG,
+                        anchor="nw",
+                        width=_PREVIEW_TEXT_WIDTH,
+                        justify="left",
+                    )
+                    y += _PREVIEW_MSG_H
+                    y += _PREVIEW_SECTION_GAP
+                    continue
+                if suffix != PDF_SUFFIX and suffix not in IMAGE_SUFFIXES:
+                    preview_canvas.create_text(
+                        _PREVIEW_PAD_X,
+                        y,
+                        text="この形式はプレビューできません",
+                        anchor="nw",
+                        width=_PREVIEW_TEXT_WIDTH,
+                        justify="left",
+                    )
+                    y += _PREVIEW_MSG_H
+                    y += _PREVIEW_SECTION_GAP
+                    continue
+
+                page_images = load_billing_preview_pages(path, max_edge_px=900)
+                if not page_images:
+                    preview_canvas.create_text(
+                        _PREVIEW_PAD_X,
+                        y,
+                        text="プレビューを表示できません",
+                        anchor="nw",
+                        width=_PREVIEW_TEXT_WIDTH,
+                        justify="left",
+                    )
+                    y += _PREVIEW_MSG_H
+                    y += _PREVIEW_SECTION_GAP
+                    continue
+
+                page_total = len(page_images)
+                for page_index, pil in enumerate(page_images, start=1):
+                    if page_total > 1:
+                        preview_canvas.create_text(
+                            _PREVIEW_PAD_X,
+                            y,
+                            text=f"ページ {page_index} / {page_total}",
+                            anchor="nw",
+                            font=("", 9),
+                        )
+                        y += _PREVIEW_PAGE_CAPTION_H
+
+                    photo = ImageTk.PhotoImage(pil)
+                    self._billing_review_photos.append(photo)
+                    iw, ih = pil.size
+                    preview_canvas.create_image(
+                        _PREVIEW_PAD_X, y, anchor="nw", image=photo
+                    )
+                    y += ih
+                    max_w = max(max_w, _PREVIEW_PAD_X + iw)
+                    if page_index < page_total:
+                        y += _PREVIEW_PAGE_GAP
+
+                y += _PREVIEW_SECTION_GAP
+
+            preview_canvas.configure(scrollregion=(0, 0, max_w, max(y, 1)))
+            preview_canvas.xview_moveto(0)
+            preview_canvas.yview_moveto(0)
+
+        def show_at_index(idx: int) -> None:
+            if not entries:
+                top.destroy()
+                return
+            state["index"] = max(0, min(idx, len(entries) - 1))
+            entry = current_entry()
+            nav_var.set(f"{state['index'] + 1} / {len(entries)}")
+            no_disp = (
+                str(entry.grid_no)
+                if entry.grid_no < 10**9
+                else "—"
+            )
+            no_var.set(no_disp)
+            file_var.set(self._billing_review_file_names_display(entry.iid))
+            emp_var.set(entry.employee_no or "（なし）")
+            hours_var.set(self._billing_cell_preview(entry.hours_write))
+            transport_var.set(self._billing_cell_preview(entry.transport_write))
+            prev_btn.configure(state=(tk.NORMAL if state["index"] > 0 else tk.DISABLED))
+            next_btn.configure(
+                state=(tk.NORMAL if state["index"] < len(entries) - 1 else tk.DISABLED)
+            )
+            preview_iids = self._billing_review_preview_iids(entry.iid)
+            self._apply_billing_review_grid_highlight(preview_iids)
+            refresh_preview_image(entry)
+            self._open_excel_files_for_billing_review(preview_iids)
+
+        def on_prev() -> None:
+            show_at_index(state["index"] - 1)
+
+        def on_next() -> None:
+            show_at_index(state["index"] + 1)
+
+        def on_open_file() -> None:
+            entry = current_entry()
+            for iid in self._billing_review_preview_iids(entry.iid):
+                if self._resolve_file_path_for_row(iid) is not None:
+                    self._open_row_file(iid, force=True)
+
+        def on_exclude() -> None:
+            entry = current_entry()
+            core = self._row_dict_to_core(self._current_row_dict_from_iid(entry.iid))
+            core["user_judgment_company"] = "✖"
+            core[self.FINAL_JUDGMENT_COL] = "✖"
+            self._replace_row_with_result(entry.iid, core)
+            self._loaded_rows = self._current_grid_rows()
+            idx = state["index"]
+            entries.pop(idx)
+            if not entries:
+                messagebox.showinfo(
+                    "画像とデータ照合",
+                    "照合対象がなくなりました。",
+                    parent=top,
+                )
+                top.destroy()
+                return
+            show_at_index(min(idx, len(entries) - 1))
+
+        prev_btn.configure(command=on_prev)
+        next_btn.configure(command=on_next)
+        open_file_btn.configure(command=on_open_file)
+        exclude_btn.configure(command=on_exclude)
+        top.bind("<Left>", lambda _e: on_prev())
+        top.bind("<Right>", lambda _e: on_next())
+
+        try:
+            show_at_index(0)
+            top.wait_window()
+        finally:
+            _unbind_preview_wheel()
+            self._close_row_file()
+            self._clear_billing_review_grid_highlight()
 
     def _prompt_billing_duplicate_resolution(
         self,
@@ -2329,6 +2863,8 @@ class KintaiApp(tk.Frame):
         """有効社員番号が2行以上あるとき、該当行全体の文字色を赤にする。"""
         tag_dup = self._TAG_DUP_EMPLOYEE_NO
         tag_reanalysis = self._TAG_REANALYSIS_ACTIVE
+        tag_billing_review = self._TAG_BILLING_REVIEW_ACTIVE
+        preserve_tags = (tag_reanalysis, tag_billing_review)
         counts: dict[str, int] = {}
         for iid in self._tree.get_children():
             row = self._row_dict_to_core(
@@ -2351,12 +2887,12 @@ class KintaiApp(tk.Frame):
             key = _normalize_employee_no_cell_value(_row_employee_no(row))
             is_dup = _is_valid_employee_no(key) and key in dup_keys
             without_dup = tuple(t for t in cur if t != tag_dup)
-            other = tuple(t for t in without_dup if t != tag_reanalysis)
-            has_reanalysis = tag_reanalysis in without_dup
+            other = tuple(t for t in without_dup if t not in preserve_tags)
+            kept = tuple(t for t in preserve_tags if t in without_dup)
             if is_dup:
-                new_tags = (tag_dup,) + other + ((tag_reanalysis,) if has_reanalysis else ())
+                new_tags = (tag_dup,) + other + kept
             else:
-                new_tags = other + ((tag_reanalysis,) if has_reanalysis else ())
+                new_tags = other + kept
             if new_tags != cur:
                 self._tree.item(iid, tags=new_tags)
 
@@ -3030,6 +3566,7 @@ class KintaiApp(tk.Frame):
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
         self._billing_delete_btn.configure(state=tk.DISABLED)
+        self._billing_review_btn.configure(state=tk.DISABLED)
         self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set("再解析中 0 / 1")
         self._status_var.set(f"再解析しています… {file_name}")
@@ -3162,6 +3699,7 @@ class KintaiApp(tk.Frame):
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
         self._billing_delete_btn.configure(state=tk.DISABLED)
+        self._billing_review_btn.configure(state=tk.DISABLED)
         self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set(f"{label}中 0 / {total}")
         self._status_var.set(f"{label}しています… {total} 件（並列 {parallel}）")
@@ -3957,6 +4495,7 @@ class KintaiApp(tk.Frame):
         self._error_reanalysis_btn.configure(state=tk.DISABLED)
         self._billing_prepare_btn.configure(state=tk.DISABLED)
         self._billing_delete_btn.configure(state=tk.DISABLED)
+        self._billing_review_btn.configure(state=tk.DISABLED)
         self._billing_update_btn.configure(state=tk.DISABLED)
         self._progress_var.set("")
         self._status_var.set("解析を準備しています…")
