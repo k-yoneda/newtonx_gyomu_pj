@@ -3029,12 +3029,230 @@ def _row_grid_no(row: dict[str, str]) -> int:
     return 10**9
 
 
+@dataclass(frozen=True)
+class BillingDuplicateResolution:
+    """会社+社員番号重複グループの勤務・交通費の解決方法。"""
+
+    hours_mode: str  # "pick" | "sum"
+    hours_pick_index: int
+    transport_mode: str  # "pick" | "sum"
+    transport_pick_index: int
+
+
+@dataclass(frozen=True)
+class BillingDuplicateGroupInfo:
+    """請求データ作成時に解決が必要な重複グループ。"""
+
+    key: tuple[str, str]
+    company_display: str
+    employee_no: str
+    member_indices: tuple[int, ...]
+    needs_dialog: bool
+
+
+def billing_duplicate_group_key(row: dict[str, str]) -> tuple[str, str] | None:
+    """ファイル名会社（照合コア）と社員番号による重複グループキー。"""
+    fn = _row_file_name(row)
+    if not fn:
+        return None
+    co, _ = _parse_filename_company_and_person(fn)
+    core = _company_core_for_match(co)
+    emp = _normalize_employee_no_cell_value(_row_employee_no(row))
+    if not core or not _is_valid_employee_no(emp):
+        return None
+    return (core, emp)
+
+
+def billing_row_update_candidates(row: dict[str, str]) -> tuple[str, str]:
+    """更新用列へコピーする正規化後の勤務・交通費候補。"""
+    hours = _normalize_billing_update_hours_copy(_row_total_hours_decimal(row))
+    transport = _normalize_billing_update_transport_copy(
+        _row_transport_expense_raw(row)
+    )
+    return hours, transport
+
+
+def _billing_duplicate_member_sort_key(
+    rows: list[dict[str, str]], index: int
+) -> tuple[int, int]:
+    return (_row_grid_no(rows[index]), index)
+
+
+def group_billing_duplicate_indices(
+    rows: list[dict[str, str]],
+) -> dict[tuple[str, str], list[int]]:
+    groups: dict[tuple[str, str], list[int]] = {}
+    for i, row in enumerate(rows):
+        key = billing_duplicate_group_key(row)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(i)
+    return groups
+
+
+def billing_duplicate_group_needs_dialog(members: list[dict[str, str]]) -> bool:
+    hours_vals: set[str] = set()
+    transport_vals: set[str] = set()
+    for m in members:
+        h, t = billing_row_update_candidates(m)
+        hours_vals.add(h)
+        transport_vals.add(t)
+    return len(hours_vals) > 1 or len(transport_vals) > 1
+
+
+def build_billing_duplicate_groups(
+    rows: list[dict[str, str]],
+) -> list[BillingDuplicateGroupInfo]:
+    groups = group_billing_duplicate_indices(rows)
+    out: list[BillingDuplicateGroupInfo] = []
+    for key, idxs in groups.items():
+        if len(idxs) < 2:
+            continue
+        idxs_sorted = sorted(
+            idxs, key=lambda i: _billing_duplicate_member_sort_key(rows, i)
+        )
+        members = [rows[i] for i in idxs_sorted]
+        fn = _row_file_name(members[0])
+        co, _ = _parse_filename_company_and_person(fn)
+        out.append(
+            BillingDuplicateGroupInfo(
+                key=key,
+                company_display=(co or key[0]),
+                employee_no=key[1],
+                member_indices=tuple(idxs_sorted),
+                needs_dialog=billing_duplicate_group_needs_dialog(members),
+            )
+        )
+    return out
+
+
+def _format_hours_decimal_sum(total: float) -> str:
+    if abs(total) < 1e-9:
+        return ""
+    rounded = round(total, 2)
+    if math.isclose(rounded, round(rounded), abs_tol=1e-9):
+        return str(int(round(rounded)))
+    return f"{rounded:.2f}".rstrip("0").rstrip(".")
+
+
+def resolve_billing_hours_from_group(
+    members: list[dict[str, str]],
+    mode: str,
+    pick_index: int,
+) -> str:
+    if mode == "pick":
+        if not members:
+            return ""
+        idx = max(0, min(pick_index, len(members) - 1))
+        return billing_row_update_candidates(members[idx])[0]
+    total = 0.0
+    for m in members:
+        raw = _row_total_hours_decimal(m)
+        if _is_valid_total_hours_decimal(raw):
+            try:
+                total += float(raw)
+            except ValueError:
+                pass
+    return _format_hours_decimal_sum(total)
+
+
+def resolve_billing_transport_from_group(
+    members: list[dict[str, str]],
+    mode: str,
+    pick_index: int,
+) -> str:
+    if mode == "pick":
+        if not members:
+            return ""
+        idx = max(0, min(pick_index, len(members) - 1))
+        return billing_row_update_candidates(members[idx])[1]
+    total = 0.0
+    for m in members:
+        kind, amount = _transport_for_billing_excel(_row_transport_expense_raw(m))
+        if kind == "amount" and amount is not None:
+            total += amount
+    if abs(total) < 1e-9:
+        return ""
+    return _format_transport_sum(total)
+
+
+def _set_row_final_judgment(row: dict[str, str], symbol: str) -> None:
+    sym = normalize_judgment_symbol(symbol)
+    row["user_judgment_company"] = sym
+    row[SUMMARY_FINAL_JUDGMENT_COL] = sym
+
+
+def _default_billing_duplicate_resolution() -> BillingDuplicateResolution:
+    return BillingDuplicateResolution(
+        hours_mode="pick",
+        hours_pick_index=0,
+        transport_mode="pick",
+        transport_pick_index=0,
+    )
+
+
+def apply_billing_create_for_rows(
+    rows: list[dict[str, str]],
+    duplicate_resolutions: dict[tuple[str, str], BillingDuplicateResolution]
+    | None = None,
+) -> int:
+    """請求データ作成: 更新用列と重複グループの最終判断を設定する（in-place）。"""
+    if not rows:
+        return 0
+
+    resolutions = duplicate_resolutions or {}
+    for row in rows:
+        _clear_billing_update_columns(row)
+
+    groups = group_billing_duplicate_indices(rows)
+    duplicate_keys = {k for k, idxs in groups.items() if len(idxs) >= 2}
+    updated_rows = 0
+
+    for key in duplicate_keys:
+        idxs = groups[key]
+        idxs_sorted = sorted(
+            idxs, key=lambda i: _billing_duplicate_member_sort_key(rows, i)
+        )
+        members = [rows[i] for i in idxs_sorted]
+        rep_index = idxs_sorted[0]
+
+        res = resolutions.get(key, _default_billing_duplicate_resolution())
+        hours = resolve_billing_hours_from_group(
+            members, res.hours_mode, res.hours_pick_index
+        )
+        transport = resolve_billing_transport_from_group(
+            members, res.transport_mode, res.transport_pick_index
+        )
+        if hours or transport:
+            _set_billing_update_columns(
+                rows[rep_index], hours=hours, transport=transport
+            )
+            updated_rows += 1
+        _set_row_final_judgment(rows[rep_index], "〇")
+        for i in idxs_sorted[1:]:
+            _set_row_final_judgment(rows[i], "✖")
+
+    for i, row in enumerate(rows):
+        key = billing_duplicate_group_key(row)
+        if key is not None and key in duplicate_keys:
+            continue
+        emp = _row_employee_no(row)
+        if not _is_valid_employee_no(emp):
+            continue
+        hours, transport = billing_row_update_candidates(row)
+        if not hours and not transport:
+            continue
+        _set_billing_update_columns(row, hours=hours, transport=transport)
+        updated_rows += 1
+
+    return updated_rows
+
+
 def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
     """表示順の行リストについて更新用列を設定する（in-place）。
 
-    有効な社員番号の各行について、合計勤務時間（10進）・交通費合計（読取）を
-    その行の更新用列にコピーする（同一社員番号の複数行は合算しない）。
-    戻り値: 更新用値を設定した行数。
+    重複グループがあっても行ごとに独立コピー（最終判断は変更しない）。
+    GUI の請求データ作成は ``apply_billing_create_for_rows`` を使用する。
     """
     if not rows:
         return 0
@@ -3047,8 +3265,7 @@ def populate_billing_update_columns(rows: list[dict[str, str]]) -> int:
         emp = _row_employee_no(row)
         if not _is_valid_employee_no(emp):
             continue
-        hours = _normalize_billing_update_copy(_row_total_hours_decimal(row))
-        transport = _normalize_billing_update_copy(_row_transport_expense_raw(row))
+        hours, transport = billing_row_update_candidates(row)
         if not hours and not transport:
             continue
         _set_billing_update_columns(
@@ -3130,14 +3347,47 @@ def _billing_value_is_no_data(value: str) -> bool:
 
 
 def _normalize_billing_update_copy(value: str) -> str:
-    """請求用更新列へコピーする値（データなしは空文字）。"""
+    """交通費読取→更新用交通費へのコピー（後方互換の別名）。"""
+    return _normalize_billing_update_transport_copy(value)
+
+
+def _normalize_billing_update_hours_copy(value: str) -> str:
+    """合計勤務時間（10進）→更新用勤務へのコピー（データなし・0は空文字）。"""
     if _billing_value_is_no_data(value):
         return ""
-    return (value or "").strip()
+    t = (value or "").strip()
+    if not t:
+        return ""
+    if _is_valid_total_hours_decimal(t):
+        try:
+            if abs(float(t)) < 1e-9:
+                return ""
+        except ValueError:
+            pass
+        return t
+    return ""
+
+
+def _normalize_billing_update_transport_copy(value: str) -> str:
+    """交通費（読取）→更新用交通費へのコピー（データなし・0相当は空文字）。"""
+    if _billing_value_is_no_data(value):
+        return ""
+    t = (value or "").strip()
+    if not t:
+        return ""
+    kind, _amount = _transport_for_billing_excel(t)
+    if kind in ("empty", "zero"):
+        return ""
+    if kind == "invalid":
+        return ""
+    return t
 
 
 def _transport_for_billing_excel(value: str) -> tuple[str, float | None]:
-    """O列書き込み値。(kind, amount)。kind は amount / empty / invalid。"""
+    """O列書き込み値。(kind, amount)。kind は amount / empty / zero / invalid。
+
+    zero は数値0・0円・（なし）等。Excel・更新用列は空セル扱い。
+    """
     t = (value or "").strip()
     if _is_billing_aggregated_marker(t):
         return "invalid", None
@@ -3145,15 +3395,18 @@ def _transport_for_billing_excel(value: str) -> tuple[str, float | None]:
     if not nfkc or _billing_value_is_no_data(t):
         return "empty", None
     if nfkc in _TRANSPORT_ZERO_FOR_EXCEL:
-        return "amount", 0.0
+        return "zero", None
     nfkc = nfkc.replace("，", "").replace(",", "").replace("、", "").replace("円", "")
     m = re.search(r"(\d+(?:\.\d+)?)", nfkc)
     if not m:
         return "invalid", None
     try:
-        return "amount", float(m.group(1))
+        amount = float(m.group(1))
     except ValueError:
         return "invalid", None
+    if abs(amount) < 1e-9:
+        return "zero", None
+    return "amount", amount
 
 
 def _transport_amount_for_excel(value: str) -> tuple[float | None, bool]:
@@ -3231,9 +3484,9 @@ def transport_ai_read_state_label(raw: str, file_name: str) -> str:
         return AI_READ_STATE_LABEL_ABNORMAL
     if kind == "empty":
         return AI_READ_STATE_LABEL_NO_DATA
+    if kind == "zero":
+        return AI_READ_STATE_LABEL_ZERO
     if kind == "amount":
-        if amount is not None and abs(amount) < 1e-9:
-            return AI_READ_STATE_LABEL_ZERO
         return AI_READ_STATE_LABEL_VALUE
     return AI_READ_STATE_LABEL_ABNORMAL
 
@@ -3340,7 +3593,7 @@ class BillingTsWriteItem:
 
     file_name: str
     sheet_row_indices: list[int]
-    new_hours: float
+    new_hours: float | None
     new_transport: float | None
     old_hours_display: str
     old_transport_display: str
@@ -3448,19 +3701,34 @@ def plan_billing_ts_writes(
             if _is_billing_aggregated_marker(hours_raw):
                 planned.append("✖")
                 continue
-            hours = _hours_decimal_for_excel(hours_raw)
-            if hours is None:
-                planned.append(BILLING_UPDATE_INVALID_HOURS)
-                continue
+            hours_write: float | None
+            if not (hours_raw or "").strip():
+                hours_write = None
+            else:
+                hours_parsed = _hours_decimal_for_excel(hours_raw)
+                if hours_parsed is None:
+                    planned.append(BILLING_UPDATE_INVALID_HOURS)
+                    continue
+                if abs(hours_parsed) < 1e-9:
+                    hours_write = None
+                else:
+                    hours_write = hours_parsed
             t_kind, t_amount = _transport_for_billing_excel(
                 _row_billing_update_transport(row)
             )
             if t_kind == "invalid":
                 planned.append(BILLING_UPDATE_INVALID_TRANSPORT)
                 continue
-            transport_write: float | None = t_amount if t_kind == "amount" else None
+            if t_kind == "amount":
+                transport_write: float | None = t_amount
+            else:
+                transport_write = None
             old_h, old_t, needs_confirm = _billing_ts_old_values_for_targets(ws, targets)
-            new_h_disp = _billing_ts_cell_display(hours)
+            new_h_disp = (
+                ""
+                if hours_write is None
+                else _billing_ts_cell_display(hours_write)
+            )
             new_t_disp = (
                 ""
                 if transport_write is None
@@ -3470,7 +3738,7 @@ def plan_billing_ts_writes(
                 BillingTsWriteItem(
                     file_name=file_name,
                     sheet_row_indices=list(targets),
-                    new_hours=hours,
+                    new_hours=hours_write,
                     new_transport=transport_write,
                     old_hours_display=old_h,
                     old_transport_display=old_t,

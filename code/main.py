@@ -66,6 +66,13 @@ from kintai_core import (
     is_manual_user_judgment,
     normalize_judgment_symbol,
     clear_billing_update_hours_column,
+    apply_billing_create_for_rows,
+    build_billing_duplicate_groups,
+    BillingDuplicateResolution,
+    BillingDuplicateGroupInfo,
+    billing_row_update_candidates,
+    resolve_billing_hours_from_group,
+    resolve_billing_transport_from_group,
     populate_billing_update_columns,
     row_display_values,
     sync_row_ai_read_states,
@@ -109,6 +116,10 @@ from kintai_core import (
     _is_valid_employee_no,
     _row_employee_no,
     _normalize_employee_no_cell_value,
+    _row_file_name,
+    _row_grid_no,
+    _row_total_hours_decimal,
+    _row_transport_expense_raw,
 )
 from newtonx_adk.exceptions import APIError
 
@@ -1276,6 +1287,237 @@ class KintaiApp(tk.Frame):
             else:
                 messagebox.showinfo(title, "\n".join(lines), parent=self._root)
 
+    def _billing_cell_preview(self, value: str) -> str:
+        t = (value or "").strip()
+        return t if t else "（空）"
+
+    def _prompt_billing_duplicate_resolution(
+        self,
+        rows: list[dict[str, str]],
+        groups: list[BillingDuplicateGroupInfo],
+    ) -> dict[tuple[str, str], BillingDuplicateResolution] | None:
+        if not groups:
+            return {}
+
+        top = tk.Toplevel(self._root)
+        top.title("請求データ作成 — 重複の解決")
+        top.transient(self._root)
+        top.geometry("920x520")
+        top.minsize(640, 320)
+
+        outer = ttk.Frame(top, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text=(
+                "ファイル名の会社名と社員番号が同じ行があります。\n"
+                "勤務時間と交通費は別々に選べます。「合算」はその項目だけ"
+                "全行を足した値を代表行に載せます。\n"
+                "結果は No が小さい行の更新用列に設定し、その行を最終判断「〇」、"
+                "他行を「✖」にします。"
+            ),
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        table_wrap = ttk.Frame(outer)
+        table_wrap.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(table_wrap, highlightthickness=0)
+        y_scroll = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        def _on_inner_configure(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_canvas_configure(event: tk.Event) -> None:
+            if event.width > 1:
+                canvas.itemconfig(canvas_window, width=event.width)
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=y_scroll.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_dialog_mousewheel(event: tk.Event) -> None:
+            delta = getattr(event, "delta", 0)
+            if delta:
+                canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+        def _on_dialog_mousewheel_linux_up(_event: tk.Event) -> None:
+            canvas.yview_scroll(-1, "units")
+
+        def _on_dialog_mousewheel_linux_down(_event: tk.Event) -> None:
+            canvas.yview_scroll(1, "units")
+
+        def _unbind_dialog_mousewheel() -> None:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                try:
+                    top.unbind_all(seq)
+                except tk.TclError:
+                    pass
+
+        top.bind_all("<MouseWheel>", _on_dialog_mousewheel)
+        top.bind_all("<Button-4>", _on_dialog_mousewheel_linux_up)
+        top.bind_all("<Button-5>", _on_dialog_mousewheel_linux_down)
+
+        hours_vars: list[tk.StringVar] = []
+        transport_vars: list[tk.StringVar] = []
+        grid_row = 0
+
+        for gi, group in enumerate(groups):
+            members = [rows[i] for i in group.member_indices]
+            ttk.Label(
+                inner,
+                text=(
+                    f"【{gi + 1}】 {group.company_display} / 社員番号 {group.employee_no}"
+                    f"（{len(members)} 件）"
+                ),
+                font=("", 9, "bold"),
+            ).grid(row=grid_row, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2))
+            grid_row += 1
+            ttk.Label(
+                inner,
+                text=(
+                    "下で「代表行（No 最小）に載せる値」を選びます。"
+                    "勤務と交通費は別々に選べます。"
+                ),
+            ).grid(row=grid_row, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4))
+            grid_row += 1
+
+            headers = ("No", "ファイル名", "勤務（10進）", "交通費（読取）")
+            for col, title in enumerate(headers):
+                ttk.Label(inner, text=title, font=("", 9, "bold")).grid(
+                    row=grid_row, column=col, sticky="w", padx=4, pady=2
+                )
+            grid_row += 1
+
+            hours_pick_choices: list[tuple[str, str]] = []
+            transport_pick_choices: list[tuple[str, str]] = []
+            for mi, row_idx in enumerate(group.member_indices):
+                row = rows[row_idx]
+                no = _row_grid_no(row)
+                if no >= 10**9:
+                    no_disp = "—"
+                else:
+                    no_disp = str(no)
+                fn = _row_file_name(row)
+                if len(fn) > 36:
+                    fn = fn[:33] + "..."
+                h_cand, t_cand = billing_row_update_candidates(row)
+                for col, text in enumerate(
+                    (
+                        no_disp,
+                        fn,
+                        self._billing_cell_preview(_row_total_hours_decimal(row)),
+                        self._billing_cell_preview(_row_transport_expense_raw(row)),
+                    )
+                ):
+                    ttk.Label(inner, text=text).grid(
+                        row=grid_row, column=col, sticky="w", padx=4, pady=2
+                    )
+                hours_pick_choices.append(
+                    (
+                        f"pick:{mi}",
+                        f"No.{no_disp} の勤務: {self._billing_cell_preview(h_cand)}",
+                    )
+                )
+                transport_pick_choices.append(
+                    (
+                        f"pick:{mi}",
+                        f"No.{no_disp} の交通費: {self._billing_cell_preview(t_cand)}",
+                    )
+                )
+                grid_row += 1
+
+            rep_row = rows[group.member_indices[0]]
+            rep_no = _row_grid_no(rep_row)
+            rep_no_disp = str(rep_no) if rep_no < 10**9 else "—"
+            hours_sum = resolve_billing_hours_from_group(members, "sum", 0)
+            transport_sum = resolve_billing_transport_from_group(members, "sum", 0)
+            hours_pick_choices.append(
+                (
+                    "sum:",
+                    f"No.{rep_no_disp} に勤務時間を合算: "
+                    f"{self._billing_cell_preview(hours_sum)}",
+                )
+            )
+            transport_pick_choices.append(
+                (
+                    "sum:",
+                    f"No.{rep_no_disp} に交通費を合算: "
+                    f"{self._billing_cell_preview(transport_sum)}",
+                )
+            )
+
+            hv = tk.StringVar(value="pick:0")
+            tv = tk.StringVar(value="pick:0")
+            hours_vars.append(hv)
+            transport_vars.append(tv)
+
+            hf = ttk.LabelFrame(inner, text="勤務時間（代表行へ反映）", padding=(6, 4))
+            hf.grid(row=grid_row, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
+            for pi, (val, label) in enumerate(hours_pick_choices):
+                ttk.Radiobutton(hf, text=label, variable=hv, value=val).grid(
+                    row=pi, column=0, sticky="w", padx=(0, 12), pady=1
+                )
+            grid_row += 1
+
+            tf = ttk.LabelFrame(inner, text="交通費（代表行へ反映）", padding=(6, 4))
+            tf.grid(row=grid_row, column=0, columnspan=4, sticky="ew", padx=4, pady=(0, 8))
+            for pi, (val, label) in enumerate(transport_pick_choices):
+                ttk.Radiobutton(tf, text=label, variable=tv, value=val).grid(
+                    row=pi, column=0, sticky="w", padx=(0, 12), pady=1
+                )
+            grid_row += 1
+
+        result: dict[str, object] = {"ok": False}
+
+        def _parse_choice(raw: str) -> tuple[str, int]:
+            if raw.startswith("sum"):
+                return "sum", 0
+            if raw.startswith("pick:"):
+                try:
+                    return "pick", int(raw.split(":", 1)[1])
+                except ValueError:
+                    return "pick", 0
+            return "pick", 0
+
+        def on_ok() -> None:
+            out: dict[tuple[str, str], BillingDuplicateResolution] = {}
+            for group, hv, tv in zip(groups, hours_vars, transport_vars, strict=True):
+                hm, hi = _parse_choice(hv.get())
+                tm, ti = _parse_choice(tv.get())
+                out[group.key] = BillingDuplicateResolution(
+                    hours_mode=hm,
+                    hours_pick_index=hi,
+                    transport_mode=tm,
+                    transport_pick_index=ti,
+                )
+            result["ok"] = True
+            result["data"] = out
+            _unbind_dialog_mousewheel()
+            top.destroy()
+
+        def on_cancel() -> None:
+            _unbind_dialog_mousewheel()
+            top.destroy()
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="キャンセル", command=on_cancel).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+        top.bind("<Escape>", lambda _e: on_cancel())
+        try:
+            top.wait_window()
+        finally:
+            _unbind_dialog_mousewheel()
+        if not result.get("ok"):
+            return None
+        return result.get("data") or {}
+
     def _create_billing_data(self) -> None:
         if self._busy:
             return
@@ -1291,7 +1533,9 @@ class KintaiApp(tk.Frame):
             "請求データ作成",
             f"対象: {scope}\n\n"
             "各行について、更新用合計勤務時間（10進）・更新用交通費合計を\n"
-            "その行の読取値から作成します（同一社員番号の行も合算しません）。",
+            "読取値から作成します。\n"
+            "ファイル名の会社名と社員番号が同じ行がある場合は、\n"
+            "採用・合算を選ぶダイアログを表示します（代表は No が小さい行）。",
             parent=self._root,
         ):
             return
@@ -1301,7 +1545,13 @@ class KintaiApp(tk.Frame):
             ordered.append((iid, self._row_dict_to_core(self._current_row_dict_from_iid(iid))))
 
         cores = [core for _, core in ordered]
-        updated_count = populate_billing_update_columns(cores)
+        dup_groups = build_billing_duplicate_groups(cores)
+        dialog_groups = [g for g in dup_groups if g.needs_dialog]
+        resolutions = self._prompt_billing_duplicate_resolution(cores, dialog_groups)
+        if resolutions is None:
+            return
+
+        updated_count = apply_billing_create_for_rows(cores, resolutions)
         for (iid, _), core in zip(ordered, cores, strict=True):
             self._replace_row_with_result(iid, core)
 
@@ -1476,14 +1726,17 @@ class KintaiApp(tk.Frame):
                 continue
             core_row = self._row_dict_to_core(ui_row)
             hours_val = _row_billing_update_hours_decimal(core_row)
-            if not hours_val or _is_billing_aggregated_marker(hours_val):
+            transport_val = _row_billing_update_transport(core_row)
+            if _is_billing_aggregated_marker(hours_val):
+                continue
+            if not (hours_val or "").strip() and not (transport_val or "").strip():
                 continue
             targets.append((iid, core_row))
         if not targets:
             messagebox.showinfo(
                 "請求ファイル更新",
                 f"対象: {scope}\n\n"
-                "この範囲のうち、最終判断が「〇」かつ更新用合計勤務時間（10進）が"
+                "この範囲のうち、最終判断が「〇」かつ更新用列（勤務時間または交通費）が"
                 "設定された行がありません。\n"
                 "先に「請求データ作成」を実行してください。",
                 parent=self._root,
