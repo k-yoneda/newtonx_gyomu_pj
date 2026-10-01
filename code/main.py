@@ -115,6 +115,10 @@ from kintai_core import (
     _row_billing_update_hours_decimal,
     _row_billing_update_transport,
     _normalize_billing_update_copy,
+    _normalize_billing_update_hours_copy,
+    _normalize_billing_update_transport_copy,
+    _billing_value_is_no_data,
+    _set_billing_update_columns,
     _company_text_contains_seraku,
     _document_company_for_display,
     _is_valid_employee_no,
@@ -1565,8 +1569,6 @@ class KintaiApp(tk.Frame):
             ("No", no_var),
             ("ファイル名", file_var),
             ("社員番号", emp_var),
-            (self.BILLING_UPDATE_HOURS_COL, hours_var),
-            (self.BILLING_UPDATE_TRANSPORT_COL, transport_var),
         ):
             row_f = ttk.Frame(info_frame)
             row_f.pack(fill=tk.X, pady=2)
@@ -1574,6 +1576,18 @@ class KintaiApp(tk.Frame):
             ttk.Label(row_f, textvariable=var, wraplength=320, justify="left").pack(
                 side=tk.LEFT, fill=tk.X, expand=True
             )
+        for label, var in (
+            (self.BILLING_UPDATE_HOURS_COL, hours_var),
+            (self.BILLING_UPDATE_TRANSPORT_COL, transport_var),
+        ):
+            row_f = ttk.Frame(info_frame)
+            row_f.pack(fill=tk.X, pady=2)
+            ttk.Label(row_f, text=f"{label}:", width=28).pack(side=tk.LEFT)
+            ttk.Entry(row_f, textvariable=var, width=24).pack(
+                side=tk.LEFT, fill=tk.X, expand=True
+            )
+        apply_grid_btn = ttk.Button(info_frame, text="グリッド更新")
+        apply_grid_btn.pack(anchor="w", pady=(8, 0))
 
         nav_row = ttk.Frame(outer)
         nav_row.pack(fill=tk.X, pady=(8, 0))
@@ -1586,7 +1600,30 @@ class KintaiApp(tk.Frame):
         action_row.pack(fill=tk.X, pady=(8, 0))
         exclude_btn = ttk.Button(action_row, text="最終判断を ✖ にする")
         exclude_btn.pack(side=tk.LEFT)
+
+        def current_entry() -> BillingReviewEntry:
+            return entries[state["index"]]
+
+        def _review_fields_dirty() -> bool:
+            entry = current_entry()
+            return (
+                hours_var.get().strip() != (entry.hours_write or "").strip()
+                or transport_var.get().strip() != (entry.transport_write or "").strip()
+            )
+
+        def _confirm_discard_if_dirty() -> bool:
+            if not _review_fields_dirty():
+                return True
+            answer = messagebox.askyesnocancel(
+                "未反映の編集",
+                "グリッドに反映していない変更があります。\n破棄して続行しますか？",
+                parent=top,
+            )
+            return answer is True
+
         def _close_review_window() -> None:
+            if not _confirm_discard_if_dirty():
+                return
             _unbind_preview_wheel()
             self._close_row_file()
             self._clear_billing_review_grid_highlight()
@@ -1596,9 +1633,6 @@ class KintaiApp(tk.Frame):
             side=tk.RIGHT
         )
         top.protocol("WM_DELETE_WINDOW", _close_review_window)
-
-        def current_entry() -> BillingReviewEntry:
-            return entries[state["index"]]
 
         _PREVIEW_PAD_X = 8
         _PREVIEW_TEXT_WIDTH = 520
@@ -1768,8 +1802,8 @@ class KintaiApp(tk.Frame):
             no_var.set(no_disp)
             file_var.set(self._billing_review_file_names_display(entry.iid))
             emp_var.set(entry.employee_no or "（なし）")
-            hours_var.set(self._billing_cell_preview(entry.hours_write))
-            transport_var.set(self._billing_cell_preview(entry.transport_write))
+            hours_var.set((entry.hours_write or "").strip())
+            transport_var.set((entry.transport_write or "").strip())
             prev_btn.configure(state=(tk.NORMAL if state["index"] > 0 else tk.DISABLED))
             next_btn.configure(
                 state=(tk.NORMAL if state["index"] < len(entries) - 1 else tk.DISABLED)
@@ -1779,10 +1813,69 @@ class KintaiApp(tk.Frame):
             refresh_preview_image(entry)
             self._open_excel_files_for_billing_review(preview_iids)
 
+        def _parse_review_update_fields(
+            *,
+            show_errors: bool,
+        ) -> tuple[str, str] | None:
+            h_raw = hours_var.get().strip()
+            t_raw = transport_var.get().strip()
+            hours = _normalize_billing_update_hours_copy(h_raw)
+            transport = _normalize_billing_update_transport_copy(t_raw)
+            if h_raw and not hours and not _billing_value_is_no_data(h_raw):
+                if show_errors:
+                    messagebox.showerror(
+                        "グリッド更新",
+                        f"{self.BILLING_UPDATE_HOURS_COL}の形式が正しくありません。\n"
+                        "整数、または小数点以下2桁までの数値を入力してください。",
+                        parent=top,
+                    )
+                return None
+            if t_raw and not transport:
+                if show_errors:
+                    messagebox.showerror(
+                        "グリッド更新",
+                        f"{self.BILLING_UPDATE_TRANSPORT_COL}の形式が正しくありません。",
+                        parent=top,
+                    )
+                return None
+            return hours, transport
+
+        def on_apply_grid() -> None:
+            parsed = _parse_review_update_fields(show_errors=True)
+            if parsed is None:
+                return
+            hours, transport = parsed
+            entry = current_entry()
+            core = self._row_dict_to_core(
+                self._current_row_dict_from_iid(entry.iid)
+            )
+            _set_billing_update_columns(core, hours=hours, transport=transport)
+            self._replace_row_with_result(entry.iid, core)
+            self._loaded_rows = self._current_grid_rows()
+            entries[state["index"]] = BillingReviewEntry(
+                iid=entry.iid,
+                file_name=entry.file_name,
+                grid_no=entry.grid_no,
+                employee_no=entry.employee_no,
+                hours_write=hours,
+                transport_write=transport,
+            )
+            hours_var.set(hours)
+            transport_var.set(transport)
+            self._refresh_billing_buttons_state()
+
         def on_prev() -> None:
+            if state["index"] <= 0:
+                return
+            if not _confirm_discard_if_dirty():
+                return
             show_at_index(state["index"] - 1)
 
         def on_next() -> None:
+            if state["index"] >= len(entries) - 1:
+                return
+            if not _confirm_discard_if_dirty():
+                return
             show_at_index(state["index"] + 1)
 
         def on_open_file() -> None:
@@ -1812,6 +1905,7 @@ class KintaiApp(tk.Frame):
 
         prev_btn.configure(command=on_prev)
         next_btn.configure(command=on_next)
+        apply_grid_btn.configure(command=on_apply_grid)
         open_file_btn.configure(command=on_open_file)
         exclude_btn.configure(command=on_exclude)
         top.bind("<Left>", lambda _e: on_prev())
