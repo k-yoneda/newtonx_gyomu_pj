@@ -2257,15 +2257,52 @@ class KintaiApp(tk.Frame):
         table_wrap.pack(fill=tk.BOTH, expand=True)
         canvas = tk.Canvas(table_wrap, highlightthickness=0)
         y_scroll = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.bind(
-            "<Configure>",
-            lambda _e: canvas.configure(scrollregion=canvas.bbox("all")),
+        x_scroll = ttk.Scrollbar(
+            table_wrap, orient=tk.HORIZONTAL, command=canvas.xview
         )
+        inner = ttk.Frame(canvas)
+
+        def _on_inner_configure(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        inner.bind("<Configure>", _on_inner_configure)
         canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=y_scroll.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(
+            xscrollcommand=x_scroll.set,
+            yscrollcommand=y_scroll.set,
+        )
+        canvas.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_wrap.rowconfigure(0, weight=1)
+        table_wrap.columnconfigure(0, weight=1)
+
+        def _on_overwrite_mousewheel(event: tk.Event) -> None:
+            delta = getattr(event, "delta", 0)
+            if not delta:
+                return
+            steps = int(-1 * (delta / 120))
+            if event.state & 0x1:
+                canvas.xview_scroll(steps, "units")
+            else:
+                canvas.yview_scroll(steps, "units")
+
+        def _on_overwrite_mousewheel_linux_up(_event: tk.Event) -> None:
+            canvas.yview_scroll(-1, "units")
+
+        def _on_overwrite_mousewheel_linux_down(_event: tk.Event) -> None:
+            canvas.yview_scroll(1, "units")
+
+        def _unbind_overwrite_mousewheel() -> None:
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                try:
+                    top.unbind_all(seq)
+                except tk.TclError:
+                    pass
+
+        top.bind_all("<MouseWheel>", _on_overwrite_mousewheel)
+        top.bind_all("<Button-4>", _on_overwrite_mousewheel_linux_up)
+        top.bind_all("<Button-5>", _on_overwrite_mousewheel_linux_down)
 
         headers = (
             "対象ファイル名",
@@ -2319,9 +2356,11 @@ class KintaiApp(tk.Frame):
                 item.write_hours = hour_vars[idx].get()
                 item.write_transport = transport_vars[idx].get()
             result["ok"] = True
+            _unbind_overwrite_mousewheel()
             top.destroy()
 
         def on_cancel() -> None:
+            _unbind_overwrite_mousewheel()
             top.destroy()
 
         btns = ttk.Frame(outer)
@@ -2333,7 +2372,10 @@ class KintaiApp(tk.Frame):
 
         top.protocol("WM_DELETE_WINDOW", on_cancel)
         top.grab_set()
-        self._root.wait_window(top)
+        try:
+            self._root.wait_window(top)
+        finally:
+            _unbind_overwrite_mousewheel()
         return result["ok"]
 
     def _update_billing_file(self) -> None:
