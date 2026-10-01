@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -695,6 +696,14 @@ class KintaiApp(tk.Frame):
             command=self._autofit_grid_column_widths,
         ).pack(side=tk.LEFT, padx=(4, 0))
 
+        self._export_csv_btn = ttk.Button(
+            data_lf,
+            text="CSVエクスポート",
+            command=self._export_grid_csv,
+            state=tk.DISABLED,
+        )
+        self._export_csv_btn.pack(side=tk.LEFT, padx=(4, 0))
+
         self._progress_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="準備完了")
 
@@ -871,8 +880,12 @@ class KintaiApp(tk.Frame):
                 else tk.DISABLED
             )
         )
+        has_grid_rows = bool(self._tree.get_children())
         self._save_btn.configure(
-            state=(tk.NORMAL if self._tree.get_children() else tk.DISABLED)
+            state=(tk.NORMAL if has_grid_rows else tk.DISABLED)
+        )
+        self._export_csv_btn.configure(
+            state=(tk.NORMAL if has_grid_rows else tk.DISABLED)
         )
         self._cancel_btn.configure(state=tk.DISABLED)
         has_data_dir = (
@@ -1011,6 +1024,12 @@ class KintaiApp(tk.Frame):
         self._tree.item(rid, values=tuple(vals))
 
     def _billing_target_iids(self) -> list[str]:
+        selected = self._selected_tree_iids()
+        if selected:
+            return selected
+        return list(self._tree.get_children())
+
+    def _grid_export_target_iids(self) -> list[str]:
         selected = self._selected_tree_iids()
         if selected:
             return selected
@@ -2237,6 +2256,125 @@ class KintaiApp(tk.Frame):
         t = (value or "").strip()
         return t if t else "（空）"
 
+    def _show_billing_file_update_result_dialog(
+        self,
+        *,
+        scope: str,
+        billing_file_name: str,
+        ok_count: int,
+        fail_count: int,
+        skip_count: int,
+        detail_rows: list[tuple[str, str, str]],
+    ) -> None:
+        top = tk.Toplevel(self._root)
+        top.title("請求ファイル更新 — 結果")
+        top.transient(self._root)
+        top.geometry("760x520")
+        top.minsize(560, 360)
+
+        outer = ttk.Frame(top, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+        summary = (
+            f"対象: {scope}\n"
+            f"請求用ファイル: {billing_file_name}\n\n"
+            f"成功: {ok_count} 件\n"
+            f"失敗: {fail_count} 件\n"
+            f"スキップ: {skip_count} 件"
+        )
+        ttk.Label(outer, text=summary, justify="left").pack(anchor="w", pady=(0, 8))
+
+        list_frame = ttk.LabelFrame(
+            outer, text="成功以外の行（グリッドの請求用ファイル更新列も参照）", padding=4
+        )
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        def _unbind_result_mousewheel() -> None:
+            pass
+
+        if not detail_rows:
+            ttk.Label(
+                list_frame,
+                text="失敗・スキップはありません。",
+                justify="left",
+            ).pack(anchor="w", padx=4, pady=4)
+        else:
+            table_wrap = ttk.Frame(list_frame)
+            table_wrap.pack(fill=tk.BOTH, expand=True)
+            cols = ("no", "file_name", "result")
+            tree = ttk.Treeview(
+                table_wrap,
+                columns=cols,
+                show="headings",
+                selectmode="browse",
+                height=12,
+            )
+            tree.heading("no", text="No")
+            tree.heading("file_name", text="ファイル名")
+            tree.heading("result", text="結果")
+            tree.column("no", width=56, stretch=False, minwidth=40)
+            tree.column("file_name", width=360, stretch=True, minwidth=120)
+            tree.column("result", width=200, stretch=True, minwidth=80)
+            y_scroll = ttk.Scrollbar(
+                table_wrap, orient=tk.VERTICAL, command=tree.yview
+            )
+            x_scroll = ttk.Scrollbar(
+                table_wrap, orient=tk.HORIZONTAL, command=tree.xview
+            )
+            tree.configure(
+                yscrollcommand=y_scroll.set,
+                xscrollcommand=x_scroll.set,
+            )
+            tree.grid(row=0, column=0, sticky="nsew")
+            y_scroll.grid(row=0, column=1, sticky="ns")
+            x_scroll.grid(row=1, column=0, sticky="ew")
+            table_wrap.rowconfigure(0, weight=1)
+            table_wrap.columnconfigure(0, weight=1)
+            for no_disp, file_name, symbol in detail_rows:
+                tree.insert("", tk.END, values=(no_disp, file_name, symbol))
+
+            def _on_result_mousewheel(event: tk.Event) -> None:
+                delta = getattr(event, "delta", 0)
+                if not delta:
+                    return
+                steps = int(-1 * (delta / 120))
+                if event.state & 0x1:
+                    tree.xview_scroll(steps, "units")
+                else:
+                    tree.yview_scroll(steps, "units")
+
+            def _on_result_mousewheel_linux_up(_event: tk.Event) -> None:
+                tree.yview_scroll(-1, "units")
+
+            def _on_result_mousewheel_linux_down(_event: tk.Event) -> None:
+                tree.yview_scroll(1, "units")
+
+            def _do_unbind_result_mousewheel() -> None:
+                for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    try:
+                        top.unbind_all(seq)
+                    except tk.TclError:
+                        pass
+
+            _unbind_result_mousewheel = _do_unbind_result_mousewheel
+
+            top.bind_all("<MouseWheel>", _on_result_mousewheel)
+            top.bind_all("<Button-4>", _on_result_mousewheel_linux_up)
+            top.bind_all("<Button-5>", _on_result_mousewheel_linux_down)
+
+        def _close() -> None:
+            _unbind_result_mousewheel()
+            top.destroy()
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btn_row, text="閉じる", command=_close).pack(side=tk.RIGHT)
+        top.protocol("WM_DELETE_WINDOW", _close)
+        top.grab_set()
+        try:
+            self._root.wait_window(top)
+        finally:
+            _unbind_result_mousewheel()
+
     def _prompt_billing_ts_overwrite_confirm(
         self, items: list[BillingTsWriteItem]
     ) -> bool:
@@ -2472,37 +2610,33 @@ class KintaiApp(tk.Frame):
             return
         ok_count = 0
         skip_count = 0
-        detail_lines: list[str] = []
-        for (iid, core_row), symbol in zip(targets, results, strict=True):
-            self._set_billing_update_result_cell(iid, symbol)
+        detail_rows: list[tuple[str, str, str]] = []
+        for (_iid, core_row), symbol in zip(targets, results, strict=True):
+            self._set_billing_update_result_cell(_iid, symbol)
             if symbol == "〇":
                 ok_count += 1
             elif symbol == BILLING_UPDATE_SKIP:
                 skip_count += 1
-            else:
-                fn = (core_row.get("file_name") or "").strip() or "（ファイル名なし）"
-                if len(fn) > 36:
-                    fn = fn[:33] + "..."
-                detail_lines.append(f"・{fn}: {symbol}")
+            if symbol != "〇":
+                grid_no = _row_grid_no(core_row)
+                no_disp = str(grid_no) if grid_no < 10**9 else "—"
+                file_name = (
+                    (core_row.get("file_name") or "").strip() or "（ファイル名なし）"
+                )
+                detail_rows.append((no_disp, file_name, symbol))
         fail_count = len(targets) - ok_count - skip_count
         self._loaded_rows = self._current_grid_rows()
         self._status_var.set(
             f"請求ファイル更新完了（{scope}）: 成功 {ok_count} 件 / 失敗 {fail_count} 件 "
             f"/ スキップ {skip_count} 件（対象 {len(targets)} 件）"
         )
-        body = (
-            f"対象: {scope}\n"
-            f"請求用ファイル:\n{self._billing_file_path.name}\n\n"
-            f"成功: {ok_count} 件\n失敗: {fail_count} 件\nスキップ: {skip_count} 件"
-        )
-        if detail_lines:
-            body += "\n\n" + "\n".join(detail_lines[:12])
-            if len(detail_lines) > 12:
-                body += f"\n... 他 {len(detail_lines) - 12} 件"
-        messagebox.showinfo(
-            "請求ファイル更新",
-            body,
-            parent=self._root,
+        self._show_billing_file_update_result_dialog(
+            scope=scope,
+            billing_file_name=self._billing_file_path.name,
+            ok_count=ok_count,
+            fail_count=fail_count,
+            skip_count=skip_count,
+            detail_rows=detail_rows,
         )
 
     def _should_ignore_status_log(self, message: str) -> bool:
@@ -3696,6 +3830,7 @@ class KintaiApp(tk.Frame):
         self._cont_btn.configure(state=tk.DISABLED)
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
+        self._export_csv_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
         self._restore_excluded_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
@@ -3829,6 +3964,7 @@ class KintaiApp(tk.Frame):
         self._cont_btn.configure(state=tk.DISABLED)
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
+        self._export_csv_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
         self._restore_excluded_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
@@ -4478,6 +4614,55 @@ class KintaiApp(tk.Frame):
             return
         self._save_json_via_dialog()
 
+    def _export_grid_csv(self) -> None:
+        if self._busy:
+            return
+        iids = self._grid_export_target_iids()
+        if not iids:
+            messagebox.showinfo(
+                "CSVエクスポート",
+                "エクスポートする行がありません。",
+                parent=self._root,
+            )
+            return
+        self._prepare_native_dialog()
+        fp = filedialog.asksaveasfilename(
+            title="グリッドをCSVで保存",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("すべて", "*.*")],
+            initialfile=f"kintai_grid_{self._now_ts()}.csv",
+            parent=self._root,
+        )
+        if not fp:
+            return
+        out = Path(fp)
+        cols = list(self._tree["columns"])
+        header = [self._column_heading_display_text(h) for h in cols]
+        try:
+            with out.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                for iid in iids:
+                    values = list(self._tree.item(iid, "values") or ())
+                    row = [
+                        str(values[i]) if i < len(values) and values[i] is not None else ""
+                        for i in range(len(cols))
+                    ]
+                    writer.writerow(row)
+        except OSError as e:
+            messagebox.showerror(
+                "CSVエクスポート",
+                f"ファイルを保存できませんでした。\n\n{e}",
+                parent=self._root,
+            )
+            return
+        scope = (
+            f"選択行 {len(iids)} 行"
+            if self._selected_tree_iids()
+            else f"全行 {len(iids)} 行"
+        )
+        self._status_var.set(f"CSVをエクスポートしました（{scope}）: {out}")
+
     def _load_json(self) -> None:
         if self._busy:
             return
@@ -4625,6 +4810,7 @@ class KintaiApp(tk.Frame):
         self._cont_btn.configure(state=tk.DISABLED)
         self._selected_reanalysis_btn.configure(state=tk.DISABLED)
         self._save_btn.configure(state=tk.DISABLED)
+        self._export_csv_btn.configure(state=tk.DISABLED)
         self._load_btn.configure(state=tk.DISABLED)
         self._restore_excluded_btn.configure(state=tk.DISABLED)
         self._cancel_btn.configure(state=tk.NORMAL)
@@ -4828,6 +5014,7 @@ class KintaiApp(tk.Frame):
                 self._load_btn.configure(state=tk.NORMAL)
                 if self._loaded_rows:
                     self._save_btn.configure(state=tk.NORMAL)
+                    self._export_csv_btn.configure(state=tk.NORMAL)
 
                 # --- ステータス表示 ---
                 n_rows = len(self._loaded_rows or [])
