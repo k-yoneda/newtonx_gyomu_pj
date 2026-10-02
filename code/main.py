@@ -1942,15 +1942,18 @@ class KintaiApp(tk.Frame):
         self,
         rows: list[dict[str, str]],
         groups: list[BillingDuplicateGroupInfo],
+        row_iids: list[str],
     ) -> dict[tuple[str, str], BillingDuplicateResolution] | None:
         if not groups:
             return {}
 
         top = tk.Toplevel(self._root)
         top.title("請求データ作成 — 重複の解決")
-        top.transient(self._root)
-        top.geometry("920x520")
         top.minsize(640, 320)
+        try:
+            top.state("zoomed")
+        except tk.TclError:
+            top.geometry("920x520")
 
         outer = ttk.Frame(top, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -2008,6 +2011,14 @@ class KintaiApp(tk.Frame):
         top.bind_all("<Button-4>", _on_dialog_mousewheel_linux_up)
         top.bind_all("<Button-5>", _on_dialog_mousewheel_linux_down)
 
+        def _open_duplicate_member_file(rid: str) -> None:
+            if not rid or self._resolve_file_path_for_row(rid) is None:
+                return
+            try:
+                self._open_row_file(rid, force=True)
+            except OSError as e:
+                messagebox.showerror("起動できませんでした", str(e), parent=top)
+
         hours_vars: list[tk.StringVar] = []
         transport_vars: list[tk.StringVar] = []
         grid_row = 0
@@ -2021,7 +2032,7 @@ class KintaiApp(tk.Frame):
                     f"（{len(members)} 件）"
                 ),
                 font=("", 9, "bold"),
-            ).grid(row=grid_row, column=0, columnspan=4, sticky="w", padx=4, pady=(8, 2))
+            ).grid(row=grid_row, column=0, columnspan=5, sticky="w", padx=4, pady=(8, 2))
             grid_row += 1
             ttk.Label(
                 inner,
@@ -2029,10 +2040,10 @@ class KintaiApp(tk.Frame):
                     "下で「代表行（No 最小）に載せる値」を選びます。"
                     "勤務と交通費は別々に選べます。"
                 ),
-            ).grid(row=grid_row, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4))
+            ).grid(row=grid_row, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 4))
             grid_row += 1
 
-            headers = ("No", "ファイル名", "勤務（10進）", "交通費（読取）")
+            headers = ("No", "ファイル名", "勤務（10進）", "交通費（読取）", "ファイル")
             for col, title in enumerate(headers):
                 ttk.Label(inner, text=title, font=("", 9, "bold")).grid(
                     row=grid_row, column=col, sticky="w", padx=4, pady=2
@@ -2075,6 +2086,20 @@ class KintaiApp(tk.Frame):
                         f"No.{no_disp} の交通費: {self._billing_cell_preview(t_cand)}",
                     )
                 )
+                member_iid = (
+                    row_iids[row_idx] if 0 <= row_idx < len(row_iids) else ""
+                )
+                can_open = bool(
+                    member_iid
+                    and self._resolve_file_path_for_row(member_iid) is not None
+                )
+                open_btn = ttk.Button(
+                    inner,
+                    text="開く",
+                    command=lambda rid=member_iid: _open_duplicate_member_file(rid),
+                    state=(tk.NORMAL if can_open else tk.DISABLED),
+                )
+                open_btn.grid(row=grid_row, column=4, sticky="w", padx=4, pady=2)
                 grid_row += 1
 
             rep_row = rows[group.member_indices[0]]
@@ -2103,7 +2128,7 @@ class KintaiApp(tk.Frame):
             transport_vars.append(tv)
 
             hf = ttk.LabelFrame(inner, text="勤務時間（代表行へ反映）", padding=(6, 4))
-            hf.grid(row=grid_row, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
+            hf.grid(row=grid_row, column=0, columnspan=5, sticky="ew", padx=4, pady=4)
             for pi, (val, label) in enumerate(hours_pick_choices):
                 ttk.Radiobutton(hf, text=label, variable=hv, value=val).grid(
                     row=pi, column=0, sticky="w", padx=(0, 12), pady=1
@@ -2111,7 +2136,7 @@ class KintaiApp(tk.Frame):
             grid_row += 1
 
             tf = ttk.LabelFrame(inner, text="交通費（代表行へ反映）", padding=(6, 4))
-            tf.grid(row=grid_row, column=0, columnspan=4, sticky="ew", padx=4, pady=(0, 8))
+            tf.grid(row=grid_row, column=0, columnspan=5, sticky="ew", padx=4, pady=(0, 8))
             for pi, (val, label) in enumerate(transport_pick_choices):
                 ttk.Radiobutton(tf, text=label, variable=tv, value=val).grid(
                     row=pi, column=0, sticky="w", padx=(0, 12), pady=1
@@ -2192,9 +2217,12 @@ class KintaiApp(tk.Frame):
             ordered.append((iid, self._row_dict_to_core(self._current_row_dict_from_iid(iid))))
 
         cores = [core for _, core in ordered]
+        row_iids = [iid for iid, _ in ordered]
         dup_groups = build_billing_duplicate_groups(cores)
         dialog_groups = [g for g in dup_groups if g.needs_dialog]
-        resolutions = self._prompt_billing_duplicate_resolution(cores, dialog_groups)
+        resolutions = self._prompt_billing_duplicate_resolution(
+            cores, dialog_groups, row_iids
+        )
         if resolutions is None:
             return
 
