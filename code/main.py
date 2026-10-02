@@ -147,6 +147,448 @@ class BillingReviewEntry:
     hours_write: str
     transport_write: str
 
+
+class BillingPreviewMount:
+    """請求関連ダイアログ用のファイルプレビュー（単一/複数列・ズーム）。"""
+
+    _PAD_X = 8
+    _TEXT_WIDTH = 520
+    _CAPTION_H = 22
+    _MSG_H = 56
+    _SECTION_GAP = 16
+    _PAGE_CAPTION_H = 18
+    _PAGE_GAP = 8
+    _ZOOM_MIN = 0.25
+    _ZOOM_MAX = 3.0
+    _ZOOM_FACTOR = 1.1
+
+    def __init__(self, app: KintaiApp, parent: tk.Misc) -> None:
+        self._app = app
+        self._photos: list[ImageTk.PhotoImage] = []
+        self._wheel_bindings: list[tuple[tk.Misc, str]] = []
+        self._session: dict[str, object] = {
+            "layout_iids": (),
+            "current_iids": (),
+            "pil_cache": {},
+            "pane_msg": {},
+            "zoom": {},
+            "multi_panes": [],
+        }
+        self.container = ttk.Frame(parent)
+        self._preview_container = ttk.Frame(self.container)
+        self._preview_container.pack(fill=tk.BOTH, expand=True)
+        self._single_pane = ttk.Frame(self._preview_container)
+        self._single_pane.pack(fill=tk.BOTH, expand=True)
+        scroll_f = ttk.Frame(self._single_pane)
+        scroll_f.pack(fill=tk.BOTH, expand=True)
+        self._single_canvas = tk.Canvas(scroll_f, highlightthickness=0)
+        y_scroll = ttk.Scrollbar(
+            scroll_f, orient=tk.VERTICAL, command=self._single_canvas.yview
+        )
+        x_scroll = ttk.Scrollbar(
+            scroll_f, orient=tk.HORIZONTAL, command=self._single_canvas.xview
+        )
+        self._single_canvas.configure(
+            xscrollcommand=x_scroll.set,
+            yscrollcommand=y_scroll.set,
+        )
+        self._single_canvas.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        scroll_f.rowconfigure(0, weight=1)
+        scroll_f.columnconfigure(0, weight=1)
+        self._single_scroll = scroll_f
+        self._multi_pane = ttk.Frame(self._preview_container)
+        self._bind_single_pane_interactions()
+        self._bind_single_ctrl_zoom()
+
+    def unbind(self) -> None:
+        for widget, seq in self._wheel_bindings:
+            try:
+                widget.unbind(seq)
+            except tk.TclError:
+                pass
+        self._wheel_bindings = []
+
+    def _bind(self, widget: tk.Misc, sequence: str, handler) -> None:
+        widget.bind(sequence, handler)
+        self._wheel_bindings.append((widget, sequence))
+
+    @staticmethod
+    def _base_max_edge(n_files: int) -> int:
+        return 520 if n_files >= 2 else 900
+
+    @staticmethod
+    def _scale_pil(pil: Image.Image, zoom: float) -> Image.Image:
+        if abs(zoom - 1.0) < 1e-6:
+            return pil
+        w, h = pil.size
+        nw = max(1, int(round(w * zoom)))
+        nh = max(1, int(round(h * zoom)))
+        return pil.resize((nw, nh), Image.Resampling.LANCZOS)
+
+    def _pane_column_title(self, iid: str) -> str:
+        ui_row = self._app._current_row_dict_from_iid(iid)
+        core = self._app._row_dict_to_core(ui_row)
+        grid_no = _row_grid_no(core)
+        file_name = self._app._file_name_from_row(ui_row) or "（なし）"
+        title = f"No.{grid_no} — {file_name}"
+        if len(title) > 48:
+            title = title[:45] + "..."
+        return title
+
+    def _load_media(self, iids: list[str], base_max: int) -> None:
+        pil_cache: dict[str, list[Image.Image]] = {}
+        pane_msg: dict[str, str] = {}
+        zoom: dict[str, float] = {}
+        excel_msg = KintaiApp._BILLING_REVIEW_EXCEL_CANVAS_MSG
+        for iid in iids:
+            zoom[iid] = 1.0
+            path = self._app._resolve_file_path_for_row(iid)
+            if path is None:
+                pane_msg[iid] = "ファイルが見つかりません"
+                continue
+            suffix = path.suffix.lower()
+            if suffix in EXCEL_SUFFIXES:
+                pane_msg[iid] = excel_msg
+                continue
+            if suffix != PDF_SUFFIX and suffix not in IMAGE_SUFFIXES:
+                pane_msg[iid] = "この形式はプレビューできません"
+                continue
+            page_images = load_billing_preview_pages(path, max_edge_px=base_max)
+            if not page_images:
+                pane_msg[iid] = "プレビューを表示できません"
+                continue
+            pil_cache[iid] = page_images
+        self._session["pil_cache"] = pil_cache
+        self._session["pane_msg"] = pane_msg
+        self._session["zoom"] = zoom
+
+    def _render_pane(
+        self, canvas: tk.Canvas, iid: str, *, show_caption: bool
+    ) -> None:
+        canvas.delete("all")
+        pad = self._PAD_X
+        y = pad
+        max_w = self._TEXT_WIDTH + pad
+        if show_caption:
+            ui_row = self._app._current_row_dict_from_iid(iid)
+            core = self._app._row_dict_to_core(ui_row)
+            grid_no = _row_grid_no(core)
+            file_name = self._app._file_name_from_row(ui_row) or "（なし）"
+            caption = f"No.{grid_no} — {file_name}"
+            canvas.create_text(
+                pad, y, text=caption, anchor="nw", font=("", 9, "bold")
+            )
+            y += self._CAPTION_H
+        pane_msg: dict[str, str] = self._session["pane_msg"]
+        if iid in pane_msg:
+            canvas.create_text(
+                pad,
+                y,
+                text=pane_msg[iid],
+                anchor="nw",
+                width=self._TEXT_WIDTH,
+                justify="left",
+            )
+            y += self._MSG_H
+            canvas.configure(scrollregion=(0, 0, max_w, max(y, 1)))
+            canvas.xview_moveto(0)
+            canvas.yview_moveto(0)
+            return
+        pil_cache: dict[str, list[Image.Image]] = self._session["pil_cache"]
+        pages = pil_cache.get(iid, [])
+        if not pages:
+            canvas.create_text(
+                pad,
+                y,
+                text="プレビューを表示できません",
+                anchor="nw",
+                width=self._TEXT_WIDTH,
+                justify="left",
+            )
+            y += self._MSG_H
+            canvas.configure(scrollregion=(0, 0, max_w, max(y, 1)))
+            return
+        zoom_map: dict[str, float] = self._session["zoom"]
+        zoom = zoom_map.get(iid, 1.0)
+        page_total = len(pages)
+        for page_index, pil in enumerate(pages, start=1):
+            if page_total > 1:
+                canvas.create_text(
+                    pad,
+                    y,
+                    text=f"ページ {page_index} / {page_total}",
+                    anchor="nw",
+                    font=("", 9),
+                )
+                y += self._PAGE_CAPTION_H
+            scaled = self._scale_pil(pil, zoom)
+            photo = ImageTk.PhotoImage(scaled)
+            self._photos.append(photo)
+            iw, ih = scaled.size
+            canvas.create_image(pad, y, anchor="nw", image=photo)
+            y += ih
+            max_w = max(max_w, pad + iw)
+            if page_index < page_total:
+                y += self._PAGE_GAP
+        y += self._SECTION_GAP
+        canvas.configure(scrollregion=(0, 0, max_w, max(y, 1)))
+        canvas.xview_moveto(0)
+        canvas.yview_moveto(0)
+
+    def _on_scroll_wheel(self, event: tk.Event, canvas: tk.Canvas) -> str:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            steps = int(-1 * (delta / 120))
+            if event.state & 0x1:
+                canvas.xview_scroll(steps, "units")
+            else:
+                canvas.yview_scroll(steps, "units")
+        return "break"
+
+    @staticmethod
+    def _on_scroll_wheel_up(canvas: tk.Canvas) -> str:
+        canvas.yview_scroll(-1, "units")
+        return "break"
+
+    @staticmethod
+    def _on_scroll_wheel_down(canvas: tk.Canvas) -> str:
+        canvas.yview_scroll(1, "units")
+        return "break"
+
+    def _adjust_zoom(
+        self,
+        iid: str,
+        canvas: tk.Canvas,
+        *,
+        zoom_in: bool,
+        show_caption: bool,
+    ) -> None:
+        if iid in self._session["pane_msg"]:
+            return
+        if iid not in self._session["pil_cache"]:
+            return
+        zoom_map: dict[str, float] = self._session["zoom"]
+        z = zoom_map.get(iid, 1.0)
+        z *= self._ZOOM_FACTOR if zoom_in else 1.0 / self._ZOOM_FACTOR
+        z = max(self._ZOOM_MIN, min(self._ZOOM_MAX, z))
+        zoom_map[iid] = z
+        self._render_pane(canvas, iid, show_caption=show_caption)
+
+    def _bind_pane_interactions(
+        self, iid: str, canvas: tk.Canvas, widgets: tuple[tk.Misc, ...]
+    ) -> None:
+        for widget in widgets:
+            self._bind(
+                widget,
+                "<MouseWheel>",
+                lambda e, c=canvas: self._on_scroll_wheel(e, c),
+            )
+            self._bind(
+                widget,
+                "<Button-4>",
+                lambda e, c=canvas: self._on_scroll_wheel_up(c),
+            )
+            self._bind(
+                widget,
+                "<Button-5>",
+                lambda e, c=canvas: self._on_scroll_wheel_down(c),
+            )
+            self._bind(
+                widget,
+                "<Control-MouseWheel>",
+                lambda e, i=iid, c=canvas: self._on_ctrl_zoom_wheel(
+                    e, i, c, show_caption=False
+                ),
+            )
+            self._bind(
+                widget,
+                "<Control-Button-4>",
+                lambda e, i=iid, c=canvas: (
+                    self._adjust_zoom(i, c, zoom_in=True, show_caption=False),
+                    "break",
+                )[1],
+            )
+            self._bind(
+                widget,
+                "<Control-Button-5>",
+                lambda e, i=iid, c=canvas: (
+                    self._adjust_zoom(i, c, zoom_in=False, show_caption=False),
+                    "break",
+                )[1],
+            )
+
+    def _on_ctrl_zoom_wheel(
+        self,
+        event: tk.Event,
+        iid: str,
+        canvas: tk.Canvas,
+        *,
+        show_caption: bool,
+    ) -> str:
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return "break"
+        self._adjust_zoom(
+            iid, canvas, zoom_in=(delta > 0), show_caption=show_caption
+        )
+        return "break"
+
+    def _bind_single_pane_interactions(self) -> None:
+        self._bind_pane_interactions(
+            "",
+            self._single_canvas,
+            (self._single_canvas, self._single_scroll, self._single_pane),
+        )
+
+    def _bind_single_ctrl_zoom(self) -> None:
+        for w in (self._single_canvas, self._single_scroll, self._single_pane):
+            self._bind(w, "<Control-MouseWheel>", self._single_ctrl_zoom)
+            self._bind(
+                w,
+                "<Control-Button-4>",
+                lambda _e: self._single_ctrl_zoom_dir(True),
+            )
+            self._bind(
+                w,
+                "<Control-Button-5>",
+                lambda _e: self._single_ctrl_zoom_dir(False),
+            )
+
+    def _single_ctrl_zoom(self, event: tk.Event) -> str:
+        iids = self._session["current_iids"]
+        if len(iids) != 1:
+            return "break"
+        return self._on_ctrl_zoom_wheel(
+            event, iids[0], self._single_canvas, show_caption=True
+        )
+
+    def _single_ctrl_zoom_dir(self, zoom_in: bool) -> str:
+        iids = self._session["current_iids"]
+        if len(iids) != 1:
+            return "break"
+        self._adjust_zoom(
+            iids[0],
+            self._single_canvas,
+            zoom_in=zoom_in,
+            show_caption=True,
+        )
+        return "break"
+
+    def _rebuild_multi_panes(self, iids: list[str]) -> None:
+        self.unbind()
+        for child in self._multi_pane.winfo_children():
+            child.destroy()
+        self._session["multi_panes"] = []
+        for iid in iids:
+            col = ttk.LabelFrame(self._multi_pane, text=self._pane_column_title(iid))
+            col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+            scroll_f = ttk.Frame(col)
+            scroll_f.pack(fill=tk.BOTH, expand=True)
+            canvas = tk.Canvas(scroll_f, highlightthickness=0)
+            y_scroll = ttk.Scrollbar(
+                scroll_f, orient=tk.VERTICAL, command=canvas.yview
+            )
+            x_scroll = ttk.Scrollbar(
+                scroll_f, orient=tk.HORIZONTAL, command=canvas.xview
+            )
+            canvas.configure(
+                xscrollcommand=x_scroll.set,
+                yscrollcommand=y_scroll.set,
+            )
+            canvas.grid(row=0, column=0, sticky="nsew")
+            y_scroll.grid(row=0, column=1, sticky="ns")
+            x_scroll.grid(row=1, column=0, sticky="ew")
+            scroll_f.rowconfigure(0, weight=1)
+            scroll_f.columnconfigure(0, weight=1)
+            self._session["multi_panes"].append({"iid": iid, "canvas": canvas})
+            self._bind_pane_interactions(iid, canvas, (canvas, scroll_f, col))
+        self._bind_single_pane_interactions()
+        self._bind_single_ctrl_zoom()
+
+    def _ensure_layout(self, iids: list[str]) -> None:
+        key = tuple(iids)
+        if self._session["layout_iids"] == key:
+            return
+        self._session["layout_iids"] = key
+        if len(iids) < 2:
+            self._multi_pane.pack_forget()
+            for child in self._multi_pane.winfo_children():
+                child.destroy()
+            self._session["multi_panes"] = []
+            self.unbind()
+            self._bind_single_pane_interactions()
+            self._bind_single_ctrl_zoom()
+            self._single_pane.pack(fill=tk.BOTH, expand=True)
+            return
+        self._single_pane.pack_forget()
+        self._multi_pane.pack(fill=tk.BOTH, expand=True)
+        self._rebuild_multi_panes(iids)
+
+    def _show_single_message(self, text: str) -> None:
+        self._photos = []
+        self._single_canvas.delete("all")
+
+        def _redraw(_event: tk.Event | None = None) -> None:
+            self._single_canvas.delete("all")
+            w = self._single_canvas.winfo_width()
+            h = self._single_canvas.winfo_height()
+            if w <= 1 or h <= 1:
+                return
+            self._single_canvas.create_text(
+                w / 2,
+                h / 2,
+                text=text,
+                anchor="center",
+                width=max(w - 24, 80),
+                justify="center",
+            )
+            self._single_canvas.configure(scrollregion=(0, 0, w, h))
+
+        self._single_canvas.bind("<Configure>", _redraw)
+        _redraw()
+
+    def refresh(self, iids: list[str], *, idle_parent: tk.Misc | None = None) -> None:
+        self._session["current_iids"] = tuple(iids)
+        if iids and all(
+            self._app._resolve_file_path_for_row(iid) is None for iid in iids
+        ):
+            self._ensure_layout(iids)
+            if len(iids) < 2:
+                self._show_single_message("ファイルが見つかりません")
+            else:
+                self._photos = []
+                for pane in self._session["multi_panes"]:
+                    c = pane["canvas"]
+                    c.delete("all")
+                    c.create_text(8, 8, text="ファイルが見つかりません", anchor="nw")
+            return
+        self._ensure_layout(iids)
+        if len(iids) < 2:
+            self._show_single_message("読み込み中…")
+        else:
+            self._photos = []
+            for pane in self._session["multi_panes"]:
+                c = pane["canvas"]
+                c.delete("all")
+                c.create_text(8, 8, text="読み込み中…", anchor="nw")
+        if idle_parent is not None:
+            idle_parent.update_idletasks()
+        self._single_canvas.unbind("<Configure>")
+        self._photos = []
+        base_max = self._base_max_edge(len(iids))
+        self._load_media(iids, base_max)
+        if len(iids) < 2:
+            if not iids:
+                self._show_single_message("プレビュー対象がありません")
+                return
+            self._render_pane(self._single_canvas, iids[0], show_caption=True)
+        else:
+            for pane in self._session["multi_panes"]:
+                self._render_pane(pane["canvas"], pane["iid"], show_caption=False)
+
+
 _WIN32 = sys.platform == "win32"
 _STILL_ACTIVE = 259
 _YM_DIR_RE = re.compile(r"^(\d{4})年(\d{1,2})月$")
@@ -1518,49 +1960,8 @@ class KintaiApp(tk.Frame):
         body.add(img_frame, weight=3)
         img_inner = ttk.Frame(img_frame)
         img_inner.pack(fill=tk.BOTH, expand=True)
-        preview_container = ttk.Frame(img_inner)
-        preview_container.pack(fill=tk.BOTH, expand=True, padx=4, pady=(4, 0))
-
-        single_pane = ttk.Frame(preview_container)
-        single_pane.pack(fill=tk.BOTH, expand=True)
-        preview_scroll = ttk.Frame(single_pane)
-        preview_scroll.pack(fill=tk.BOTH, expand=True)
-        preview_canvas = tk.Canvas(preview_scroll, highlightthickness=0)
-        preview_y_scroll = ttk.Scrollbar(
-            preview_scroll, orient=tk.VERTICAL, command=preview_canvas.yview
-        )
-        preview_x_scroll = ttk.Scrollbar(
-            preview_scroll, orient=tk.HORIZONTAL, command=preview_canvas.xview
-        )
-        preview_canvas.configure(
-            xscrollcommand=preview_x_scroll.set,
-            yscrollcommand=preview_y_scroll.set,
-        )
-        preview_canvas.grid(row=0, column=0, sticky="nsew")
-        preview_y_scroll.grid(row=0, column=1, sticky="ns")
-        preview_x_scroll.grid(row=1, column=0, sticky="ew")
-        preview_scroll.rowconfigure(0, weight=1)
-        preview_scroll.columnconfigure(0, weight=1)
-
-        multi_pane = ttk.Frame(preview_container)
-
-        preview_session: dict[str, object] = {
-            "layout_iids": (),
-            "current_iids": (),
-            "pil_cache": {},
-            "pane_msg": {},
-            "zoom": {},
-            "multi_panes": [],
-            "wheel_bindings": [],
-        }
-
-        def _unbind_preview_wheel() -> None:
-            for widget, seq in preview_session["wheel_bindings"]:
-                try:
-                    widget.unbind(seq)
-                except tk.TclError:
-                    pass
-            preview_session["wheel_bindings"] = []
+        preview_mount = BillingPreviewMount(self, img_inner)
+        preview_mount.container.pack(fill=tk.BOTH, expand=True, padx=4, pady=(4, 0))
 
         open_file_btn = ttk.Button(img_inner, text="ファイルを開く")
         open_file_btn.pack(pady=(4, 4))
@@ -1636,7 +2037,7 @@ class KintaiApp(tk.Frame):
         def _close_review_window() -> None:
             if not _confirm_discard_if_dirty():
                 return
-            _unbind_preview_wheel()
+            preview_mount.unbind()
             self._close_row_file()
             self._clear_billing_review_grid_highlight()
             top.destroy()
@@ -1646,432 +2047,13 @@ class KintaiApp(tk.Frame):
         )
         top.protocol("WM_DELETE_WINDOW", _close_review_window)
 
-        _PREVIEW_PAD_X = 8
-        _PREVIEW_TEXT_WIDTH = 520
-        _PREVIEW_CAPTION_H = 22
-        _PREVIEW_MSG_H = 56
-        _PREVIEW_SECTION_GAP = 16
-        _PREVIEW_PAGE_CAPTION_H = 18
-        _PREVIEW_PAGE_GAP = 8
-        _PREVIEW_ZOOM_MIN = 0.25
-        _PREVIEW_ZOOM_MAX = 3.0
-        _PREVIEW_ZOOM_FACTOR = 1.1
-
-        def _preview_base_max_edge(n_files: int) -> int:
-            return 520 if n_files >= 2 else 900
-
-        def _preview_bind(widget: tk.Misc, sequence: str, handler) -> None:
-            widget.bind(sequence, handler)
-            preview_session["wheel_bindings"].append((widget, sequence))
-
-        def _scale_preview_pil(pil: Image.Image, zoom: float) -> Image.Image:
-            if abs(zoom - 1.0) < 1e-6:
-                return pil
-            w, h = pil.size
-            nw = max(1, int(round(w * zoom)))
-            nh = max(1, int(round(h * zoom)))
-            return pil.resize((nw, nh), Image.Resampling.LANCZOS)
-
-        def _pane_column_title(iid: str) -> str:
-            ui_row = self._current_row_dict_from_iid(iid)
-            core = self._row_dict_to_core(ui_row)
-            grid_no = _row_grid_no(core)
-            file_name = self._file_name_from_row(ui_row) or "（なし）"
-            title = f"No.{grid_no} — {file_name}"
-            if len(title) > 48:
-                title = title[:45] + "..."
-            return title
-
-        def _load_preview_media(iids: list[str], base_max: int) -> None:
-            pil_cache: dict[str, list[Image.Image]] = {}
-            pane_msg: dict[str, str] = {}
-            zoom: dict[str, float] = {}
-            for iid in iids:
-                zoom[iid] = 1.0
-                path = self._resolve_file_path_for_row(iid)
-                if path is None:
-                    pane_msg[iid] = "ファイルが見つかりません"
-                    continue
-                suffix = path.suffix.lower()
-                if suffix in EXCEL_SUFFIXES:
-                    pane_msg[iid] = self._BILLING_REVIEW_EXCEL_CANVAS_MSG
-                    continue
-                if suffix != PDF_SUFFIX and suffix not in IMAGE_SUFFIXES:
-                    pane_msg[iid] = "この形式はプレビューできません"
-                    continue
-                page_images = load_billing_preview_pages(path, max_edge_px=base_max)
-                if not page_images:
-                    pane_msg[iid] = "プレビューを表示できません"
-                    continue
-                pil_cache[iid] = page_images
-            preview_session["pil_cache"] = pil_cache
-            preview_session["pane_msg"] = pane_msg
-            preview_session["zoom"] = zoom
-
-        def _render_pane(
-            canvas: tk.Canvas,
-            iid: str,
-            *,
-            show_caption: bool,
-        ) -> None:
-            canvas.delete("all")
-            pad = _PREVIEW_PAD_X
-            y = pad
-            max_w = _PREVIEW_TEXT_WIDTH + pad
-
-            if show_caption:
-                ui_row = self._current_row_dict_from_iid(iid)
-                core = self._row_dict_to_core(ui_row)
-                grid_no = _row_grid_no(core)
-                file_name = self._file_name_from_row(ui_row) or "（なし）"
-                caption = f"No.{grid_no} — {file_name}"
-                canvas.create_text(
-                    pad, y, text=caption, anchor="nw", font=("", 9, "bold")
-                )
-                y += _PREVIEW_CAPTION_H
-
-            pane_msg: dict[str, str] = preview_session["pane_msg"]
-            if iid in pane_msg:
-                canvas.create_text(
-                    pad,
-                    y,
-                    text=pane_msg[iid],
-                    anchor="nw",
-                    width=_PREVIEW_TEXT_WIDTH,
-                    justify="left",
-                )
-                y += _PREVIEW_MSG_H
-                canvas.configure(scrollregion=(0, 0, max_w, max(y, 1)))
-                canvas.xview_moveto(0)
-                canvas.yview_moveto(0)
-                return
-
-            pil_cache: dict[str, list[Image.Image]] = preview_session["pil_cache"]
-            pages = pil_cache.get(iid, [])
-            if not pages:
-                canvas.create_text(
-                    pad,
-                    y,
-                    text="プレビューを表示できません",
-                    anchor="nw",
-                    width=_PREVIEW_TEXT_WIDTH,
-                    justify="left",
-                )
-                y += _PREVIEW_MSG_H
-                canvas.configure(scrollregion=(0, 0, max_w, max(y, 1)))
-                return
-
-            zoom_map: dict[str, float] = preview_session["zoom"]
-            zoom = zoom_map.get(iid, 1.0)
-            page_total = len(pages)
-            for page_index, pil in enumerate(pages, start=1):
-                if page_total > 1:
-                    canvas.create_text(
-                        pad,
-                        y,
-                        text=f"ページ {page_index} / {page_total}",
-                        anchor="nw",
-                        font=("", 9),
-                    )
-                    y += _PREVIEW_PAGE_CAPTION_H
-                scaled = _scale_preview_pil(pil, zoom)
-                photo = ImageTk.PhotoImage(scaled)
-                self._billing_review_photos.append(photo)
-                iw, ih = scaled.size
-                canvas.create_image(pad, y, anchor="nw", image=photo)
-                y += ih
-                max_w = max(max_w, pad + iw)
-                if page_index < page_total:
-                    y += _PREVIEW_PAGE_GAP
-
-            y += _PREVIEW_SECTION_GAP
-            canvas.configure(scrollregion=(0, 0, max_w, max(y, 1)))
-            canvas.xview_moveto(0)
-            canvas.yview_moveto(0)
-
-        def _on_pane_scroll_wheel(event: tk.Event, canvas: tk.Canvas) -> str:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                steps = int(-1 * (delta / 120))
-                if event.state & 0x1:
-                    canvas.xview_scroll(steps, "units")
-                else:
-                    canvas.yview_scroll(steps, "units")
-            return "break"
-
-        def _on_pane_scroll_wheel_up(_event: tk.Event, canvas: tk.Canvas) -> str:
-            canvas.yview_scroll(-1, "units")
-            return "break"
-
-        def _on_pane_scroll_wheel_down(_event: tk.Event, canvas: tk.Canvas) -> str:
-            canvas.yview_scroll(1, "units")
-            return "break"
-
-        def _adjust_pane_zoom(
-            iid: str,
-            canvas: tk.Canvas,
-            *,
-            zoom_in: bool,
-            show_caption: bool,
-        ) -> None:
-            if iid in preview_session["pane_msg"]:
-                return
-            if iid not in preview_session["pil_cache"]:
-                return
-            zoom_map: dict[str, float] = preview_session["zoom"]
-            z = zoom_map.get(iid, 1.0)
-            z *= _PREVIEW_ZOOM_FACTOR if zoom_in else 1.0 / _PREVIEW_ZOOM_FACTOR
-            z = max(_PREVIEW_ZOOM_MIN, min(_PREVIEW_ZOOM_MAX, z))
-            zoom_map[iid] = z
-            _render_pane(canvas, iid, show_caption=show_caption)
-
-        def _on_pane_ctrl_zoom_wheel(
-            event: tk.Event,
-            iid: str,
-            canvas: tk.Canvas,
-            *,
-            show_caption: bool,
-        ) -> str:
-            delta = getattr(event, "delta", 0)
-            if not delta:
-                return "break"
-            _adjust_pane_zoom(
-                iid,
-                canvas,
-                zoom_in=(delta > 0),
-                show_caption=show_caption,
-            )
-            return "break"
-
-        def _on_pane_ctrl_zoom_up(
-            _event: tk.Event, iid: str, canvas: tk.Canvas, *, show_caption: bool
-        ) -> str:
-            _adjust_pane_zoom(iid, canvas, zoom_in=True, show_caption=show_caption)
-            return "break"
-
-        def _on_pane_ctrl_zoom_down(
-            _event: tk.Event, iid: str, canvas: tk.Canvas, *, show_caption: bool
-        ) -> str:
-            _adjust_pane_zoom(iid, canvas, zoom_in=False, show_caption=show_caption)
-            return "break"
-
-        def _bind_pane_interactions(
-            iid: str, canvas: tk.Canvas, widgets: tuple[tk.Misc, ...]
-        ) -> None:
-            for widget in widgets:
-                _preview_bind(
-                    widget,
-                    "<MouseWheel>",
-                    lambda e, c=canvas: _on_pane_scroll_wheel(e, c),
-                )
-                _preview_bind(
-                    widget,
-                    "<Button-4>",
-                    lambda e, c=canvas: _on_pane_scroll_wheel_up(e, c),
-                )
-                _preview_bind(
-                    widget,
-                    "<Button-5>",
-                    lambda e, c=canvas: _on_pane_scroll_wheel_down(e, c),
-                )
-                _preview_bind(
-                    widget,
-                    "<Control-MouseWheel>",
-                    lambda e, i=iid, c=canvas: _on_pane_ctrl_zoom_wheel(
-                        e, i, c, show_caption=False
-                    ),
-                )
-                _preview_bind(
-                    widget,
-                    "<Control-Button-4>",
-                    lambda e, i=iid, c=canvas: _on_pane_ctrl_zoom_up(
-                        e, i, c, show_caption=False
-                    ),
-                )
-                _preview_bind(
-                    widget,
-                    "<Control-Button-5>",
-                    lambda e, i=iid, c=canvas: _on_pane_ctrl_zoom_down(
-                        e, i, c, show_caption=False
-                    ),
-                )
-
-        _bind_pane_interactions(
-            "",
-            preview_canvas,
-            (preview_canvas, preview_scroll, single_pane),
-        )
-
-        def _single_ctrl_zoom(event: tk.Event) -> str:
-            iids = preview_session["current_iids"]
-            if len(iids) != 1:
-                return "break"
-            return _on_pane_ctrl_zoom_wheel(
-                event, iids[0], preview_canvas, show_caption=True
-            )
-
-        def _single_ctrl_zoom_up(_event: tk.Event) -> str:
-            iids = preview_session["current_iids"]
-            if len(iids) != 1:
-                return "break"
-            _adjust_pane_zoom(
-                iids[0], preview_canvas, zoom_in=True, show_caption=True
-            )
-            return "break"
-
-        def _single_ctrl_zoom_down(_event: tk.Event) -> str:
-            iids = preview_session["current_iids"]
-            if len(iids) != 1:
-                return "break"
-            _adjust_pane_zoom(
-                iids[0], preview_canvas, zoom_in=False, show_caption=True
-            )
-            return "break"
-
-        for _w in (preview_canvas, preview_scroll, single_pane):
-            _preview_bind(_w, "<Control-MouseWheel>", _single_ctrl_zoom)
-            _preview_bind(_w, "<Control-Button-4>", _single_ctrl_zoom_up)
-            _preview_bind(_w, "<Control-Button-5>", _single_ctrl_zoom_down)
-
-        def _rebuild_multi_panes(iids: list[str]) -> None:
-            _unbind_preview_wheel()
-            for child in multi_pane.winfo_children():
-                child.destroy()
-            preview_session["multi_panes"] = []
-            for iid in iids:
-                col = ttk.LabelFrame(multi_pane, text=_pane_column_title(iid))
-                col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-                scroll_f = ttk.Frame(col)
-                scroll_f.pack(fill=tk.BOTH, expand=True)
-                canvas = tk.Canvas(scroll_f, highlightthickness=0)
-                y_scroll = ttk.Scrollbar(
-                    scroll_f, orient=tk.VERTICAL, command=canvas.yview
-                )
-                x_scroll = ttk.Scrollbar(
-                    scroll_f, orient=tk.HORIZONTAL, command=canvas.xview
-                )
-                canvas.configure(
-                    xscrollcommand=x_scroll.set,
-                    yscrollcommand=y_scroll.set,
-                )
-                canvas.grid(row=0, column=0, sticky="nsew")
-                y_scroll.grid(row=0, column=1, sticky="ns")
-                x_scroll.grid(row=1, column=0, sticky="ew")
-                scroll_f.rowconfigure(0, weight=1)
-                scroll_f.columnconfigure(0, weight=1)
-                preview_session["multi_panes"].append(
-                    {"iid": iid, "canvas": canvas}
-                )
-                _bind_pane_interactions(iid, canvas, (canvas, scroll_f, col))
-            _bind_pane_interactions(
-                "",
-                preview_canvas,
-                (preview_canvas, preview_scroll, single_pane),
-            )
-            for _w in (preview_canvas, preview_scroll, single_pane):
-                _preview_bind(_w, "<Control-MouseWheel>", _single_ctrl_zoom)
-                _preview_bind(_w, "<Control-Button-4>", _single_ctrl_zoom_up)
-                _preview_bind(_w, "<Control-Button-5>", _single_ctrl_zoom_down)
-
-        def _ensure_preview_layout(iids: list[str]) -> None:
-            key = tuple(iids)
-            if preview_session["layout_iids"] == key:
-                return
-            preview_session["layout_iids"] = key
-            if len(iids) < 2:
-                multi_pane.pack_forget()
-                for child in multi_pane.winfo_children():
-                    child.destroy()
-                preview_session["multi_panes"] = []
-                _unbind_preview_wheel()
-                _bind_pane_interactions(
-                    "",
-                    preview_canvas,
-                    (preview_canvas, preview_scroll, single_pane),
-                )
-                for _w in (preview_canvas, preview_scroll, single_pane):
-                    _preview_bind(_w, "<Control-MouseWheel>", _single_ctrl_zoom)
-                    _preview_bind(_w, "<Control-Button-4>", _single_ctrl_zoom_up)
-                    _preview_bind(_w, "<Control-Button-5>", _single_ctrl_zoom_down)
-                single_pane.pack(fill=tk.BOTH, expand=True)
-                return
-            single_pane.pack_forget()
-            multi_pane.pack(fill=tk.BOTH, expand=True)
-            _rebuild_multi_panes(iids)
-
-        def _clear_single_preview_canvas() -> None:
-            preview_canvas.delete("all")
-            preview_canvas.configure(scrollregion=(0, 0, 0, 0))
-
-        def _show_single_preview_message(text: str) -> None:
-            self._billing_review_photos = []
-            _clear_single_preview_canvas()
-
-            def _redraw(_event: tk.Event | None = None) -> None:
-                preview_canvas.delete("all")
-                w = preview_canvas.winfo_width()
-                h = preview_canvas.winfo_height()
-                if w <= 1 or h <= 1:
-                    return
-                preview_canvas.create_text(
-                    w / 2,
-                    h / 2,
-                    text=text,
-                    anchor="center",
-                    width=max(w - 24, 80),
-                    justify="center",
-                )
-                preview_canvas.configure(scrollregion=(0, 0, w, h))
-
-            preview_canvas.bind("<Configure>", _redraw)
-            _redraw()
-
         def refresh_preview_image(entry: BillingReviewEntry) -> None:
             preview_iids = self._billing_review_preview_iids(entry.iid)
-            preview_session["current_iids"] = tuple(preview_iids)
             any_openable = any(
                 self._resolve_file_path_for_row(iid) is not None for iid in preview_iids
             )
             open_file_btn.configure(state=tk.NORMAL if any_openable else tk.DISABLED)
-
-            if preview_iids and all(
-                self._resolve_file_path_for_row(iid) is None for iid in preview_iids
-            ):
-                _ensure_preview_layout(preview_iids)
-                if len(preview_iids) < 2:
-                    _show_single_preview_message("ファイルが見つかりません")
-                else:
-                    self._billing_review_photos = []
-                    for pane in preview_session["multi_panes"]:
-                        pane["canvas"].delete("all")
-                        pane["canvas"].create_text(
-                            8, 8, text="ファイルが見つかりません", anchor="nw"
-                        )
-                return
-
-            _ensure_preview_layout(preview_iids)
-            if len(preview_iids) < 2:
-                _show_single_preview_message("読み込み中…")
-            else:
-                self._billing_review_photos = []
-                for pane in preview_session["multi_panes"]:
-                    c = pane["canvas"]
-                    c.delete("all")
-                    c.create_text(8, 8, text="読み込み中…", anchor="nw")
-            top.update_idletasks()
-
-            preview_canvas.unbind("<Configure>")
-            self._billing_review_photos = []
-            base_max = _preview_base_max_edge(len(preview_iids))
-            _load_preview_media(preview_iids, base_max)
-
-            if len(preview_iids) < 2:
-                _render_pane(preview_canvas, preview_iids[0], show_caption=True)
-            else:
-                for pane in preview_session["multi_panes"]:
-                    _render_pane(
-                        pane["canvas"], pane["iid"], show_caption=False
-                    )
+            preview_mount.refresh(preview_iids, idle_parent=top)
 
         def show_at_index(idx: int) -> None:
             if not entries:
@@ -2201,9 +2183,21 @@ class KintaiApp(tk.Frame):
             show_at_index(0)
             top.wait_window()
         finally:
-            _unbind_preview_wheel()
+            preview_mount.unbind()
             self._close_row_file()
             self._clear_billing_review_grid_highlight()
+
+    def _duplicate_group_member_iids(
+        self,
+        group: BillingDuplicateGroupInfo,
+        rows: list[dict[str, str]],
+        row_iids: list[str],
+    ) -> list[str]:
+        idxs = sorted(
+            group.member_indices,
+            key=lambda i: (_row_grid_no(rows[i]), i),
+        )
+        return [row_iids[i] for i in idxs if 0 <= i < len(row_iids)]
 
     def _prompt_billing_duplicate_resolution(
         self,
@@ -2236,99 +2230,60 @@ class KintaiApp(tk.Frame):
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
-        table_wrap = ttk.Frame(outer)
-        table_wrap.pack(fill=tk.BOTH, expand=True)
-        canvas = tk.Canvas(table_wrap, highlightthickness=0)
-        y_scroll = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        def _on_inner_configure(_event: tk.Event) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
+        body = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True)
 
-        inner.bind("<Configure>", _on_inner_configure)
-        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        preview_frame = ttk.LabelFrame(body, text="プレビュー", padding=4)
+        body.add(preview_frame, weight=3)
+        preview_mount = BillingPreviewMount(self, preview_frame)
+        preview_mount.container.pack(fill=tk.BOTH, expand=True)
 
-        def _on_canvas_configure(event: tk.Event) -> None:
-            if event.width > 1:
-                canvas.itemconfig(canvas_window, width=event.width)
-
-        canvas.bind("<Configure>", _on_canvas_configure)
-        canvas.configure(yscrollcommand=y_scroll.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        def _on_dialog_mousewheel(event: tk.Event) -> None:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                canvas.yview_scroll(int(-1 * (delta / 120)), "units")
-
-        def _on_dialog_mousewheel_linux_up(_event: tk.Event) -> None:
-            canvas.yview_scroll(-1, "units")
-
-        def _on_dialog_mousewheel_linux_down(_event: tk.Event) -> None:
-            canvas.yview_scroll(1, "units")
-
-        def _unbind_dialog_mousewheel() -> None:
-            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                try:
-                    top.unbind_all(seq)
-                except tk.TclError:
-                    pass
-
-        top.bind_all("<MouseWheel>", _on_dialog_mousewheel)
-        top.bind_all("<Button-4>", _on_dialog_mousewheel_linux_up)
-        top.bind_all("<Button-5>", _on_dialog_mousewheel_linux_down)
-
-        def _open_duplicate_member_file(rid: str) -> None:
-            if not rid or self._resolve_file_path_for_row(rid) is None:
-                return
-            try:
-                self._open_row_file(rid, force=True)
-            except OSError as e:
-                messagebox.showerror("起動できませんでした", str(e), parent=top)
+        choice_outer = ttk.LabelFrame(body, text="採用・合算", padding=8)
+        body.add(choice_outer, weight=2)
+        choice_host = ttk.Frame(choice_outer)
+        choice_host.pack(fill=tk.BOTH, expand=True)
 
         hours_vars: list[tk.StringVar] = []
         transport_vars: list[tk.StringVar] = []
-        grid_row = 0
+        group_frames: list[ttk.Frame] = []
 
         for gi, group in enumerate(groups):
             members = [rows[i] for i in group.member_indices]
+            gf = ttk.Frame(choice_host)
+            group_frames.append(gf)
             ttk.Label(
-                inner,
+                gf,
                 text=(
-                    f"【{gi + 1}】 {group.company_display} / 社員番号 {group.employee_no}"
+                    f"{group.company_display} / 社員番号 {group.employee_no}"
                     f"（{len(members)} 件）"
                 ),
-                font=("", 9, "bold"),
-            ).grid(row=grid_row, column=0, columnspan=5, sticky="w", padx=4, pady=(8, 2))
-            grid_row += 1
+                font=("", 10, "bold"),
+            ).pack(anchor="w", pady=(0, 6))
             ttk.Label(
-                inner,
-                text=(
-                    "下で「代表行（No 最小）に載せる値」を選びます。"
-                    "勤務と交通費は別々に選べます。"
-                ),
-            ).grid(row=grid_row, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 4))
-            grid_row += 1
+                gf,
+                text="代表行（No 最小）に載せる値を選びます。勤務と交通費は別々に選べます。",
+                wraplength=360,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 8))
 
-            headers = ("No", "ファイル名", "勤務（10進）", "交通費（読取）", "ファイル")
+            table_f = ttk.Frame(gf)
+            table_f.pack(fill=tk.X, pady=(0, 8))
+            headers = ("No", "ファイル名", "勤務", "交通費")
             for col, title in enumerate(headers):
-                ttk.Label(inner, text=title, font=("", 9, "bold")).grid(
-                    row=grid_row, column=col, sticky="w", padx=4, pady=2
+                ttk.Label(table_f, text=title, font=("", 9, "bold")).grid(
+                    row=0, column=col, sticky="w", padx=4, pady=2
                 )
-            grid_row += 1
-
             hours_pick_choices: list[tuple[str, str]] = []
             transport_pick_choices: list[tuple[str, str]] = []
-            for mi, row_idx in enumerate(group.member_indices):
+            for tr, (mi, row_idx) in enumerate(
+                enumerate(group.member_indices), start=1
+            ):
                 row = rows[row_idx]
                 no = _row_grid_no(row)
-                if no >= 10**9:
-                    no_disp = "—"
-                else:
-                    no_disp = str(no)
+                no_disp = "—" if no >= 10**9 else str(no)
                 fn = _row_file_name(row)
-                if len(fn) > 36:
-                    fn = fn[:33] + "..."
+                if len(fn) > 28:
+                    fn = fn[:25] + "..."
                 h_cand, t_cand = billing_row_update_candidates(row)
                 for col, text in enumerate(
                     (
@@ -2338,8 +2293,8 @@ class KintaiApp(tk.Frame):
                         self._billing_cell_preview(_row_transport_expense_raw(row)),
                     )
                 ):
-                    ttk.Label(inner, text=text).grid(
-                        row=grid_row, column=col, sticky="w", padx=4, pady=2
+                    ttk.Label(table_f, text=text).grid(
+                        row=tr, column=col, sticky="w", padx=4, pady=2
                     )
                 hours_pick_choices.append(
                     (
@@ -2353,21 +2308,6 @@ class KintaiApp(tk.Frame):
                         f"No.{no_disp} の交通費: {self._billing_cell_preview(t_cand)}",
                     )
                 )
-                member_iid = (
-                    row_iids[row_idx] if 0 <= row_idx < len(row_iids) else ""
-                )
-                can_open = bool(
-                    member_iid
-                    and self._resolve_file_path_for_row(member_iid) is not None
-                )
-                open_btn = ttk.Button(
-                    inner,
-                    text="開く",
-                    command=lambda rid=member_iid: _open_duplicate_member_file(rid),
-                    state=(tk.NORMAL if can_open else tk.DISABLED),
-                )
-                open_btn.grid(row=grid_row, column=4, sticky="w", padx=4, pady=2)
-                grid_row += 1
 
             rep_row = rows[group.member_indices[0]]
             rep_no = _row_grid_no(rep_row)
@@ -2394,21 +2334,67 @@ class KintaiApp(tk.Frame):
             hours_vars.append(hv)
             transport_vars.append(tv)
 
-            hf = ttk.LabelFrame(inner, text="勤務時間（代表行へ反映）", padding=(6, 4))
-            hf.grid(row=grid_row, column=0, columnspan=5, sticky="ew", padx=4, pady=4)
+            hf = ttk.LabelFrame(gf, text="勤務時間（代表行へ反映）", padding=(6, 4))
+            hf.pack(fill=tk.X, pady=(0, 4))
             for pi, (val, label) in enumerate(hours_pick_choices):
-                ttk.Radiobutton(hf, text=label, variable=hv, value=val).grid(
-                    row=pi, column=0, sticky="w", padx=(0, 12), pady=1
+                ttk.Radiobutton(hf, text=label, variable=hv, value=val).pack(
+                    anchor="w", pady=1
                 )
-            grid_row += 1
 
-            tf = ttk.LabelFrame(inner, text="交通費（代表行へ反映）", padding=(6, 4))
-            tf.grid(row=grid_row, column=0, columnspan=5, sticky="ew", padx=4, pady=(0, 8))
+            tf = ttk.LabelFrame(gf, text="交通費（代表行へ反映）", padding=(6, 4))
+            tf.pack(fill=tk.X, pady=(0, 4))
             for pi, (val, label) in enumerate(transport_pick_choices):
-                ttk.Radiobutton(tf, text=label, variable=tv, value=val).grid(
-                    row=pi, column=0, sticky="w", padx=(0, 12), pady=1
+                ttk.Radiobutton(tf, text=label, variable=tv, value=val).pack(
+                    anchor="w", pady=1
                 )
-            grid_row += 1
+
+        dup_state = {"index": 0}
+        nav_row = ttk.Frame(outer)
+        nav_row.pack(fill=tk.X, pady=(8, 0))
+        nav_var = tk.StringVar(value="")
+        ttk.Label(nav_row, textvariable=nav_var, font=("", 10, "bold")).pack(
+            side=tk.LEFT
+        )
+        dup_prev_btn = ttk.Button(nav_row, text="前へ")
+        dup_prev_btn.pack(side=tk.LEFT, padx=(12, 0))
+        dup_next_btn = ttk.Button(nav_row, text="次へ")
+        dup_next_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        def show_dup_group(gi: int) -> None:
+            dup_state["index"] = max(0, min(gi, len(groups) - 1))
+            idx = dup_state["index"]
+            nav_var.set(f"グループ {idx + 1} / {len(groups)}")
+            dup_prev_btn.configure(
+                state=(tk.NORMAL if idx > 0 else tk.DISABLED)
+            )
+            dup_next_btn.configure(
+                state=(tk.NORMAL if idx < len(groups) - 1 else tk.DISABLED)
+            )
+            for i, gf in enumerate(group_frames):
+                if i == idx:
+                    gf.pack(fill=tk.BOTH, expand=True)
+                else:
+                    gf.pack_forget()
+            member_iids = self._duplicate_group_member_iids(
+                groups[idx], rows, row_iids
+            )
+            self._apply_billing_review_grid_highlight(member_iids)
+            preview_mount.refresh(member_iids, idle_parent=top)
+
+        def on_dup_prev() -> None:
+            if dup_state["index"] <= 0:
+                return
+            show_dup_group(dup_state["index"] - 1)
+
+        def on_dup_next() -> None:
+            if dup_state["index"] >= len(groups) - 1:
+                return
+            show_dup_group(dup_state["index"] + 1)
+
+        dup_prev_btn.configure(command=on_dup_prev)
+        dup_next_btn.configure(command=on_dup_next)
+        top.bind("<Left>", lambda _e: on_dup_prev())
+        top.bind("<Right>", lambda _e: on_dup_next())
 
         result: dict[str, object] = {"ok": False}
 
@@ -2435,11 +2421,13 @@ class KintaiApp(tk.Frame):
                 )
             result["ok"] = True
             result["data"] = out
-            _unbind_dialog_mousewheel()
+            preview_mount.unbind()
+            self._clear_billing_review_grid_highlight()
             top.destroy()
 
         def on_cancel() -> None:
-            _unbind_dialog_mousewheel()
+            preview_mount.unbind()
+            self._clear_billing_review_grid_highlight()
             top.destroy()
 
         btns = ttk.Frame(outer)
@@ -2449,10 +2437,12 @@ class KintaiApp(tk.Frame):
             side=tk.RIGHT, padx=(0, 8)
         )
         top.bind("<Escape>", lambda _e: on_cancel())
+        show_dup_group(0)
         try:
             top.wait_window()
         finally:
-            _unbind_dialog_mousewheel()
+            preview_mount.unbind()
+            self._clear_billing_review_grid_highlight()
         if not result.get("ok"):
             return None
         return result.get("data") or {}
